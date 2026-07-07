@@ -285,6 +285,9 @@ async fn main() -> Result<()> {
                 run = resumed;
             }
 
+            AgentRunStep::AwaitTasks { .. } => {
+                anyhow::bail!("this example never defers tool calls");
+            }
             AgentRunStep::Done(response) => {
                 println!("\n✓ {}", response.output);
                 return Ok(());

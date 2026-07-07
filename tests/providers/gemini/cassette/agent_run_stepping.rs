@@ -60,6 +60,9 @@ async fn hand_driven_single_turn_completes() {
                     AgentRunStep::CallTools { calls } => {
                         panic!("tool-free run must not request tool execution: {calls:?}")
                     }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => break response,
                 }
             };
@@ -155,7 +158,9 @@ async fn hand_driven_multi_turn_tool_run_completes() {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
-                    AgentRunStep::Done(response) => break response,
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }AgentRunStep::Done(response) => break response,
                 }
             };
 
@@ -236,7 +241,9 @@ async fn hand_driven_parallel_tool_calls_arrive_in_one_step() {
                         run.tool_results(results)
                             .expect("tool results in any order should be accepted");
                     }
-                    AgentRunStep::Done(response) => break response,
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }AgentRunStep::Done(response) => break response,
                 }
             };
 
@@ -285,7 +292,9 @@ async fn max_turns_error_carries_pending_tool_results_message() {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
-                    Ok(AgentRunStep::Done(response)) => {
+                    Ok(AgentRunStep::AwaitTasks { pending }) => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }Ok(AgentRunStep::Done(response)) => {
                         panic!("run should exhaust max_turns before completing: {response:?}")
                     }
                     Err(error) => break error,

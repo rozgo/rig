@@ -245,6 +245,14 @@ pub struct PromptResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completion_calls: Vec<CompletionCall>,
     pub messages: Option<Vec<Message>>,
+    /// Deferred tool tasks still pending when the run finished (see
+    /// [`TaskDrainPolicy`](crate::agent::run::TaskDrainPolicy)): under
+    /// `Detach` they are still running and the caller owns their lifecycle
+    /// (resume via a [`TaskResumer`](crate::tool::TaskResumer)); under
+    /// `CancelAndFinish` — or a `WaitAndResume` run whose turn budget was
+    /// exhausted — the driver has already requested their cancellation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_tasks: Vec<crate::tool::ToolTaskDescriptor>,
 }
 
 impl std::fmt::Display for PromptResponse {
@@ -260,6 +268,7 @@ impl PromptResponse {
             usage,
             completion_calls: Vec::new(),
             messages: None,
+            unresolved_tasks: Vec::new(),
         }
     }
 

@@ -686,6 +686,19 @@ where
                         break 'outer;
                     }
                 }
+                AgentRunStep::AwaitTasks { .. } => {
+                    // Both built-in drivers dispatch tools through
+                    // `call_tool_structured`, which never defers, so this step
+                    // is unreachable from `run()`/`stream()` today; it can only
+                    // be produced by feeding `tool_batch_results` deferrals
+                    // into a hand-driven machine. Fail closed rather than
+                    // wedge. The task wait engine lands with the driver
+                    // integration.
+                    yield Err(StreamingError::Prompt(Box::new(run.cancel_error(
+                        "deferred tool tasks are not driven by this surface yet",
+                    ))));
+                    break 'outer;
+                }
                 AgentRunStep::Done(response) => {
                     // Run-completion marker, unifying the blocking driver's
                     // "Depth reached" and the streaming driver's "multi-turn
