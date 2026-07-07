@@ -211,7 +211,117 @@ fn parse_mcp_arguments(args: &str) -> Result<Option<rmcp::model::JsonObject>, se
     }
 }
 
+/// Convert a `CallToolResult` into model-facing text, mapping a tool-reported
+/// error (`is_error: true`) and unsupported content kinds to classified
+/// errors. Shared by the synchronous call path ([`McpTool::execute`]) and the
+/// task payload path (`tasks/result`).
+pub(crate) fn call_tool_result_to_text(
+    result: rmcp::model::CallToolResult,
+) -> Result<String, McpToolError> {
+    if let Some(true) = result.is_error {
+        let error_msg = result
+            .content
+            .into_iter()
+            .map(|x| x.as_text().map(|y| y.text.clone()))
+            .collect::<Option<Vec<String>>>();
+
+        // The MCP tool ran and reported its own error result — a handled
+        // tool failure rather than a transport/timeout condition.
+        let error_message = error_msg.map(|x| x.join("\n"));
+        if let Some(error_message) = error_message {
+            return Err(McpToolError::new(ToolFailureKind::Other, error_message));
+        } else {
+            return Err(McpToolError::new(
+                ToolFailureKind::Other,
+                "No message returned".to_string(),
+            ));
+        }
+    };
+
+    let mut content = String::new();
+
+    for item in result.content {
+        let chunk = match item {
+            ContentBlock::Text(raw) => raw.text,
+            ContentBlock::Image(raw) => {
+                format!("data:{};base64,{}", raw.mime_type, raw.data)
+            }
+            ContentBlock::Resource(raw) => match raw.resource {
+                rmcp::model::ResourceContents::TextResourceContents {
+                    uri,
+                    mime_type,
+                    text,
+                    ..
+                } => {
+                    format!(
+                        "{mime_type}{uri}:{text}",
+                        mime_type = mime_type.map(|m| format!("data:{m};")).unwrap_or_default(),
+                    )
+                }
+                rmcp::model::ResourceContents::BlobResourceContents {
+                    uri,
+                    mime_type,
+                    blob,
+                    ..
+                } => format!(
+                    "{mime_type}{uri}:{blob}",
+                    mime_type = mime_type.map(|m| format!("data:{m};")).unwrap_or_default(),
+                ),
+                other => {
+                    return Err(McpToolError::new(
+                        ToolFailureKind::Other,
+                        format!("MCP tool returned unsupported resource contents: {other:?}"),
+                    ));
+                }
+            },
+            ContentBlock::Audio(_) => {
+                return Err(McpToolError::new(
+                    ToolFailureKind::Other,
+                    "MCP tool returned audio content, which Rig does not support yet".to_string(),
+                ));
+            }
+            thing => {
+                return Err(McpToolError::new(
+                    ToolFailureKind::Other,
+                    format!("MCP tool returned unsupported content: {thing:?}"),
+                ));
+            }
+        };
+
+        content.push_str(&chunk);
+    }
+
+    Ok(content)
+}
+
 impl McpTool {
+    /// Build the `tools/call` request params: validated arguments plus the
+    /// caller's `_meta` (SEP-1319). Shared by the synchronous call path and the
+    /// task-augmented dispatch path, so both apply identical argument
+    /// validation — malformed JSON surfaces as an
+    /// [`InvalidArgs`](ToolFailureKind::InvalidArgs) failure before the server
+    /// is contacted.
+    fn build_call_params(
+        &self,
+        args: &str,
+        meta: Option<rmcp::model::Meta>,
+    ) -> Result<rmcp::model::CallToolRequestParams, McpToolError> {
+        let name = self.definition.name.clone();
+        let arguments = parse_mcp_arguments(args).map_err(|err| {
+            McpToolError::new(
+                ToolFailureKind::InvalidArgs,
+                format!("MCP tool '{name}' received invalid JSON arguments: {err}"),
+            )
+        })?;
+        let mut request = arguments
+            .map(|arguments| {
+                rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
+            })
+            .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
+        request.meta = meta;
+        Ok(request)
+    }
+
     /// Shared executor for [`ToolDyn::call`] and [`ToolDyn::call_with_extensions`].
     ///
     /// `meta`, when present, is attached as the MCP request's `_meta`
@@ -224,23 +334,10 @@ impl McpTool {
         args: String,
         meta: Option<rmcp::model::Meta>,
     ) -> WasmBoxedFuture<'_, Result<String, McpToolError>> {
-        let name = self.definition.name.clone();
-
         Box::pin(async move {
             // Validate the JSON arguments before contacting the server: malformed
             // JSON must surface as an InvalidArgs failure, not a silent no-arg call.
-            let arguments = parse_mcp_arguments(&args).map_err(|err| {
-                McpToolError::new(
-                    ToolFailureKind::InvalidArgs,
-                    format!("MCP tool '{name}' received invalid JSON arguments: {err}"),
-                )
-            })?;
-            let mut request = arguments
-                .map(|arguments| {
-                    rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
-                })
-                .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
-            request.meta = meta;
+            let request = self.build_call_params(&args, meta)?;
 
             let call = self.client.call_tool(request);
             // Bound the call so a never-answered request (see issue #1914)
@@ -269,84 +366,7 @@ impl McpTool {
                 )
             })?;
 
-            if let Some(true) = result.is_error {
-                let error_msg = result
-                    .content
-                    .into_iter()
-                    .map(|x| x.as_text().map(|y| y.text.clone()))
-                    .collect::<Option<Vec<String>>>();
-
-                // The MCP tool ran and reported its own error result — a handled
-                // tool failure rather than a transport/timeout condition.
-                let error_message = error_msg.map(|x| x.join("\n"));
-                if let Some(error_message) = error_message {
-                    return Err(McpToolError::new(ToolFailureKind::Other, error_message));
-                } else {
-                    return Err(McpToolError::new(
-                        ToolFailureKind::Other,
-                        "No message returned".to_string(),
-                    ));
-                }
-            };
-
-            let mut content = String::new();
-
-            for item in result.content {
-                let chunk = match item {
-                    ContentBlock::Text(raw) => raw.text,
-                    ContentBlock::Image(raw) => {
-                        format!("data:{};base64,{}", raw.mime_type, raw.data)
-                    }
-                    ContentBlock::Resource(raw) => match raw.resource {
-                        rmcp::model::ResourceContents::TextResourceContents {
-                            uri,
-                            mime_type,
-                            text,
-                            ..
-                        } => {
-                            format!(
-                                "{mime_type}{uri}:{text}",
-                                mime_type =
-                                    mime_type.map(|m| format!("data:{m};")).unwrap_or_default(),
-                            )
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            uri,
-                            mime_type,
-                            blob,
-                            ..
-                        } => format!(
-                            "{mime_type}{uri}:{blob}",
-                            mime_type = mime_type.map(|m| format!("data:{m};")).unwrap_or_default(),
-                        ),
-                        other => {
-                            return Err(McpToolError::new(
-                                ToolFailureKind::Other,
-                                format!(
-                                    "MCP tool returned unsupported resource contents: {other:?}"
-                                ),
-                            ));
-                        }
-                    },
-                    ContentBlock::Audio(_) => {
-                        return Err(McpToolError::new(
-                            ToolFailureKind::Other,
-                            "MCP tool returned audio content, which Rig does not support yet"
-                                .to_string(),
-                        ));
-                    }
-                    thing => {
-                        return Err(McpToolError::new(
-                            ToolFailureKind::Other,
-                            format!("MCP tool returned unsupported content: {thing:?}"),
-                        ));
-                    }
-                };
-
-                content.push_str(&chunk);
-            }
-
-            Ok(content)
+            call_tool_result_to_text(result)
         })
     }
 }
