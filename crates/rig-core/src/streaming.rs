@@ -45,6 +45,11 @@ impl PauseControl {
     }
 
     /// Pause polling of the public stream until [`PauseControl::resume`] is called.
+    ///
+    /// Pausing pauses **everything**: the agent stream is pull-based with no
+    /// background spawns, so deferred tool tasks stop being polled too (their
+    /// backends keep running). Task deadlines are wall-clock, so a deadline
+    /// that elapses while paused is detected on the first poll after resume.
     pub fn pause(&self) {
         let _ = self.paused_tx.send(true);
     }

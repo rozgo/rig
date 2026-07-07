@@ -10098,6 +10098,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp_tasks_example"
+version = "0.39.0"
+dependencies = [
+ "anyhow",
+ "rig",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rmp"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

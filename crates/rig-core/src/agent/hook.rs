@@ -89,6 +89,9 @@
 //! | `on_tool_call_delta` | [`ToolCallDelta`](StepEvent::ToolCallDelta) `{ tool_call_id, internal_call_id, tool_name, delta }` | [`cont`](Flow::cont) / [`terminate`](Flow::terminate) |
 //! | `on_stream_completion_response_finish` | [`StreamResponseFinish`](StepEvent::StreamResponseFinish) `{ prompt, response }` | [`cont`](Flow::cont) / [`terminate`](Flow::terminate) |
 //! | *(new, both surfaces)* | [`ModelTurnFinished`](StepEvent::ModelTurnFinished) `{ turn, content, usage }` | [`cont`](Flow::cont) / [`terminate`](Flow::terminate) |
+//! | *(new, deferred tasks)* | [`ToolTaskStarted`](StepEvent::ToolTaskStarted) `{ tool_name, .., task_id, immediate_response }` | [`cont`](Flow::cont) / [`cancel_task`](Flow::cancel_task) / [`terminate`](Flow::terminate) |
+//! | *(new, deferred tasks)* | [`ToolTaskStatus`](StepEvent::ToolTaskStatus) `{ .., status }` (gated on [`observes`](AgentHook::observes)) | [`cont`](Flow::cont) / [`cancel_task`](Flow::cancel_task) / [`terminate`](Flow::terminate) |
+//! | *(new, deferred tasks)* | [`ToolTaskResult`](StepEvent::ToolTaskResult) `{ .., result, outcome, extensions, policy }` (replaces `ToolResult` for a deferred call) | [`cont`](Flow::cont) / [`rewrite_result`](Flow::rewrite_result) / [`terminate`](Flow::terminate) |
 //!
 //! Behavioral notes:
 //!
