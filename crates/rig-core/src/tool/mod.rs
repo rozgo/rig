@@ -23,6 +23,7 @@
 mod extensions;
 mod result;
 pub mod server;
+mod task;
 
 pub use extensions::{MissingExtension, ToolCallExtensions, ToolResultExtensions};
 pub use result::{
@@ -31,6 +32,7 @@ pub use result::{
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+pub use task::{ToolDispatch, ToolTaskDescriptor, ToolTaskHandle, ToolTaskStatus};
 
 use futures::Future;
 use indexmap::IndexMap;
@@ -327,6 +329,24 @@ pub trait ToolDyn: WasmCompatSend + WasmCompatSync {
             }
         })
     }
+
+    /// Dispatch the tool call, which may complete immediately or defer behind
+    /// a [`ToolTaskHandle`] (e.g. an MCP task, SEP-1686).
+    ///
+    /// The default wraps [`call_structured`](Self::call_structured) into
+    /// [`ToolDispatch::Completed`], so ordinary tools never defer and existing
+    /// `ToolDyn` implementations need no changes. A backend that can hand back
+    /// a task (like [`McpTool`](crate::tool::rmcp::McpTool)) overrides this;
+    /// its `call_structured` remains the always-synchronous path.
+    fn dispatch_structured<'a>(
+        &'a self,
+        args: String,
+        extensions: &'a ToolCallExtensions,
+    ) -> WasmBoxedFuture<'a, ToolDispatch> {
+        Box::pin(
+            async move { ToolDispatch::Completed(self.call_structured(args, extensions).await) },
+        )
+    }
 }
 
 fn serialize_tool_output(output: impl Serialize) -> serde_json::Result<String> {
@@ -496,6 +516,18 @@ impl ToolType {
         match self {
             ToolType::Simple(tool) => tool.call_structured(args, extensions).await,
             ToolType::Embedding(tool) => tool.call_structured(args, extensions).await,
+        }
+    }
+
+    /// Dispatch the tool, returning a [`ToolDispatch`] (completed or deferred).
+    pub async fn dispatch_structured(
+        &self,
+        args: String,
+        extensions: &ToolCallExtensions,
+    ) -> ToolDispatch {
+        match self {
+            ToolType::Simple(tool) => tool.dispatch_structured(args, extensions).await,
+            ToolType::Embedding(tool) => tool.dispatch_structured(args, extensions).await,
         }
     }
 }
@@ -672,6 +704,31 @@ impl ToolSet {
                 format!("tool `{toolname}` not found"),
                 ToolFailure::not_found(format!("no tool named `{toolname}` is registered")),
             ),
+        }
+    }
+
+    /// Dispatch a tool by name, returning a [`ToolDispatch`] that is either an
+    /// already-final [`ToolExecutionResult`] or a deferred [`ToolTaskHandle`].
+    ///
+    /// The task-aware counterpart of
+    /// [`call_structured`](Self::call_structured); an unknown tool name
+    /// resolves to a `Completed` result with a
+    /// [`NotFound`](ToolFailureKind::NotFound) outcome, identical to that path.
+    pub async fn dispatch_structured(
+        &self,
+        toolname: &str,
+        args: String,
+        extensions: &ToolCallExtensions,
+    ) -> ToolDispatch {
+        match self.tools.get(toolname) {
+            Some(tool) => {
+                tracing::debug!(target: "rig", "Dispatching tool {toolname} with args:\n{args}");
+                tool.dispatch_structured(args, extensions).await
+            }
+            None => ToolDispatch::Completed(ToolExecutionResult::failed(
+                format!("tool `{toolname}` not found"),
+                ToolFailure::not_found(format!("no tool named `{toolname}` is registered")),
+            )),
         }
     }
 

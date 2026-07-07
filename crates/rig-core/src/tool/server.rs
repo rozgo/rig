@@ -5,7 +5,8 @@ use tokio::sync::RwLock;
 use crate::{
     completion::{CompletionError, ToolDefinition},
     tool::{
-        Tool, ToolCallExtensions, ToolDyn, ToolExecutionResult, ToolFailure, ToolSet, ToolSetError,
+        Tool, ToolCallExtensions, ToolDispatch, ToolDyn, ToolExecutionResult, ToolFailure, ToolSet,
+        ToolSetError,
     },
     vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn, request::Filter},
 };
@@ -261,6 +262,43 @@ impl ToolServerHandle {
         }
     }
 
+    /// Look up and dispatch a tool by name, returning a [`ToolDispatch`] that
+    /// is either an already-final [`ToolExecutionResult`] or a deferred
+    /// [`ToolTaskHandle`](crate::tool::ToolTaskHandle).
+    ///
+    /// The task-aware counterpart of
+    /// [`call_tool_structured`](Self::call_tool_structured) and the path a
+    /// task-capable agent loop drives. A missing tool resolves to a
+    /// `Completed` result with a
+    /// [`NotFound`](crate::tool::ToolFailureKind::NotFound) outcome. The tool
+    /// handle is cloned under a brief read lock so that long-running tool
+    /// executions never block writers.
+    pub async fn dispatch_tool_structured(
+        &self,
+        tool_name: &str,
+        args: &str,
+        extensions: &ToolCallExtensions,
+    ) -> ToolDispatch {
+        let tool = {
+            let state = self.0.read().await;
+            state.toolset.get(tool_name).cloned()
+        };
+
+        match tool {
+            Some(tool) => {
+                tracing::debug!(target: "rig",
+                    "Dispatching tool {tool_name} with args:\n{}",
+                    serde_json::to_string_pretty(&args).unwrap_or_default()
+                );
+                tool.dispatch_structured(args.to_string(), extensions).await
+            }
+            None => ToolDispatch::Completed(ToolExecutionResult::failed(
+                format!("tool `{tool_name}` not found"),
+                ToolFailure::not_found(format!("no tool named `{tool_name}` is registered")),
+            )),
+        }
+    }
+
     /// Retrieve tool definitions, optionally using a prompt to select
     /// dynamic tools from configured vector stores.
     pub async fn get_tool_defs(
@@ -409,6 +447,39 @@ mod tests {
         let res = handle.get_tool_defs(None).await.unwrap();
 
         assert_eq!(res.len(), 0);
+    }
+
+    #[tokio::test]
+    pub async fn test_toolserver_dispatch_structured() {
+        use crate::tool::{ToolCallExtensions, ToolDispatch, ToolFailureKind, ToolOutcome};
+
+        let handle = ToolServer::new().run();
+        handle.add_tool(MockAddTool).await.unwrap();
+
+        // An ordinary tool dispatches as an already-final `Completed` result
+        // identical to the `call_tool_structured` path.
+        let args = serde_json::to_string(&serde_json::json!({"x": 2, "y": 5})).unwrap();
+        let dispatch = handle
+            .dispatch_tool_structured("add", &args, &ToolCallExtensions::EMPTY)
+            .await;
+        let ToolDispatch::Completed(result) = dispatch else {
+            panic!("an ordinary tool must never defer");
+        };
+        assert_eq!(result.model_output(), "7");
+
+        // An unknown tool resolves to a Completed NotFound outcome, matching
+        // `call_tool_structured` byte for byte.
+        let dispatch = handle
+            .dispatch_tool_structured("missing", "{}", &ToolCallExtensions::EMPTY)
+            .await;
+        let ToolDispatch::Completed(result) = dispatch else {
+            panic!("a missing tool must resolve to a completed failure");
+        };
+        assert_eq!(result.model_output(), "tool `missing` not found");
+        match result.outcome() {
+            ToolOutcome::Error(failure) => assert_eq!(failure.kind, ToolFailureKind::NotFound),
+            other => panic!("expected a NotFound error outcome, got {other:?}"),
+        }
     }
 
     #[tokio::test]
