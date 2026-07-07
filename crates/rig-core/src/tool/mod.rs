@@ -32,7 +32,7 @@ pub use result::{
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-pub use task::{ToolDispatch, ToolTaskDescriptor, ToolTaskHandle, ToolTaskStatus};
+pub use task::{TaskResumer, ToolDispatch, ToolTaskDescriptor, ToolTaskHandle, ToolTaskStatus};
 
 use futures::Future;
 use indexmap::IndexMap;

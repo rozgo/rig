@@ -58,13 +58,20 @@ use tokio::sync::RwLock;
 use crate::completion::ToolDefinition;
 use crate::tool::server::{ToolServerError, ToolServerHandle};
 use crate::tool::{
-    ToolCallExtensions, ToolDyn, ToolError, ToolExecutionResult, ToolFailure, ToolFailureKind,
+    ToolCallExtensions, ToolDispatch, ToolDyn, ToolError, ToolExecutionResult, ToolFailure,
+    ToolFailureKind,
 };
 use crate::wasm_compat::WasmBoxedFuture;
 
 /// Re-export of [`rmcp::model::Meta`]: place one in a [`ToolCallExtensions`] to have
 /// [`McpTool`] forward it as a call's MCP `_meta` (see the module docs).
 pub use rmcp::model::Meta;
+
+pub mod tasks;
+pub use tasks::{
+    MODEL_IMMEDIATE_RESPONSE_META_KEY, McpTaskHandle, McpTaskInfo, McpTaskNotifications,
+    McpTaskPolicy, McpTaskResumer, ServerSinkTaskExt,
+};
 
 /// Default per-call timeout applied to MCP tools (see issue #1914).
 ///
@@ -92,6 +99,15 @@ pub struct McpTool {
     /// server is not sent a cancellation, so a still-running tool keeps running
     /// server-side, and rmcp reclaims the request slot when the session closes.
     timeout: Option<Duration>,
+    /// When calls on the [`ToolDyn::dispatch_structured`] path go out as MCP
+    /// tasks (SEP-1686). The plain `call`/`call_structured` paths never
+    /// create tasks.
+    task_policy: McpTaskPolicy,
+    /// `TaskMetadata.ttl` (task retention) requested on task-augmented calls.
+    /// `None` leaves the retention to the server.
+    task_ttl: Option<Duration>,
+    /// Shared `notifications/tasks/status` registry; absent ⇒ pure polling.
+    task_notifications: Option<Arc<McpTaskNotifications>>,
 }
 
 impl McpTool {
@@ -109,6 +125,9 @@ impl McpTool {
             definition,
             client,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            task_policy: McpTaskPolicy::default(),
+            task_ttl: None,
+            task_notifications: None,
         }
     }
 
@@ -128,6 +147,42 @@ impl McpTool {
     /// The per-call timeout, if any.
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Set when calls dispatch as MCP tasks (see [`McpTaskPolicy`]), consuming
+    /// and returning the tool. Only the
+    /// [`ToolDyn::dispatch_structured`] path consults it.
+    pub fn with_task_policy(mut self, policy: McpTaskPolicy) -> Self {
+        self.task_policy = policy;
+        self
+    }
+
+    /// Set (or clear) the task retention (`TaskMetadata.ttl`) requested on
+    /// task-augmented calls, consuming and returning the tool.
+    pub fn with_task_ttl(mut self, ttl: impl Into<Option<Duration>>) -> Self {
+        self.task_ttl = ttl.into();
+        self
+    }
+
+    /// Wire the shared status-notification registry so deferred task handles
+    /// wake on `notifications/tasks/status` instead of waiting out their poll
+    /// interval.
+    pub(crate) fn with_task_notifications(
+        mut self,
+        notifications: Arc<McpTaskNotifications>,
+    ) -> Self {
+        self.task_notifications = Some(notifications);
+        self
+    }
+
+    /// The task dispatch policy.
+    pub fn task_policy(&self) -> McpTaskPolicy {
+        self.task_policy
+    }
+
+    /// The requested task retention, if any.
+    pub fn task_ttl(&self) -> Option<Duration> {
+        self.task_ttl
     }
 }
 
@@ -430,6 +485,115 @@ impl ToolDyn for McpTool {
             }
         })
     }
+
+    /// Task-aware dispatch (SEP-1686): when the negotiated server capability,
+    /// the tool's `taskSupport`, and this tool's [`McpTaskPolicy`] agree, the
+    /// call is sent task-augmented and an [`McpTaskHandle`] is returned as
+    /// [`ToolDispatch::Deferred`]; otherwise this behaves exactly like
+    /// [`call_structured`](ToolDyn::call_structured). The caller's
+    /// [`Meta`] extension is attached to the initial call either way.
+    fn dispatch_structured<'a>(
+        &'a self,
+        args: String,
+        extensions: &'a ToolCallExtensions,
+    ) -> WasmBoxedFuture<'a, ToolDispatch> {
+        use tasks::ServerSinkTaskExt as _;
+
+        Box::pin(async move {
+            let server_supports = self
+                .client
+                .tasks_capability()
+                .is_some_and(|capability| capability.supports_tools_call());
+            let support = self.definition.task_support();
+            let as_task = match (support, server_supports, self.task_policy) {
+                // Spec rule 1: forbidden/absent taskSupport is never a task.
+                (rmcp::model::TaskSupport::Forbidden, _, _) => false,
+                (rmcp::model::TaskSupport::Optional, true, McpTaskPolicy::Preferred) => true,
+                (rmcp::model::TaskSupport::Optional, _, _) => false,
+                // The server would reject a plain call with -32601; failing
+                // fast client-side gives the model a clearer message.
+                (rmcp::model::TaskSupport::Required, _, McpTaskPolicy::Never) => {
+                    let message = format!(
+                        "MCP tool '{}' requires task-based invocation but the task policy is Never",
+                        self.definition.name
+                    );
+                    return ToolDispatch::Completed(ToolExecutionResult::failed(
+                        message.clone(),
+                        ToolFailure::other(message)
+                            .with_code("mcp_task_required")
+                            .with_retryable(false),
+                    ));
+                }
+                (rmcp::model::TaskSupport::Required, true, _) => true,
+                // An inconsistent server (required tool, no capability): let
+                // the server decide what to do with a plain call.
+                (rmcp::model::TaskSupport::Required, false, _) => {
+                    tracing::warn!(
+                        tool_name = %self.definition.name,
+                        "MCP tool requires tasks but the server declared no tasks capability; \
+                         attempting a plain call"
+                    );
+                    false
+                }
+            };
+
+            if !as_task {
+                return ToolDispatch::Completed(self.call_structured(args, extensions).await);
+            }
+
+            let meta = extensions.get::<rmcp::model::Meta>().cloned();
+            let mut params = match self.build_call_params(&args, meta) {
+                Ok(params) => params,
+                Err(err) => {
+                    let failure = err.into_failure();
+                    return ToolDispatch::Completed(ToolExecutionResult::failed(
+                        failure.message.clone(),
+                        failure,
+                    ));
+                }
+            };
+            let mut task_metadata = rmcp::model::TaskMetadata::new();
+            if let Some(ttl) = self.task_ttl {
+                task_metadata =
+                    task_metadata.with_ttl(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+            }
+            params = params.with_task(task_metadata);
+
+            // Bound the launch like every other MCP request (issue #1914).
+            let launch = self.client.call_tool_as_task(params);
+            let created = match self.timeout {
+                Some(timeout) => crate::wasm_compat::timeout(timeout, launch)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(McpToolError::new(
+                            ToolFailureKind::Timeout,
+                            format!(
+                                "task-augmented call to MCP tool '{}' timed out after {timeout:?}",
+                                self.definition.name
+                            ),
+                        ))
+                    }),
+                None => launch.await,
+            };
+
+            match created {
+                Ok(created) => ToolDispatch::Deferred(Box::new(McpTaskHandle::from_create_result(
+                    self.client.clone(),
+                    self.definition.name.to_string(),
+                    created,
+                    self.timeout,
+                    self.task_notifications.clone(),
+                ))),
+                Err(err) => {
+                    let failure = err.into_failure();
+                    ToolDispatch::Completed(ToolExecutionResult::failed(
+                        failure.message.clone(),
+                        failure,
+                    ))
+                }
+            }
+        })
+    }
 }
 
 /// Error type for [`McpClientHandler`] operations.
@@ -477,6 +641,13 @@ pub struct McpClientHandler {
     /// Per-call timeout applied to every MCP tool this handler registers
     /// (see issue #1914). Defaults to [`DEFAULT_MCP_TOOL_TIMEOUT`].
     timeout: Option<Duration>,
+    /// Task policy applied to every registered tool. Defaults to
+    /// [`McpTaskPolicy::Preferred`] — see [`McpClientHandler::new`].
+    task_policy: McpTaskPolicy,
+    /// Requested task retention (`TaskMetadata.ttl`) for task-augmented calls.
+    task_ttl: Option<Duration>,
+    /// Shared wakeup registry for `notifications/tasks/status`.
+    task_notifications: Arc<McpTaskNotifications>,
     /// Tracks which tool names were registered by this handler so they
     /// can be removed and replaced on list-change notifications.
     managed_tool_names: Arc<RwLock<Vec<String>>>,
@@ -493,6 +664,12 @@ impl McpClientHandler {
             client_info,
             tool_server_handle,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            // Preferred: a task-aware agent loop should exploit tasks whenever
+            // the server and tool permit them (a bare McpTool defaults to the
+            // spec-minimum `Required` instead).
+            task_policy: McpTaskPolicy::Preferred,
+            task_ttl: None,
+            task_notifications: Arc::new(McpTaskNotifications::default()),
             managed_tool_names: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -506,9 +683,42 @@ impl McpClientHandler {
         self
     }
 
-    /// Build an [`McpTool`], applying this handler's configured timeout.
+    /// Set the [`McpTaskPolicy`] applied to every tool this handler registers.
+    /// Defaults to [`McpTaskPolicy::Preferred`].
+    pub fn with_task_policy(mut self, policy: McpTaskPolicy) -> Self {
+        self.task_policy = policy;
+        self
+    }
+
+    /// Set (or clear) the task retention (`TaskMetadata.ttl`) requested on
+    /// task-augmented calls made by tools this handler registers.
+    pub fn with_task_ttl(mut self, ttl: impl Into<Option<Duration>>) -> Self {
+        self.task_ttl = ttl.into();
+        self
+    }
+
+    /// The shared `notifications/tasks/status` registry this handler publishes
+    /// into. Tools built by this handler subscribe to it automatically.
+    pub fn task_notifications(&self) -> Arc<McpTaskNotifications> {
+        self.task_notifications.clone()
+    }
+
+    /// Build a [`TaskResumer`](crate::tool::TaskResumer) that rehydrates this
+    /// connection's persisted MCP tasks. Register it on the agent runner to
+    /// resume serialized runs; `sink` is the connection's peer
+    /// (`service.peer().clone()`).
+    pub fn task_resumer(&self, sink: rmcp::service::ServerSink) -> McpTaskResumer {
+        McpTaskResumer::new(sink, self.timeout, Some(self.task_notifications.clone()))
+    }
+
+    /// Build an [`McpTool`], applying this handler's configured timeout and
+    /// task settings.
     fn build_tool(&self, tool: rmcp::model::Tool, client: rmcp::service::ServerSink) -> McpTool {
-        McpTool::from_mcp_server(tool, client).with_timeout(self.timeout)
+        McpTool::from_mcp_server(tool, client)
+            .with_timeout(self.timeout)
+            .with_task_policy(self.task_policy)
+            .with_task_ttl(self.task_ttl)
+            .with_task_notifications(self.task_notifications.clone())
     }
 
     /// Connect to an MCP server, fetch the initial tool list, and register
@@ -556,6 +766,17 @@ impl McpClientHandler {
 impl rmcp::handler::client::ClientHandler for McpClientHandler {
     fn get_info(&self) -> rmcp::model::ClientInfo {
         self.client_info.clone()
+    }
+
+    async fn on_task_status(
+        &self,
+        params: rmcp::model::TaskStatusNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        // Route the update into the shared registry so any waiting
+        // McpTaskHandle wakes immediately instead of at its next poll tick.
+        // Notifications are optional per spec; handles keep polling either way.
+        self.task_notifications.publish(&params.task);
     }
 
     async fn on_tool_list_changed(

@@ -180,6 +180,23 @@ pub trait ToolTaskHandle: WasmCompatSend + WasmCompatSync + 'static {
     fn immediate_response(&self) -> Option<&str>;
 }
 
+/// Rehydrates a live [`ToolTaskHandle`] for a suspended deferred task when a
+/// serialized agent run is resumed.
+///
+/// Register implementations on the agent runner; each is consulted in
+/// registration order for every persisted [`ToolTaskDescriptor`] that has no
+/// live handle. The MCP backend provides
+/// [`McpTaskResumer`](crate::tool::rmcp::McpTaskResumer).
+pub trait TaskResumer: WasmCompatSend + WasmCompatSync {
+    /// Attempt to resume `descriptor`. `Ok(None)` means "not mine" (e.g. a
+    /// different backend or server key) and the next registered resumer is
+    /// consulted; `Err` is a definitive failure for this descriptor.
+    fn resume<'a>(
+        &'a self,
+        descriptor: &'a ToolTaskDescriptor,
+    ) -> WasmBoxedFuture<'a, Result<Option<Box<dyn ToolTaskHandle>>, super::ToolError>>;
+}
+
 /// The outcome of dispatching a tool call: already complete, or deferred
 /// behind a task handle the caller must drive.
 #[non_exhaustive]
