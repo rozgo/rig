@@ -4,16 +4,20 @@ use crate::{
     agent::hook::{
         AgentHook, HookContext, HookStack, InvalidToolCallHookAction, StepEvent, StepEventKind,
     },
-    agent::prompt_request::{assistant_text_from_choice, is_empty_assistant_turn},
+    agent::prompt_request::{
+        assistant_text_from_choice, is_empty_assistant_turn, tool_result_message,
+        tool_result_output,
+    },
     agent::run::{
-        AgentRun, AgentRunStep, PendingToolCall,
+        AgentRun, AgentRunStep, PendingTask, PendingToolCall, TaskDrainPolicy, TaskResolution,
         streamed::{StreamedResolution, StreamedTurnAssembler, StreamedTurnEvent},
     },
     agent::runner::{
-        AgentRunner, CompletionCallOutcome, InvalidDecision, ToolExecution, acquire_agent_span,
-        append_run_messages, build_chat_span, flow_into_invalid, new_execute_tool_span,
-        observe_flow, resolve_completion_call, run_single_tool,
+        AgentRunner, CompletionCallOutcome, InvalidDecision, SingleToolResolution, ToolExecution,
+        acquire_agent_span, append_run_messages, build_chat_span, flow_into_invalid,
+        new_execute_tool_span, observe_flow, resolve_completion_call, run_single_tool,
     },
+    agent::task_wait::{TaskDriveEvent, TaskTable},
     completion::GetTokenUsage,
     message::{AssistantContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, ToolCallDeltaContent},
@@ -89,6 +93,58 @@ pub enum MultiTurnStreamItem<R> {
     /// surfaced (in call order) only after the whole batch settles successfully —
     /// a run that terminates mid-batch surfaces no successful tool results.
     StreamUserItem(StreamedUserContent),
+    /// A tool call was dispatched as a deferred task; its terminal result
+    /// arrives later as [`ToolTaskResult`](Self::ToolTaskResult). Surfaced at
+    /// batch settle, in call order, alongside the batch's other items. Under
+    /// [`ContinueTurns`](crate::agent::run::TaskCompletionPolicy::ContinueTurns)
+    /// the call's immediate tool_result (the model-visible placeholder) is
+    /// additionally surfaced as a normal
+    /// [`StreamUserItem`](Self::StreamUserItem).
+    #[serde(rename_all = "camelCase")]
+    ToolTaskStarted {
+        /// The effective (hook-rewritten) tool call that launched the task.
+        tool_call: crate::message::ToolCall,
+        /// Rig-generated id correlating this task's items with the model tool
+        /// call and its eventual result.
+        internal_call_id: String,
+        /// The backend-assigned task id.
+        task_id: String,
+        /// How the launching call completes relative to its turn.
+        policy: crate::agent::run::TaskCompletionPolicy,
+        /// The backend's model-facing immediate response, if any.
+        immediate_response: Option<String>,
+    },
+    /// A status observation for a running deferred task (emitted on change
+    /// only, in completion order — tasks are inherently asynchronous). Not
+    /// emitted while the consumer has the stream paused: the agent stream is
+    /// pull-based, so pausing also pauses task polling.
+    #[serde(rename_all = "camelCase")]
+    ToolTaskStatus {
+        /// Rig-generated id correlating this task's items.
+        internal_call_id: String,
+        /// The backend-assigned task id.
+        task_id: String,
+        /// The newly observed lifecycle status.
+        status: crate::tool::ToolTaskStatus,
+    },
+    /// The terminal, post-hook, model-visible result of a deferred task.
+    /// `tool_result.id` is the launching tool call's id; `policy` tells the
+    /// consumer whether this content was committed as the call's tool_result
+    /// slot (`JoinTurn`) or injected as a labeled notice into a later prompt
+    /// (`ContinueTurns`).
+    #[serde(rename_all = "camelCase")]
+    ToolTaskResult {
+        /// Rig-generated id correlating this task's items.
+        internal_call_id: String,
+        /// The backend-assigned task id.
+        task_id: String,
+        /// The model-visible result, shaped like an ordinary tool result.
+        tool_result: crate::message::ToolResult,
+        /// The terminal status the task ended in.
+        status: crate::tool::ToolTaskStatus,
+        /// How the launching call completed relative to its turn.
+        policy: crate::agent::run::TaskCompletionPolicy,
+    },
     /// Details for one successfully completed completion request made by this agent stream.
     ///
     /// This is emitted when a provider call finishes. Usage is the provider's
@@ -517,13 +573,15 @@ where
     ) -> DriveStream<'a, Self::Raw>;
 
     /// Execute a turn's tool calls, feeding the results into the machine and
-    /// yielding any intermediate items.
+    /// yielding any intermediate items. Calls that defer behind a task move
+    /// their live handles into `tasks`.
     fn run_tool_calls<'a>(
         &'a self,
         runner: &'a AgentRunner<M>,
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
+        tasks: &'a mut TaskTable,
     ) -> DriveStream<'a, Self::Raw>;
 
     /// Record run-level telemetry onto the agent span at `Done`. Gated on
@@ -577,10 +635,106 @@ where
         // per-turn index is advanced on each `CallModel` step below.
         let hook_ctx = HookContext::new(is_streaming, runner.agent_name.clone());
 
+        // The run-scoped working set of live deferred tasks. Task events
+        // observed while a step stream mutably borrows `run` fire their hooks
+        // and surface their items immediately, but their machine feedback is
+        // buffered here and applied at the top of the loop — the sans-IO
+        // machine stays single-writer. A task hook `Terminate` observed
+        // mid-step lands in `deferred_terminate` and is honored at the same
+        // boundary.
+        let mut tasks = TaskTable::new();
+        let mut task_feedback: Vec<TaskFeedback> = Vec::new();
+        let mut deferred_terminate: Option<String> = None;
+
         'outer: loop {
+            // Honor a task hook's Terminate observed during a borrowed step.
+            if let Some(reason) = deferred_terminate.take() {
+                tasks.graceful_cancel("the run was terminated by a hook").await;
+                yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
+                break 'outer;
+            }
+            // Apply buffered task feedback now that `run` is free.
+            for feedback in task_feedback.drain(..) {
+                match feedback {
+                    TaskFeedback::Status { internal_call_id, status } => {
+                        if let Err(err) = run.task_status(&internal_call_id, status) {
+                            // A status observed in the same batch that resolved
+                            // the task is stale, not fatal.
+                            tracing::debug!(error = %err, "stale task status observation dropped");
+                        }
+                    }
+                    TaskFeedback::Resolved { internal_call_id, resolution } => {
+                        if let Err(err) = run.task_resolved(&internal_call_id, resolution) {
+                            tasks.graceful_cancel("the run failed").await;
+                            yield Err(Box::new(err).into());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            // Rehydrate persisted tasks that have no live driver (a resumed
+            // run). A descriptor no registered resumer can claim resolves as a
+            // classified not-found failure so the run never wedges.
+            let unresumed: Vec<PendingTask> = run
+                .pending_tasks()
+                .into_iter()
+                .filter(|task| !tasks.is_live(&task.internal_call_id))
+                .cloned()
+                .collect();
+            for pending in unresumed {
+                let mut handle = None;
+                for resumer in &runner.task_resumers {
+                    match resumer.resume(&pending.descriptor).await {
+                        Ok(Some(resumed)) => {
+                            handle = Some(resumed);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                task_id = %pending.descriptor.task_id,
+                                error = %err,
+                                "a task resumer failed for a persisted task"
+                            );
+                        }
+                    }
+                }
+                match handle {
+                    Some(handle) => {
+                        tasks.launch(
+                            handle,
+                            &pending,
+                            crate::agent::task_wait::TaskDriveConfig {
+                                poll_fallback: runner.task_poll_interval,
+                                deadline: runner.task_deadline,
+                            },
+                            &tracing::Span::current(),
+                        );
+                    }
+                    None => {
+                        let message = format!(
+                            "deferred task `{}` for tool `{}` could not be resumed \
+                             (no registered resumer rehydrated it)",
+                            pending.descriptor.task_id, pending.tool_call.function.name,
+                        );
+                        let resolution = TaskResolution::synthetic(
+                            message,
+                            crate::tool::ToolTaskStatus::Failed,
+                        );
+                        if let Err(err) =
+                            run.task_resolved(&pending.internal_call_id, resolution)
+                        {
+                            yield Err(Box::new(err).into());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
             let step = match run.next_step() {
                 Ok(step) => step,
                 Err(err) => {
+                    tasks.graceful_cancel("the run failed").await;
                     yield Err(Box::new(err).into());
                     break 'outer;
                 }
@@ -653,23 +807,68 @@ where
                         prompt,
                     );
                     let mut errored = false;
-                    while let Some(item) = turn_stream.next().await {
-                        match item {
-                            Ok(item) => yield Ok(DriveItem::Item(item)),
-                            Err(err) => {
+                    // Forward the turn while concurrently driving any pending
+                    // deferred tasks: a task event fires its hooks and surfaces
+                    // its items immediately, but its machine feedback is
+                    // buffered (the turn stream holds the `run` borrow).
+                    loop {
+                        enum StepOrTask<I> {
+                            Step(Option<I>),
+                            // Boxed: a drive event carries a full result.
+                            Task(Box<TaskDriveEvent>),
+                        }
+                        let next = if tasks.is_empty() {
+                            StepOrTask::Step(turn_stream.next().await)
+                        } else {
+                            use futures::future::{Either, select};
+                            let step_fut = turn_stream.next();
+                            futures::pin_mut!(step_fut);
+                            let task_fut = tasks.next_event();
+                            futures::pin_mut!(task_fut);
+                            match select(step_fut, task_fut).await {
+                                Either::Left((item, _)) => StepOrTask::Step(item),
+                                Either::Right((Some(event), _)) => {
+                                    StepOrTask::Task(Box::new(event))
+                                }
+                                // The wait set drained mid-select: re-evaluate.
+                                Either::Right((None, _)) => continue,
+                            }
+                        };
+                        match next {
+                            StepOrTask::Step(None) => break,
+                            StepOrTask::Step(Some(Ok(item))) => {
+                                yield Ok(DriveItem::Item(item));
+                            }
+                            StepOrTask::Step(Some(Err(err))) => {
                                 errored = true;
                                 yield Err(err);
                                 break;
+                            }
+                            StepOrTask::Task(event) => {
+                                let (items, feedback, terminate) =
+                                    process_task_event(&runner, &hook_ctx, &mut tasks, *event)
+                                        .await;
+                                for item in items {
+                                    yield Ok(DriveItem::Item(item));
+                                }
+                                task_feedback.extend(feedback);
+                                if let Some(reason) = terminate {
+                                    deferred_terminate = Some(reason);
+                                    errored = false;
+                                    break;
+                                }
                             }
                         }
                     }
                     drop(turn_stream);
                     if errored {
+                        tasks.graceful_cancel("the run failed").await;
                         break 'outer;
                     }
                 }
                 AgentRunStep::CallTools { calls } => {
-                    let mut tool_stream = source.run_tool_calls(&runner, &hook_ctx, &mut run, calls);
+                    let mut tool_stream =
+                        source.run_tool_calls(&runner, &hook_ctx, &mut run, calls, &mut tasks);
                     let mut errored = false;
                     while let Some(item) = tool_stream.next().await {
                         match item {
@@ -683,23 +882,113 @@ where
                     }
                     drop(tool_stream);
                     if errored {
+                        tasks.graceful_cancel("the run failed").await;
                         break 'outer;
                     }
                 }
-                AgentRunStep::AwaitTasks { .. } => {
-                    // Both built-in drivers dispatch tools through
-                    // `call_tool_structured`, which never defers, so this step
-                    // is unreachable from `run()`/`stream()` today; it can only
-                    // be produced by feeding `tool_batch_results` deferrals
-                    // into a hand-driven machine. Fail closed rather than
-                    // wedge. The task wait engine lands with the driver
-                    // integration.
-                    yield Err(StreamingError::Prompt(Box::new(run.cancel_error(
-                        "deferred tool tasks are not driven by this surface yet",
-                    ))));
-                    break 'outer;
+                AgentRunStep::AwaitTasks { pending } => {
+                    // Block on the listed deferred tasks (a JoinTurn batch, or
+                    // the pre-Done drain), feeding each terminal result into
+                    // the machine as it arrives. `run` is free here, so
+                    // feedback applies immediately.
+                    let mut awaiting: std::collections::BTreeSet<String> = pending
+                        .iter()
+                        .map(|task| task.internal_call_id.clone())
+                        .collect();
+                    let mut errored = false;
+                    while !awaiting.is_empty() {
+                        match tasks.next_event().await {
+                            Some(event) => {
+                                let (items, feedback, terminate) =
+                                    process_task_event(&runner, &hook_ctx, &mut tasks, event)
+                                        .await;
+                                for item in items {
+                                    yield Ok(DriveItem::Item(item));
+                                }
+                                match feedback {
+                                    Some(TaskFeedback::Status { internal_call_id, status }) => {
+                                        if let Err(err) =
+                                            run.task_status(&internal_call_id, status)
+                                        {
+                                            tracing::debug!(
+                                                error = %err,
+                                                "stale task status observation dropped"
+                                            );
+                                        }
+                                    }
+                                    Some(TaskFeedback::Resolved {
+                                        internal_call_id,
+                                        resolution,
+                                    }) => {
+                                        awaiting.remove(&internal_call_id);
+                                        if let Err(err) =
+                                            run.task_resolved(&internal_call_id, resolution)
+                                        {
+                                            yield Err(Box::new(err).into());
+                                            errored = true;
+                                            break;
+                                        }
+                                    }
+                                    None => {}
+                                }
+                                if let Some(reason) = terminate {
+                                    tasks
+                                        .graceful_cancel("the run was terminated by a hook")
+                                        .await;
+                                    yield Err(StreamingError::Prompt(Box::new(
+                                        run.cancel_error(reason),
+                                    )));
+                                    errored = true;
+                                    break;
+                                }
+                            }
+                            None => {
+                                // No live driver remains for an awaited task
+                                // (it could not be launched or resumed):
+                                // resolve the leftovers as classified failures
+                                // so the run never wedges.
+                                for internal_call_id in std::mem::take(&mut awaiting) {
+                                    let resolution = TaskResolution::synthetic(
+                                        format!(
+                                            "deferred task for call `{internal_call_id}` has no \
+                                             live driver and could not be awaited"
+                                        ),
+                                        crate::tool::ToolTaskStatus::Failed,
+                                    );
+                                    if let Err(err) =
+                                        run.task_resolved(&internal_call_id, resolution)
+                                    {
+                                        yield Err(Box::new(err).into());
+                                        errored = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if errored {
+                        tasks.graceful_cancel("the run failed").await;
+                        break 'outer;
+                    }
                 }
                 AgentRunStep::Done(response) => {
+                    // Settle any tasks that outlived the run: Detach leaves
+                    // them running (dropping their drivers abandons them
+                    // locally; the descriptors are on `unresolved_tasks`),
+                    // every other policy — including a degraded WaitAndResume —
+                    // best-effort cancels them.
+                    if !tasks.is_empty() {
+                        match runner.task_drain {
+                            TaskDrainPolicy::Detach => {
+                                tasks.detach();
+                            }
+                            _ => {
+                                tasks
+                                    .graceful_cancel("the run finished before the task completed")
+                                    .await;
+                            }
+                        }
+                    }
                     // Run-completion marker, unifying the blocking driver's
                     // "Depth reached" and the streaming driver's "multi-turn
                     // stream finished" logs into one shared event.
@@ -724,6 +1013,179 @@ where
                     break 'outer;
                 }
             }
+        }
+    }
+}
+
+/// Machine feedback produced by a processed task event, applied immediately
+/// when the engine owns `run` (the await-tasks arm, the loop top) and buffered
+/// while a step stream holds the borrow (a multiplexed model turn).
+pub(crate) enum TaskFeedback {
+    /// Record a status observation via [`AgentRun::task_status`].
+    Status {
+        internal_call_id: String,
+        status: crate::tool::ToolTaskStatus,
+    },
+    /// Deliver a terminal result via [`AgentRun::task_resolved`].
+    Resolved {
+        internal_call_id: String,
+        resolution: crate::agent::run::TaskResolution,
+    },
+}
+
+/// Handle one [`TaskDriveEvent`]: fire the task hooks (honoring
+/// `CancelTask`/`Terminate`/`RewriteResult`), record the task span after the
+/// result hook (redaction discipline), and shape the stream items and machine
+/// feedback for the caller to yield/apply. Returns `(items, feedback,
+/// terminate_reason)`.
+async fn process_task_event<M, R>(
+    runner: &AgentRunner<M>,
+    hook_ctx: &HookContext,
+    tasks: &mut crate::agent::task_wait::TaskTable,
+    event: crate::agent::task_wait::TaskDriveEvent,
+) -> (
+    Vec<MultiTurnStreamItem<R>>,
+    Option<TaskFeedback>,
+    Option<String>,
+)
+where
+    M: CompletionModel,
+{
+    use crate::agent::runner::{TaskEventDecision, flow_into_task_event};
+    use crate::agent::task_wait::TaskDriveEvent;
+
+    match event {
+        TaskDriveEvent::Status {
+            internal_call_id,
+            tool_name,
+            call_id,
+            task_id,
+            status,
+        } => {
+            let mut terminate = None;
+            // Status events are high-frequency relative to the rest of the
+            // run: gate the hook dispatch on `observes`, like the streamed
+            // delta events. The machine bookkeeping happens either way.
+            if runner.hooks.observes(StepEventKind::ToolTaskStatus) {
+                let flow = runner
+                    .hooks
+                    .on_event(
+                        hook_ctx,
+                        StepEvent::ToolTaskStatus {
+                            tool_name: &tool_name,
+                            tool_call_id: call_id.as_deref(),
+                            internal_call_id: &internal_call_id,
+                            task_id: &task_id,
+                            status,
+                        },
+                    )
+                    .await;
+                match flow_into_task_event(flow) {
+                    TaskEventDecision::Proceed => {}
+                    TaskEventDecision::Cancel(reason) => {
+                        tasks.cancel_one(&internal_call_id, reason);
+                    }
+                    TaskEventDecision::Terminate(reason) => terminate = Some(reason),
+                }
+            }
+            let items = vec![MultiTurnStreamItem::ToolTaskStatus {
+                internal_call_id: internal_call_id.clone(),
+                task_id,
+                status,
+            }];
+            (
+                items,
+                Some(TaskFeedback::Status {
+                    internal_call_id,
+                    status,
+                }),
+                terminate,
+            )
+        }
+        TaskDriveEvent::Resolved {
+            internal_call_id,
+            tool_name,
+            tool_use_id,
+            call_id,
+            task_id,
+            policy,
+            result,
+            status,
+            synthetic,
+        } => {
+            let task_span = tasks.finish(&internal_call_id);
+            let flow = runner
+                .hooks
+                .on_event(
+                    hook_ctx,
+                    StepEvent::ToolTaskResult {
+                        tool_name: &tool_name,
+                        tool_call_id: call_id.as_deref(),
+                        internal_call_id: &internal_call_id,
+                        task_id: &task_id,
+                        result: result.model_output(),
+                        outcome: result.outcome(),
+                        extensions: result.extensions(),
+                        policy,
+                    },
+                )
+                .await;
+            let (output, synthetic, terminate) =
+                match crate::agent::runner::flow_into_tool_result(flow) {
+                    crate::agent::runner::ToolResultDecision::Keep => {
+                        (result.model_output().to_string(), synthetic, None)
+                    }
+                    // A rewrite is hook-supplied content: delivered verbatim.
+                    crate::agent::runner::ToolResultDecision::Replace(replacement) => {
+                        (replacement, true, None)
+                    }
+                    crate::agent::runner::ToolResultDecision::Terminate(reason) => {
+                        // Do not record the raw output: the run is terminating
+                        // and the hook may have terminated to prevent the leak.
+                        return (Vec::new(), None, Some(reason));
+                    }
+                };
+            // Post-hook recording, mirroring the inline tool path.
+            if let Some(span) = &task_span {
+                span.record("gen_ai.tool.task.status", status.as_str());
+                span.record("gen_ai.tool.call.result", &output);
+                span.record("gen_ai.tool.call.outcome", result.outcome().as_str());
+                if let crate::tool::ToolOutcome::Error(failure) = result.outcome() {
+                    span.record("gen_ai.tool.error.type", failure.kind.as_str());
+                }
+            }
+            let resolution = if synthetic {
+                crate::agent::run::TaskResolution::synthetic(output.clone(), status)
+            } else {
+                crate::agent::run::TaskResolution::new(output.clone(), status)
+            };
+            // Shape the model-visible item exactly like the machine shapes the
+            // committed content.
+            let item_content = if synthetic {
+                tool_result_message(tool_use_id.clone(), call_id.clone(), output)
+            } else {
+                tool_result_output(tool_use_id.clone(), call_id.clone(), output)
+            };
+            let items = match item_content {
+                UserContent::ToolResult(tool_result) => {
+                    vec![MultiTurnStreamItem::ToolTaskResult {
+                        internal_call_id: internal_call_id.clone(),
+                        task_id,
+                        tool_result,
+                        status,
+                        policy,
+                    }]
+                }
+                _ => Vec::new(),
+            };
+            (
+                items,
+                Some(TaskFeedback::Resolved {
+                    internal_call_id,
+                    resolution,
+                }),
+                terminate,
+            )
         }
     }
 }
@@ -756,6 +1218,7 @@ pub(crate) fn drive_tool_calls<'a, M, R, F>(
     hook_ctx: &'a HookContext,
     run: &'a mut AgentRun,
     calls: Vec<PendingToolCall>,
+    tasks: &'a mut crate::agent::task_wait::TaskTable,
     chain_tool_span: F,
     forward_items: bool,
 ) -> DriveStream<'a, R>
@@ -785,11 +1248,15 @@ where
         Executed(Box<crate::message::ToolCall>),
         Skipped,
         Preresolved,
+        // The backend accepted the call as a deferred task; the handle (and its
+        // launch span) move into the engine's TaskTable at settle.
+        Deferred(Box<crate::agent::runner::DeferredToolCall>, tracing::Span),
     }
     // A collected tool outcome, held (not surfaced or committed) until the whole
-    // batch settles.
+    // batch settles. `content` is `None` for a deferred call — its result slot
+    // is owned by the run state machine until the task resolves.
     struct CollectedToolResult {
-        content: UserContent,
+        content: Option<UserContent>,
         internal_call_id: String,
         surface: ToolSurface,
     }
@@ -838,6 +1305,7 @@ where
             (0..call_count).map(|_| None).collect();
         let mut first_error: Option<(usize, PromptError)> = None;
 
+        let launched_turn = run.turn();
         if runner.concurrency <= 1 {
             // Sequential: run in call order, fail-fast on the first terminating
             // error so the remaining tools never start.
@@ -846,13 +1314,14 @@ where
                 if let Some(result) = preresolved_result {
                     if let Some(slot) = collected.get_mut(index) {
                         *slot = Some(CollectedToolResult {
-                            content: result,
+                            content: Some(result),
                             internal_call_id,
                             surface: ToolSurface::Preresolved,
                         });
                     }
                     continue;
                 }
+                let policy = runner.task_policy_for_tool(&tool_call.function.name);
                 let outcome = run_single_tool(
                     &runner.hooks,
                     hook_ctx,
@@ -860,21 +1329,32 @@ where
                     &runner.tool_extensions,
                     &tool_call,
                     &internal_call_id,
+                    policy,
+                    launched_turn,
                     &full_history_for_errors,
                 )
-                .instrument(span)
+                .instrument(span.clone())
                 .await;
                 match outcome {
-                    Ok(outcome) => {
+                    Ok(SingleToolResolution::Completed(outcome)) => {
                         let surface = match outcome.execution {
                             ToolExecution::Executed(effective) => ToolSurface::Executed(effective),
                             ToolExecution::Skipped => ToolSurface::Skipped,
                         };
                         if let Some(slot) = collected.get_mut(index) {
                             *slot = Some(CollectedToolResult {
-                                content: outcome.content,
+                                content: Some(outcome.content),
                                 internal_call_id,
                                 surface,
+                            });
+                        }
+                    }
+                    Ok(SingleToolResolution::Deferred(deferred)) => {
+                        if let Some(slot) = collected.get_mut(index) {
+                            *slot = Some(CollectedToolResult {
+                                content: None,
+                                internal_call_id,
+                                surface: ToolSurface::Deferred(deferred, span),
                             });
                         }
                     }
@@ -899,12 +1379,14 @@ where
                     let tool_extensions = &runner.tool_extensions;
                     let full_history_for_errors = &full_history_for_errors;
                     let terminating = terminating.clone();
+                    let policy = runner.task_policy_for_tool(&tool_call.function.name);
+                    let outer_span = span.clone();
                     async move {
                         if let Some(result) = preresolved_result {
                             return (
                                 index,
                                 Some(Ok(CollectedToolResult {
-                                    content: result,
+                                    content: Some(result),
                                     internal_call_id,
                                     surface: ToolSurface::Preresolved,
                                 })),
@@ -921,21 +1403,30 @@ where
                             tool_extensions,
                             &tool_call,
                             &internal_call_id,
+                            policy,
+                            launched_turn,
                             full_history_for_errors,
                         )
                         .await;
-                        let mapped = outcome.map(|o| {
-                            let surface = match o.execution {
-                                ToolExecution::Executed(effective) => {
-                                    ToolSurface::Executed(effective)
+                        let mapped = outcome.map(|resolution| match resolution {
+                            SingleToolResolution::Completed(o) => {
+                                let surface = match o.execution {
+                                    ToolExecution::Executed(effective) => {
+                                        ToolSurface::Executed(effective)
+                                    }
+                                    ToolExecution::Skipped => ToolSurface::Skipped,
+                                };
+                                CollectedToolResult {
+                                    content: Some(o.content),
+                                    internal_call_id,
+                                    surface,
                                 }
-                                ToolExecution::Skipped => ToolSurface::Skipped,
-                            };
-                            CollectedToolResult {
-                                content: o.content,
-                                internal_call_id,
-                                surface,
                             }
+                            SingleToolResolution::Deferred(deferred) => CollectedToolResult {
+                                content: None,
+                                internal_call_id,
+                                surface: ToolSurface::Deferred(deferred, outer_span),
+                            },
                         });
                         (index, Some(mapped))
                     }
@@ -969,8 +1460,21 @@ where
         }
 
         // Settle. On termination: surface only the deterministic error — no
-        // execution-start, no result, no history commit (all-or-nothing).
+        // execution-start, no result, no history commit (all-or-nothing). Any
+        // deferred task already launched this batch is best-effort cancelled
+        // so a terminating batch leaves no orphaned backend work.
         if let Some((_, err)) = first_error {
+            for slot in collected.into_iter().flatten() {
+                if let ToolSurface::Deferred(deferred, _) = slot.surface
+                    && let Err(failure) = deferred.handle.cancel().await
+                {
+                    tracing::warn!(
+                        task_id = %deferred.pending.descriptor.task_id,
+                        error = %failure.message,
+                        "failed to cancel a deferred task while failing its batch"
+                    );
+                }
+            }
             yield Err(StreamingError::Prompt(Box::new(err)));
             return;
         }
@@ -982,7 +1486,8 @@ where
         // preresolved call surfaces nothing (already surfaced during the model
         // turn) but is still committed. Every non-dropped slot is filled; a
         // dropped slot only occurs after a termination, handled above.
-        let mut committed: Vec<UserContent> = Vec::with_capacity(call_count);
+        let mut resolutions: Vec<crate::agent::run::ToolCallResolution> =
+            Vec::with_capacity(call_count);
         for slot in collected {
             let CollectedToolResult { content, internal_call_id, surface } = match slot {
                 Some(collected_result) => collected_result,
@@ -994,6 +1499,67 @@ where
                     ))));
                     return;
                 }
+            };
+            // A deferred call moves its live handle into the engine's task
+            // table, surfaces its launch item (plus, under ContinueTurns, the
+            // model-visible immediate tool_result the machine will commit),
+            // and feeds the machine its serializable record.
+            if let ToolSurface::Deferred(deferred, launch_span) = surface {
+                let crate::agent::runner::DeferredToolCall {
+                    handle,
+                    pending,
+                    effective_tool_call,
+                } = *deferred;
+                if forward_items {
+                    yield Ok(MultiTurnStreamItem::ToolTaskStarted {
+                        tool_call: (*effective_tool_call).clone(),
+                        internal_call_id: internal_call_id.clone(),
+                        task_id: pending.descriptor.task_id.clone(),
+                        policy: pending.policy,
+                        immediate_response: pending.immediate_response.clone(),
+                    });
+                    if pending.policy == crate::agent::run::TaskCompletionPolicy::ContinueTurns {
+                        // Mirror the machine's slot shaping so the stream shows
+                        // exactly what the model will see.
+                        let text = pending.immediate_response.clone().unwrap_or_else(|| {
+                            crate::agent::run::task_launch_notice_text(&pending)
+                        });
+                        let slot_content = crate::agent::prompt_request::tool_result_message(
+                            pending.tool_call.id.clone(),
+                            pending.tool_call.call_id.clone(),
+                            text,
+                        );
+                        if let UserContent::ToolResult(tool_result) = &slot_content {
+                            yield Ok(MultiTurnStreamItem::StreamUserItem(
+                                StreamedUserContent::ToolResult {
+                                    tool_result: tool_result.clone(),
+                                    internal_call_id: internal_call_id.clone(),
+                                },
+                            ));
+                        }
+                    }
+                }
+                tasks.launch(
+                    handle,
+                    &pending,
+                    crate::agent::task_wait::TaskDriveConfig {
+                        poll_fallback: runner.task_poll_interval,
+                        deadline: runner.task_deadline,
+                    },
+                    &launch_span,
+                );
+                resolutions.push(crate::agent::run::ToolCallResolution::Deferred(Box::new(
+                    pending,
+                )));
+                continue;
+            }
+            let Some(content) = content else {
+                yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
+                    CompletionError::ResponseError(
+                        "tool execution finished without producing every result".to_string(),
+                    ),
+                ))));
+                return;
             };
             if forward_items {
                 // An executed call also surfaces its execution-start; a skipped
@@ -1008,7 +1574,7 @@ where
                         true
                     }
                     ToolSurface::Skipped => true,
-                    ToolSurface::Preresolved => false,
+                    ToolSurface::Preresolved | ToolSurface::Deferred(..) => false,
                 };
                 if surface_result
                     && let UserContent::ToolResult(tool_result) = &content
@@ -1021,10 +1587,10 @@ where
                     ));
                 }
             }
-            committed.push(content);
+            resolutions.push(crate::agent::run::ToolCallResolution::Completed(content));
         }
 
-        if let Err(err) = run.tool_results(committed) {
+        if let Err(err) = run.tool_batch_results(resolutions) {
             yield Err(Box::new(err).into());
             return;
         }
@@ -1428,10 +1994,11 @@ where
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
+        tasks: &'a mut TaskTable,
     ) -> DriveStream<'a, M::StreamingResponse> {
         // The streaming surface chains nothing onto its tool spans, and forwards
         // the ToolCall/ToolResult items to the consumer.
-        drive_tool_calls(runner, hook_ctx, run, calls, |span| span, true)
+        drive_tool_calls(runner, hook_ctx, run, calls, tasks, |span| span, true)
     }
 
     fn record_run_level_telemetry(
@@ -1535,6 +2102,42 @@ where
             agent_span.clone(),
             created_agent_span,
             memory_handle,
+            true,
+        )
+        .filter_map(|item| {
+            std::future::ready(match item {
+                Ok(DriveItem::Item(item)) => Some(Ok(item)),
+                Ok(DriveItem::Done(_)) => None,
+                Err(err) => Some(Err(err)),
+            })
+        });
+
+        Box::pin(driver.instrument(agent_span))
+    }
+
+    /// Stream a previously suspended [`AgentRun`] to completion instead of
+    /// starting fresh — the streaming counterpart of
+    /// [`run_from`](AgentRunner::run_from). Deferred tasks recorded in the run
+    /// are rehydrated via the registered
+    /// [`TaskResumer`](crate::tool::TaskResumer)s; conversation memory is
+    /// bypassed (an explicit run carries its own history).
+    pub fn stream_from(self, run: AgentRun) -> StreamingResult<M::StreamingResponse> {
+        let (agent_span, created_agent_span) =
+            acquire_agent_span(self.agent_name_or_default(), self.preamble.as_deref());
+
+        let source = StreamingTurnSource::new(
+            &self.hooks,
+            self.agent_name_or_default().to_string(),
+            created_agent_span,
+        );
+
+        let driver = drive_agent(
+            self,
+            source,
+            run,
+            agent_span.clone(),
+            created_agent_span,
+            None,
             true,
         )
         .filter_map(|item| {

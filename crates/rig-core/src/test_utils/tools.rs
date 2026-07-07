@@ -635,3 +635,262 @@ impl Tool for MockMetadataTool {
             .with_extension(MockRequestId("req-7".to_string())))
     }
 }
+
+/// Scripted control state shared between a [`MockTaskTool`], the
+/// [`MockTaskHandle`]s it hands out, and the test driving them.
+#[derive(Default)]
+pub struct MockTaskState {
+    /// The statuses `status()` reports, consumed front-to-back (the last one
+    /// repeats). Terminal statuses make the driver fetch the result.
+    pub statuses: Mutex<Vec<crate::tool::ToolTaskStatus>>,
+    /// The output `wait()` resolves with once terminal.
+    pub output: Mutex<String>,
+    /// Records every `cancel()` call.
+    pub cancels: Mutex<u32>,
+    /// Wakes pollers when the script advances.
+    pub advanced: tokio::sync::Notify,
+}
+
+impl MockTaskState {
+    /// Replace the scripted status sequence and wake pollers.
+    pub fn set_statuses(&self, statuses: Vec<crate::tool::ToolTaskStatus>) {
+        *self
+            .statuses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
+        self.advanced.notify_waiters();
+    }
+
+    /// Mark the task completed with `output` and wake pollers.
+    pub fn complete(&self, output: impl Into<String>) {
+        *self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = output.into();
+        self.set_statuses(vec![crate::tool::ToolTaskStatus::Completed]);
+    }
+
+    /// The number of `cancel()` calls observed.
+    pub fn cancel_count(&self) -> u32 {
+        *self
+            .cancels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn current_status(&self) -> crate::tool::ToolTaskStatus {
+        let mut statuses = self
+            .statuses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if statuses.len() > 1 {
+            statuses.remove(0)
+        } else {
+            statuses
+                .first()
+                .copied()
+                .unwrap_or(crate::tool::ToolTaskStatus::Working)
+        }
+    }
+}
+
+/// A [`ToolTaskHandle`](crate::tool::ToolTaskHandle) driven entirely by a
+/// shared [`MockTaskState`] script.
+pub struct MockTaskHandle {
+    /// The shared script.
+    pub state: Arc<MockTaskState>,
+    /// The task id reported by the handle and its descriptor.
+    pub task_id: String,
+    /// The backend's immediate-response hint.
+    pub immediate_response: Option<String>,
+}
+
+impl crate::tool::ToolTaskHandle for MockTaskHandle {
+    fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    fn status(
+        &self,
+    ) -> crate::wasm_compat::WasmBoxedFuture<'_, Result<crate::tool::ToolTaskStatus, ToolFailure>>
+    {
+        Box::pin(async move { Ok(self.state.current_status()) })
+    }
+
+    fn wait(
+        self: Box<Self>,
+    ) -> crate::wasm_compat::WasmBoxedFuture<'static, crate::tool::ToolExecutionResult> {
+        Box::pin(async move {
+            loop {
+                let status = self.state.current_status();
+                if status.is_terminal() {
+                    let output = self
+                        .state
+                        .output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    return match status {
+                        crate::tool::ToolTaskStatus::Completed => {
+                            crate::tool::ToolExecutionResult::success(output)
+                        }
+                        _ => crate::tool::ToolExecutionResult::failed(
+                            output.clone(),
+                            ToolFailure::other(output),
+                        ),
+                    };
+                }
+                self.state.advanced.notified().await;
+            }
+        })
+    }
+
+    fn cancel(&self) -> crate::wasm_compat::WasmBoxedFuture<'_, Result<(), ToolFailure>> {
+        Box::pin(async move {
+            *self
+                .state
+                .cancels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            self.state
+                .set_statuses(vec![crate::tool::ToolTaskStatus::Cancelled]);
+            Ok(())
+        })
+    }
+
+    fn poll_hint(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(20))
+    }
+
+    fn descriptor(&self) -> crate::tool::ToolTaskDescriptor {
+        crate::tool::ToolTaskDescriptor {
+            immediate_response: self.immediate_response.clone(),
+            ..crate::tool::ToolTaskDescriptor::new("mock", self.task_id.clone(), MockTaskTool::NAME)
+        }
+    }
+
+    fn immediate_response(&self) -> Option<&str> {
+        self.immediate_response.as_deref()
+    }
+}
+
+/// A tool whose dispatch always defers behind a [`MockTaskHandle`] scripted by
+/// the shared [`MockTaskState`].
+#[derive(Clone)]
+pub struct MockTaskTool {
+    /// The script shared with every handle this tool hands out.
+    pub state: Arc<MockTaskState>,
+    /// The task id assigned to launched tasks.
+    pub task_id: String,
+    /// The backend's immediate-response hint.
+    pub immediate_response: Option<String>,
+}
+
+impl MockTaskTool {
+    /// The tool name.
+    pub const NAME: &'static str = "mock_task";
+
+    /// A deferring tool with a fresh script.
+    pub fn new(task_id: impl Into<String>) -> Self {
+        Self {
+            state: Arc::new(MockTaskState::default()),
+            task_id: task_id.into(),
+            immediate_response: None,
+        }
+    }
+
+    /// Set the immediate-response hint launched handles report.
+    pub fn with_immediate_response(mut self, response: impl Into<String>) -> Self {
+        self.immediate_response = Some(response.into());
+        self
+    }
+}
+
+impl crate::tool::ToolDyn for MockTaskTool {
+    fn name(&self) -> String {
+        Self::NAME.to_string()
+    }
+
+    fn definition(
+        &self,
+        _prompt: String,
+    ) -> crate::wasm_compat::WasmBoxedFuture<'_, ToolDefinition> {
+        Box::pin(async move {
+            ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "Test tool that defers behind a task".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }
+        })
+    }
+
+    fn call(
+        &self,
+        _args: String,
+    ) -> crate::wasm_compat::WasmBoxedFuture<'_, Result<String, crate::tool::ToolError>> {
+        Box::pin(async move {
+            Err(crate::tool::ToolError::ToolCallError(
+                "MockTaskTool only supports the dispatch path".into(),
+            ))
+        })
+    }
+
+    fn dispatch_structured<'a>(
+        &'a self,
+        _args: String,
+        _extensions: &'a ToolCallExtensions,
+    ) -> crate::wasm_compat::WasmBoxedFuture<'a, crate::tool::ToolDispatch> {
+        Box::pin(async move {
+            crate::tool::ToolDispatch::Deferred(Box::new(MockTaskHandle {
+                state: self.state.clone(),
+                task_id: self.task_id.clone(),
+                immediate_response: self.immediate_response.clone(),
+            }))
+        })
+    }
+}
+
+/// A [`TaskResumer`](crate::tool::TaskResumer) that records the descriptors it
+/// is asked about and rehydrates `"mock"`-backend tasks against a shared
+/// [`MockTaskState`].
+pub struct MockTaskResumer {
+    /// The script resumed handles are driven by.
+    pub state: Arc<MockTaskState>,
+    /// Every descriptor this resumer was consulted for.
+    pub seen: Arc<Mutex<Vec<crate::tool::ToolTaskDescriptor>>>,
+}
+
+impl MockTaskResumer {
+    /// A resumer over the given script.
+    pub fn new(state: Arc<MockTaskState>) -> Self {
+        Self {
+            state,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl crate::tool::TaskResumer for MockTaskResumer {
+    fn resume<'a>(
+        &'a self,
+        descriptor: &'a crate::tool::ToolTaskDescriptor,
+    ) -> crate::wasm_compat::WasmBoxedFuture<
+        'a,
+        Result<Option<Box<dyn crate::tool::ToolTaskHandle>>, crate::tool::ToolError>,
+    > {
+        Box::pin(async move {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(descriptor.clone());
+            if descriptor.backend != "mock" {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(MockTaskHandle {
+                state: self.state.clone(),
+                task_id: descriptor.task_id.clone(),
+                immediate_response: descriptor.immediate_response.clone(),
+            }) as Box<dyn crate::tool::ToolTaskHandle>))
+        })
+    }
+}

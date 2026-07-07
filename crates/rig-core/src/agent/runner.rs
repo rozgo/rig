@@ -47,7 +47,8 @@ use super::{
         tool_result_message, tool_result_output,
     },
     run::{
-        AgentRun, DEFAULT_OUTPUT_RETRIES, ModelTurn, ModelTurnOutcome, OutputMode, PendingToolCall,
+        AgentRun, DEFAULT_OUTPUT_RETRIES, ModelTurn, ModelTurnOutcome, OutputMode, PendingTask,
+        PendingToolCall, TaskCompletionPolicy, TaskDrainPolicy,
     },
 };
 use crate::{
@@ -106,6 +107,7 @@ fn flow_name(flow: &Flow) -> &'static str {
         Flow::Fail => "Fail",
         Flow::Retry { .. } => "Retry",
         Flow::Repair { .. } => "Repair",
+        Flow::CancelTask { .. } => "CancelTask",
     }
 }
 
@@ -237,15 +239,44 @@ pub(crate) fn flow_into_invalid(flow: Flow) -> InvalidDecision {
         Flow::Skip { reason } => InvalidDecision::Action(InvalidToolCallHookAction::skip(reason)),
         // Continue and Fail both preserve fail-fast for invalid calls.
         Flow::Continue | Flow::Fail => InvalidDecision::Action(InvalidToolCallHookAction::fail()),
-        // `RewriteArgs`/`RewriteResult`/`PatchRequest` steer a *valid* call;
-        // they cannot repair an unknown or disallowed one (use `Repair` to
-        // rewrite the name), so they are fail-closed here.
+        // `RewriteArgs`/`RewriteResult`/`PatchRequest` steer a *valid* call
+        // (and `CancelTask` a running task); they cannot repair an unknown or
+        // disallowed one (use `Repair` to rewrite the name), so they are
+        // fail-closed here.
         other @ (Flow::RewriteArgs { .. }
         | Flow::RewriteResult { .. }
-        | Flow::PatchRequest { .. }) => InvalidDecision::Terminate(format!(
+        | Flow::PatchRequest { .. }
+        | Flow::CancelTask { .. }) => InvalidDecision::Terminate(format!(
             "hook returned `{}` for an invalid tool-call event, which only \
                  honors Fail/Retry/Repair/Skip/Terminate — terminating the run \
                  (fail-closed)",
+            flow_name(&other)
+        )),
+    }
+}
+
+/// Decision for a [`StepEvent::ToolTaskStarted`] / [`StepEvent::ToolTaskStatus`]
+/// event.
+pub(crate) enum TaskEventDecision {
+    /// Keep driving the task.
+    Proceed,
+    /// Cancel the task; deliver `reason` to the model as its result.
+    Cancel(String),
+    /// Terminate the run.
+    Terminate(String),
+}
+
+/// Resolve a hook's [`Flow`] for a task lifecycle event (honors
+/// `Continue`/`CancelTask`/`Terminate`). **Fail-closed**: any other action
+/// terminates the run rather than silently letting the task run on.
+pub(crate) fn flow_into_task_event(flow: Flow) -> TaskEventDecision {
+    match flow {
+        Flow::Continue => TaskEventDecision::Proceed,
+        Flow::CancelTask { reason } => TaskEventDecision::Cancel(reason),
+        Flow::Terminate { reason } => TaskEventDecision::Terminate(reason),
+        other => TaskEventDecision::Terminate(format!(
+            "hook returned `{}` for a task lifecycle event, which only honors \
+             Continue/CancelTask/Terminate — terminating the run (fail-closed)",
             flow_name(&other)
         )),
     }
@@ -291,6 +322,20 @@ where
     pub(crate) memory: Option<Arc<dyn ConversationMemory>>,
     pub(crate) conversation_id: Option<String>,
     pub(crate) hooks: HookStack<M>,
+    /// Default completion policy for tool calls that defer behind a task.
+    pub(crate) task_policy: TaskCompletionPolicy,
+    /// Per-tool-name completion-policy overrides.
+    pub(crate) task_policies: std::collections::BTreeMap<String, TaskCompletionPolicy>,
+    /// Per-task wall-clock deadline, measured from launch. `None` = unbounded
+    /// (the backend's own bounds still apply).
+    pub(crate) task_deadline: Option<std::time::Duration>,
+    /// Fallback status-poll cadence when a task handle carries no
+    /// [`poll_hint`](crate::tool::ToolTaskHandle::poll_hint).
+    pub(crate) task_poll_interval: Option<std::time::Duration>,
+    /// What to do when the model finalizes while tasks are still pending.
+    pub(crate) task_drain: TaskDrainPolicy,
+    /// Resumers consulted (in order) to rehydrate persisted task descriptors.
+    pub(crate) task_resumers: Vec<Arc<dyn crate::tool::TaskResumer>>,
 }
 
 impl<M> AgentRunner<M>
@@ -322,6 +367,12 @@ where
             memory: agent.memory.clone(),
             conversation_id: agent.default_conversation_id.clone(),
             hooks: agent.hooks.clone(),
+            task_policy: TaskCompletionPolicy::default(),
+            task_policies: std::collections::BTreeMap::new(),
+            task_deadline: None,
+            task_poll_interval: None,
+            task_drain: TaskDrainPolicy::default(),
+            task_resumers: Vec::new(),
         }
     }
 
@@ -418,6 +469,69 @@ where
         self
     }
 
+    /// Set the default [`TaskCompletionPolicy`] for tool calls that defer
+    /// behind a task. Defaults to
+    /// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns).
+    pub fn task_policy(mut self, policy: TaskCompletionPolicy) -> Self {
+        self.task_policy = policy;
+        self
+    }
+
+    /// Override the completion policy for one tool by name; other tools use
+    /// the runner-wide [`task_policy`](Self::task_policy). The resolved policy
+    /// is stamped into the run state at dispatch, so serialization pins it.
+    pub fn task_policy_for(
+        mut self,
+        tool_name: impl Into<String>,
+        policy: TaskCompletionPolicy,
+    ) -> Self {
+        self.task_policies.insert(tool_name.into(), policy);
+        self
+    }
+
+    /// Bound every deferred task by a wall-clock deadline measured from its
+    /// launch. On expiry the driver best-effort cancels the task and delivers
+    /// a classified [`Timeout`](crate::tool::ToolFailureKind::Timeout) result.
+    pub fn task_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.task_deadline = Some(deadline);
+        self
+    }
+
+    /// Set the fallback status-poll cadence for deferred tasks whose handle
+    /// carries no backend poll hint.
+    pub fn task_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.task_poll_interval = Some(interval);
+        self
+    }
+
+    /// Set the [`TaskDrainPolicy`] applied when the model produces its final
+    /// answer while tasks are still pending. Defaults to
+    /// [`WaitAndResume`](TaskDrainPolicy::WaitAndResume).
+    pub fn task_drain(mut self, policy: TaskDrainPolicy) -> Self {
+        self.task_drain = policy;
+        self
+    }
+
+    /// Register a [`TaskResumer`](crate::tool::TaskResumer) consulted (in
+    /// registration order) to rehydrate persisted task descriptors when a
+    /// serialized run is resumed via [`run_from`](Self::run_from) /
+    /// [`stream_from`](Self::stream_from).
+    pub fn task_resumer<R>(mut self, resumer: R) -> Self
+    where
+        R: crate::tool::TaskResumer + 'static,
+    {
+        self.task_resumers.push(Arc::new(resumer));
+        self
+    }
+
+    /// Resolve the completion policy for a tool at dispatch time.
+    pub(crate) fn task_policy_for_tool(&self, tool_name: &str) -> TaskCompletionPolicy {
+        self.task_policies
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.task_policy)
+    }
+
     pub(crate) fn agent_name_or_default(&self) -> &str {
         self.agent_name.as_deref().unwrap_or(UNKNOWN_AGENT_NAME)
     }
@@ -435,6 +549,7 @@ where
             history_override.or_else(|| self.chat_history.clone()),
             self.tool_choice.clone(),
         )
+        .with_task_drain(self.task_drain)
     }
 }
 
@@ -583,6 +698,29 @@ pub(crate) struct ToolCallOutcome {
     pub execution: ToolExecution,
 }
 
+/// A tool call the backend accepted as a deferred task: the live handle the
+/// driver must drive, plus the serializable [`PendingTask`] fed to the run
+/// state machine.
+pub(crate) struct DeferredToolCall {
+    /// The live task handle (never serialized; rebuilt on resume).
+    pub handle: Box<dyn crate::tool::ToolTaskHandle>,
+    /// The serializable record for [`AgentRun::tool_batch_results`].
+    pub pending: PendingTask,
+    /// The effective (hook-rewritten) tool call, for stream items.
+    pub effective_tool_call: Box<ToolCall>,
+}
+
+/// How one call resolved out of [`run_single_tool`]: completed inline (exactly
+/// the historical [`ToolCallOutcome`] path — the `ToolResult` hook has fired),
+/// or deferred behind a task (the `ToolTaskStarted` hook has fired; the
+/// `ToolTaskResult` hook fires at resolution instead of `ToolResult`).
+pub(crate) enum SingleToolResolution {
+    /// The call finished inline.
+    Completed(ToolCallOutcome),
+    /// The call deferred; the driver owns the handle.
+    Deferred(Box<DeferredToolCall>),
+}
+
 /// Execute a single tool call, firing the `ToolCall` and `ToolResult` hooks and
 /// shaping the result. **Shared by the blocking and streaming drivers** so a
 /// tool call behaves identically in both: same hook events, same fail-closed
@@ -591,6 +729,7 @@ pub(crate) struct ToolCallOutcome {
 /// ([`tool_result_output`]). Records `gen_ai.tool.*` on the current span;
 /// `error_history` builds a cancellation error if a hook terminates the run.
 /// Returns whether the tool body executed via [`ToolCallOutcome::execution`].
+#[allow(clippy::too_many_arguments)] // one shared per-call routine beats splitting its context
 pub(crate) async fn run_single_tool<M>(
     hooks: &HookStack<M>,
     ctx: &HookContext,
@@ -598,8 +737,10 @@ pub(crate) async fn run_single_tool<M>(
     tool_extensions: &ToolCallExtensions,
     tool_call: &ToolCall,
     internal_call_id: &str,
+    policy: TaskCompletionPolicy,
+    launched_turn: usize,
     error_history: &[Message],
-) -> Result<ToolCallOutcome, PromptError>
+) -> Result<SingleToolResolution, PromptError>
 where
     M: CompletionModel,
 {
@@ -685,10 +826,89 @@ where
         None => {
             let mut effective_tool_call = tool_call.clone();
             effective_tool_call.function.arguments = effective_args;
-            let exec = tool_server
-                .call_tool_structured(tool_name, &args, tool_extensions)
-                .await;
-            (exec, ToolExecution::Executed(Box::new(effective_tool_call)))
+            match tool_server
+                .dispatch_tool_structured(tool_name, &args, tool_extensions)
+                .await
+            {
+                crate::tool::ToolDispatch::Completed(exec) => {
+                    (exec, ToolExecution::Executed(Box::new(effective_tool_call)))
+                }
+                // The backend accepted the call as a deferred task: fire the
+                // ToolTaskStarted hook and hand the live handle to the driver.
+                // The plain ToolResult hook does NOT fire for this call — the
+                // ToolTaskResult hook fires when the task resolves.
+                crate::tool::ToolDispatch::Deferred(handle) => {
+                    tool_span.record("gen_ai.tool.task.id", handle.task_id());
+                    tool_span.record(
+                        "gen_ai.tool.task.status",
+                        crate::tool::ToolTaskStatus::Working.as_str(),
+                    );
+                    let flow = hooks
+                        .on_event(
+                            ctx,
+                            StepEvent::ToolTaskStarted {
+                                tool_name,
+                                tool_call_id: tool_call.call_id.as_deref(),
+                                internal_call_id,
+                                task_id: handle.task_id(),
+                                immediate_response: handle.immediate_response(),
+                            },
+                        )
+                        .await;
+                    match flow_into_task_event(flow) {
+                        TaskEventDecision::Proceed => {
+                            tracing::info!(
+                                "tool {tool_name} dispatched as deferred task {}",
+                                handle.task_id()
+                            );
+                            let pending = PendingTask::new(
+                                internal_call_id,
+                                effective_tool_call.clone(),
+                                handle.descriptor(),
+                                policy,
+                                launched_turn,
+                            );
+                            return Ok(SingleToolResolution::Deferred(Box::new(
+                                DeferredToolCall {
+                                    handle,
+                                    pending,
+                                    effective_tool_call: Box::new(effective_tool_call),
+                                },
+                            )));
+                        }
+                        // Cancelled at start: the task never became pending, so
+                        // the call resolves inline through the ordinary
+                        // ToolResult hook path below, as a cancelled failure.
+                        TaskEventDecision::Cancel(reason) => {
+                            if let Err(failure) = handle.cancel().await {
+                                tracing::warn!(
+                                    task_id = %handle.task_id(),
+                                    error = %failure.message,
+                                    "failed to cancel a task after a hook CancelTask"
+                                );
+                            }
+                            let exec = ToolExecutionResult::failed(
+                                reason.clone(),
+                                crate::tool::ToolFailure::cancelled(reason),
+                            );
+                            (exec, ToolExecution::Executed(Box::new(effective_tool_call)))
+                        }
+                        TaskEventDecision::Terminate(reason) => {
+                            if let Err(failure) = handle.cancel().await {
+                                tracing::warn!(
+                                    task_id = %handle.task_id(),
+                                    error = %failure.message,
+                                    "failed to cancel a task while terminating the run"
+                                );
+                            }
+                            return Err(PromptError::prompt_cancelled(
+                                error_history.to_vec(),
+                                reason,
+                            ));
+                        }
+                    }
+                }
+            }
         }
     };
     // A synthetic (skip) result is delivered verbatim; a real tool output is
@@ -743,14 +963,14 @@ where
             record_tool_outcome(&tool_span, &exec.outcome);
             tool_span.record("gen_ai.tool.call.result", &replacement);
             tracing::info!("tool {tool_name} with args {args}; result rewritten by a hook");
-            Ok(ToolCallOutcome {
+            Ok(SingleToolResolution::Completed(ToolCallOutcome {
                 content: tool_result_message(
                     tool_call.id.clone(),
                     tool_call.call_id.clone(),
                     replacement,
                 ),
                 execution,
-            })
+            }))
         }
         ToolResultDecision::Keep => {
             // No redaction requested: now that the hook has run without replacing
@@ -782,7 +1002,10 @@ where
                     exec.model_output,
                 )
             };
-            Ok(ToolCallOutcome { content, execution })
+            Ok(SingleToolResolution::Completed(ToolCallOutcome {
+                content,
+                execution,
+            }))
         }
     }
 }
@@ -976,6 +1199,7 @@ where
         hook_ctx: &'a HookContext,
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
+        tasks: &'a mut crate::agent::task_wait::TaskTable,
     ) -> DriveStream<'a, M::Response> {
         // The blocking surface chains tool spans into its linear `follows_from`
         // sequence (chat -> tool -> chat), and discards the yielded items, so it
@@ -985,6 +1209,7 @@ where
             hook_ctx,
             run,
             calls,
+            tasks,
             |span| self.chain_span(span),
             false,
         )
@@ -1070,6 +1295,42 @@ where
         }
 
         // The engine yields `Done` unless it errored (handled above).
+        response.ok_or_else(|| {
+            PromptError::CompletionError(CompletionError::ResponseError(
+                "agent run ended without producing a final response".to_string(),
+            ))
+        })
+    }
+
+    /// Drive a previously suspended [`AgentRun`] to completion instead of
+    /// starting fresh. Deferred tasks recorded in the run are rehydrated via
+    /// the registered [`TaskResumer`](crate::tool::TaskResumer)s; a task no
+    /// resumer can rehydrate resolves as a classified not-found failure result
+    /// so the run never wedges. Conversation memory is bypassed (an explicit
+    /// run carries its own history).
+    pub async fn run_from(self, run: AgentRun) -> Result<PromptResponse, PromptError> {
+        let (agent_span, created_agent_span) =
+            acquire_agent_span(self.agent_name_or_default(), self.preamble.as_deref());
+
+        let driver = drive_agent(
+            self,
+            UnaryTurnSource::new(),
+            run,
+            agent_span,
+            created_agent_span,
+            None,
+            false,
+        );
+        futures::pin_mut!(driver);
+
+        let mut response = None;
+        while let Some(item) = driver.next().await {
+            match item {
+                Ok(DriveItem::Done(done)) => response = Some(*done),
+                Ok(DriveItem::Item(_)) => {}
+                Err(err) => return Err(streaming_error_into_prompt(err)),
+            }
+        }
         response.ok_or_else(|| {
             PromptError::CompletionError(CompletionError::ResponseError(
                 "agent run ended without producing a final response".to_string(),
@@ -6097,5 +6358,471 @@ mod tests {
             tool_result_text_in_history(&messages, "denied by policy: `subtract` not allowed"),
             "the policy denial reason must reach the model as the subtract tool result"
         );
+    }
+}
+
+#[cfg(test)]
+mod task_driver_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use serde_json::json;
+
+    use crate::agent::AgentBuilder;
+    use crate::agent::hook::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
+    use crate::agent::prompt_request::streaming::MultiTurnStreamItem;
+    use crate::agent::run::{
+        AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, TaskCompletionPolicy,
+        ToolCallResolution,
+    };
+    use crate::completion::CompletionModel;
+    use crate::message::AssistantContent;
+    use crate::test_utils::{
+        MockCompletionModel, MockStreamEvent, MockTaskResumer, MockTaskState, MockTaskTool,
+        MockTurn,
+    };
+    use crate::tool::{ToolDyn, ToolOutcome, ToolTaskStatus};
+
+    /// Records the kinds and task-result payloads of every hook event.
+    #[derive(Clone, Default)]
+    struct TaskRecordingHook {
+        events: Arc<Mutex<Vec<StepEventKind>>>,
+        task_results: Arc<Mutex<Vec<(String, String)>>>,
+        cancel_started: bool,
+    }
+
+    impl TaskRecordingHook {
+        fn cancelling() -> Self {
+            Self {
+                cancel_started: true,
+                ..Self::default()
+            }
+        }
+
+        fn events(&self) -> Vec<StepEventKind> {
+            self.events.lock().expect("events lock").clone()
+        }
+    }
+
+    impl<M: CompletionModel> AgentHook<M> for TaskRecordingHook {
+        async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            self.events.lock().expect("events lock").push(event.kind());
+            match event {
+                StepEvent::ToolTaskStarted { .. } if self.cancel_started => {
+                    Flow::cancel_task("cancelled by policy")
+                }
+                StepEvent::ToolTaskResult {
+                    task_id, result, ..
+                } => {
+                    self.task_results
+                        .lock()
+                        .expect("results lock")
+                        .push((task_id.to_string(), result.to_string()));
+                    Flow::cont()
+                }
+                _ => Flow::cont(),
+            }
+        }
+    }
+
+    fn task_call_then_text(final_text: &str) -> MockCompletionModel {
+        MockCompletionModel::from_turns([
+            MockTurn::tool_call("tc1", MockTaskTool::NAME, json!({})),
+            MockTurn::text(final_text),
+        ])
+    }
+
+    /// A JoinTurn task holds the batch open, resolves through the wait engine,
+    /// fires ToolTaskStarted/ToolTaskResult (never the plain ToolResult), and
+    /// the model sees the real output.
+    #[tokio::test]
+    async fn join_turn_task_resolves_through_blocking_surface() {
+        let tool = MockTaskTool::new("task-join");
+        let state = tool.state.clone();
+        let hook = TaskRecordingHook::default();
+
+        let completer = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                state.complete("42 apples");
+            }
+        });
+
+        let response = AgentBuilder::new(task_call_then_text("done"))
+            .tools(vec![Box::new(tool)])
+            .build()
+            .runner("count apples")
+            .max_turns(3)
+            .task_policy(TaskCompletionPolicy::JoinTurn)
+            .add_hook(hook.clone())
+            .run()
+            .await
+            .expect("run should succeed");
+        completer.await.expect("completer");
+
+        assert_eq!(response.output, "done");
+        assert!(response.unresolved_tasks.is_empty());
+        let events = hook.events();
+        assert!(events.contains(&StepEventKind::ToolTaskStarted));
+        assert!(events.contains(&StepEventKind::ToolTaskResult));
+        assert!(
+            !events.contains(&StepEventKind::ToolResult),
+            "the plain ToolResult must not fire for a deferred call: {events:?}"
+        );
+        assert_eq!(
+            hook.task_results.lock().expect("results lock").as_slice(),
+            &[("task-join".to_string(), "42 apples".to_string())]
+        );
+        // The model's second turn saw the real task output in its tool slot.
+        let messages = response.messages.expect("messages");
+        let serialized = serde_json::to_string(&messages).expect("history serializes");
+        assert!(serialized.contains("42 apples"));
+    }
+
+    /// ContinueTurns fills the slot with the immediate response, keeps taking
+    /// turns, and injects the terminal result as a labeled notice the final
+    /// turn incorporates. The streaming surface additionally yields the task
+    /// items.
+    #[tokio::test]
+    async fn continue_turns_streams_items_and_injects_notice() {
+        let tool = MockTaskTool::new("task-bg").with_immediate_response("crunching");
+        let state = tool.state.clone();
+
+        let completer = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                state.complete("background answer");
+            }
+        });
+
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call("tc1", MockTaskTool::NAME, json!({})),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ],
+            vec![
+                MockStreamEvent::text("premature answer"),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ],
+            vec![
+                MockStreamEvent::text("final answer with background result"),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ],
+        ]);
+
+        let mut stream = AgentBuilder::new(model)
+            .tools(vec![Box::new(tool)])
+            .build()
+            .runner("work in the background")
+            .max_turns(4)
+            .stream()
+            .await;
+
+        let mut saw_started = false;
+        let mut saw_result = false;
+        let mut immediate = None;
+        let mut final_response = None;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream item") {
+                MultiTurnStreamItem::ToolTaskStarted {
+                    task_id,
+                    immediate_response,
+                    ..
+                } => {
+                    saw_started = true;
+                    assert_eq!(task_id, "task-bg");
+                    immediate = immediate_response;
+                }
+                MultiTurnStreamItem::ToolTaskResult {
+                    task_id, status, ..
+                } => {
+                    saw_result = true;
+                    assert_eq!(task_id, "task-bg");
+                    assert_eq!(status, ToolTaskStatus::Completed);
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    final_response = Some(response);
+                }
+                _ => {}
+            }
+        }
+        completer.await.expect("completer");
+
+        assert!(saw_started, "the launch item must surface");
+        assert!(saw_result, "the terminal item must surface");
+        assert_eq!(immediate.as_deref(), Some("crunching"));
+        let final_response = final_response.expect("final response");
+        assert_eq!(
+            final_response.response(),
+            "final answer with background result"
+        );
+        let serialized =
+            serde_json::to_string(&final_response.history().expect("history")).expect("history");
+        assert!(
+            serialized.contains("Background task update"),
+            "the drained result must be injected as a labeled notice"
+        );
+        assert!(serialized.contains("background answer"));
+    }
+
+    /// A `CancelTask` flow on ToolTaskStarted cancels the backend task before
+    /// it becomes pending; the call resolves inline as a cancelled failure and
+    /// the run continues.
+    #[tokio::test]
+    async fn cancel_task_on_started_resolves_inline() {
+        let tool = MockTaskTool::new("task-cancelled");
+        let state = tool.state.clone();
+        let hook = TaskRecordingHook::cancelling();
+
+        let response = AgentBuilder::new(task_call_then_text("done without the task"))
+            .tools(vec![Box::new(tool)])
+            .build()
+            .runner("try the task")
+            .max_turns(3)
+            .task_policy(TaskCompletionPolicy::JoinTurn)
+            .add_hook(hook.clone())
+            .run()
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(response.output, "done without the task");
+        assert_eq!(state.cancel_count(), 1, "the backend must see the cancel");
+        let events = hook.events();
+        assert!(events.contains(&StepEventKind::ToolTaskStarted));
+        assert!(
+            events.contains(&StepEventKind::ToolResult),
+            "a start-cancelled call resolves through the inline result path"
+        );
+        assert!(!events.contains(&StepEventKind::ToolTaskResult));
+    }
+
+    /// A never-completing task is bounded by the runner's task deadline: the
+    /// backend sees a cancel and the model receives a classified timeout
+    /// failure instead of the run wedging.
+    #[tokio::test]
+    async fn task_deadline_expiry_delivers_timeout_failure() {
+        let tool = MockTaskTool::new("task-stuck");
+        let state = tool.state.clone();
+        let hook = TaskRecordingHook::default();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            AgentBuilder::new(task_call_then_text("recovered"))
+                .tools(vec![Box::new(tool)])
+                .build()
+                .runner("get stuck")
+                .max_turns(3)
+                .task_policy(TaskCompletionPolicy::JoinTurn)
+                .task_deadline(Duration::from_millis(60))
+                .add_hook(hook.clone())
+                .run(),
+        )
+        .await
+        .expect("the deadline must bound the wait")
+        .expect("run should succeed");
+
+        assert_eq!(response.output, "recovered");
+        assert!(
+            state.cancel_count() >= 1,
+            "deadline expiry cancels the task"
+        );
+        let results = hook.task_results.lock().expect("results lock").clone();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1.contains("deadline"),
+            "the model-visible result explains the deadline: {results:?}"
+        );
+    }
+
+    /// A run serialized mid-await resumes in a fresh runner: the registered
+    /// TaskResumer rehydrates the descriptor and the run completes with the
+    /// late result.
+    #[tokio::test]
+    async fn run_from_rehydrates_tasks_via_resumer() {
+        // Drive a machine to AwaitingTasks by hand, exactly as a suspended
+        // process would have left it.
+        let tool = MockTaskTool::new("task-resume");
+        let mut run = AgentRun::new("count apples").max_turns(3);
+        let AgentRunStep::CallModel { .. } = run.next_step().expect("first step") else {
+            panic!("expected CallModel");
+        };
+        let turn = ModelTurn::new(
+            None,
+            crate::OneOrMany::one(AssistantContent::ToolCall(crate::message::ToolCall::new(
+                "tc1".to_string(),
+                crate::message::ToolFunction::new(MockTaskTool::NAME.to_string(), json!({})),
+            ))),
+            crate::completion::Usage::new(),
+            [MockTaskTool::NAME.to_string()].into_iter().collect(),
+            [MockTaskTool::NAME.to_string()].into_iter().collect(),
+        );
+        assert!(matches!(
+            run.model_response(turn).expect("turn accepted"),
+            ModelTurnOutcome::Continue { .. }
+        ));
+        let AgentRunStep::CallTools { .. } = run.next_step().expect("tools step") else {
+            panic!("expected CallTools");
+        };
+        // Launch the task out-of-band and record it as a join deferral.
+        let handle =
+            ToolDyn::dispatch_structured(&tool, "{}".to_string(), &Default::default()).await;
+        let crate::tool::ToolDispatch::Deferred(handle) = handle else {
+            panic!("mock task tool must defer");
+        };
+        let pending = crate::agent::run::PendingTask::new(
+            "internal-tc1",
+            crate::message::ToolCall::new(
+                "tc1".to_string(),
+                crate::message::ToolFunction::new(MockTaskTool::NAME.to_string(), json!({})),
+            ),
+            handle.descriptor(),
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        );
+        drop(handle); // the suspended process died; only the descriptor survives
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(pending))])
+            .expect("batch accepted");
+
+        let serialized = serde_json::to_string(&run).expect("run serializes");
+        let resumed: AgentRun = serde_json::from_str(&serialized).expect("run deserializes");
+
+        // The new process: same tool state, completed before resume.
+        let state = Arc::new(MockTaskState::default());
+        state.complete("resumed apples");
+        let resumer = MockTaskResumer::new(state);
+        let seen = resumer.seen.clone();
+
+        let response = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+            "final after resume",
+        )]))
+        .build()
+        .runner("unused prompt")
+        .max_turns(3)
+        .task_resumer(resumer)
+        .run_from(resumed)
+        .await
+        .expect("resumed run should succeed");
+
+        assert_eq!(response.output, "final after resume");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].task_id, "task-resume");
+        let serialized = serde_json::to_string(&response.messages).expect("history");
+        assert!(serialized.contains("resumed apples"));
+    }
+
+    /// Without any resumer, a persisted task resolves as a classified failure
+    /// and the run still completes.
+    #[tokio::test]
+    async fn run_from_without_resumer_fails_task_gracefully() {
+        let tool = MockTaskTool::new("task-lost");
+        let mut run = AgentRun::new("count").max_turns(3);
+        let _ = run.next_step().expect("first step");
+        let turn = ModelTurn::new(
+            None,
+            crate::OneOrMany::one(AssistantContent::ToolCall(crate::message::ToolCall::new(
+                "tc1".to_string(),
+                crate::message::ToolFunction::new(MockTaskTool::NAME.to_string(), json!({})),
+            ))),
+            crate::completion::Usage::new(),
+            [MockTaskTool::NAME.to_string()].into_iter().collect(),
+            [MockTaskTool::NAME.to_string()].into_iter().collect(),
+        );
+        run.model_response(turn).expect("turn accepted");
+        let _ = run.next_step().expect("tools step");
+        let handle =
+            ToolDyn::dispatch_structured(&tool, "{}".to_string(), &Default::default()).await;
+        let crate::tool::ToolDispatch::Deferred(handle) = handle else {
+            panic!("mock task tool must defer");
+        };
+        let pending = crate::agent::run::PendingTask::new(
+            "internal-tc1",
+            crate::message::ToolCall::new(
+                "tc1".to_string(),
+                crate::message::ToolFunction::new(MockTaskTool::NAME.to_string(), json!({})),
+            ),
+            handle.descriptor(),
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        );
+        drop(handle);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(pending))])
+            .expect("batch accepted");
+
+        let hook = TaskRecordingHook::default();
+        let response = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+            "recovered without the task",
+        )]))
+        .build()
+        .runner("unused")
+        .max_turns(3)
+        .add_hook(hook.clone())
+        .run_from(run)
+        .await
+        .expect("the run must not wedge on an unresumable task");
+
+        assert_eq!(response.output, "recovered without the task");
+        let serialized = serde_json::to_string(&response.messages).expect("history");
+        assert!(
+            serialized.contains("could not be resumed"),
+            "the model must see the classified failure: {serialized}"
+        );
+    }
+
+    /// The model-visible tool slot carries the outcome of a task whose hook
+    /// verdict was an Error: the failure text flows through, and the
+    /// structured outcome reaches the ToolTaskResult hook.
+    #[tokio::test]
+    async fn failed_task_outcome_reaches_hook_and_model() {
+        let tool = MockTaskTool::new("task-fail");
+        let state = tool.state.clone();
+
+        #[derive(Clone, Default)]
+        struct OutcomeProbe {
+            saw_error: Arc<Mutex<bool>>,
+        }
+        impl<M: CompletionModel> AgentHook<M> for OutcomeProbe {
+            async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+                if let StepEvent::ToolTaskResult { outcome, .. } = event
+                    && matches!(outcome, ToolOutcome::Error(_))
+                {
+                    *self.saw_error.lock().expect("probe lock") = true;
+                }
+                Flow::cont()
+            }
+        }
+
+        let probe = OutcomeProbe::default();
+        let completer = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                *state
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = "disk full".to_string();
+                state.set_statuses(vec![ToolTaskStatus::Failed]);
+            }
+        });
+
+        let response = AgentBuilder::new(task_call_then_text("handled the failure"))
+            .tools(vec![Box::new(tool)])
+            .build()
+            .runner("fail the task")
+            .max_turns(3)
+            .task_policy(TaskCompletionPolicy::JoinTurn)
+            .add_hook(probe.clone())
+            .run()
+            .await
+            .expect("run should succeed");
+        completer.await.expect("completer");
+
+        assert_eq!(response.output, "handled the failure");
+        assert!(*probe.saw_error.lock().expect("probe lock"));
+        let serialized = serde_json::to_string(&response.messages).expect("history");
+        assert!(serialized.contains("disk full"));
     }
 }

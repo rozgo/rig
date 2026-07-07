@@ -110,6 +110,7 @@ pub mod hook;
 pub(crate) mod prompt_request;
 pub mod run;
 pub mod runner;
+pub(crate) mod task_wait;
 mod tool;
 
 /// Fallback display name used in telemetry spans and logs when an agent has no

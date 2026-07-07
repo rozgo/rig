@@ -563,6 +563,67 @@ pub enum StepEvent<'a, M: CompletionModel> {
         /// Metadata the tool attached to its result, never sent to the model.
         extensions: &'a ToolResultExtensions,
     },
+    /// A tool call was dispatched as a deferred task (e.g. an MCP task,
+    /// SEP-1686) instead of completing inline. Fires after the
+    /// [`ToolCall`](Self::ToolCall) hook chain proceeded and the backend
+    /// accepted the task. Honors [`Flow::Continue`], [`Flow::CancelTask`]
+    /// (cancel it before it becomes pending; `reason` is delivered as the
+    /// call's result) and [`Flow::Terminate`].
+    ToolTaskStarted {
+        /// Name of the tool the task runs.
+        tool_name: &'a str,
+        /// Provider-supplied tool call ID, when available.
+        tool_call_id: Option<&'a str>,
+        /// Internal Rig call ID correlating this call's events.
+        internal_call_id: &'a str,
+        /// The backend-assigned task id.
+        task_id: &'a str,
+        /// The backend's model-facing immediate response hint, if any.
+        immediate_response: Option<&'a str>,
+    },
+    /// A pending deferred task's status changed (fires on change only, while
+    /// the driver waits on the task). Gated on
+    /// [`observes`](AgentHook::observes) like the streaming delta events —
+    /// declare [`StepEventKind::ToolTaskStatus`] to receive it. Honors
+    /// [`Flow::Continue`], [`Flow::CancelTask`] and [`Flow::Terminate`].
+    ToolTaskStatus {
+        /// Name of the tool the task runs.
+        tool_name: &'a str,
+        /// Provider-supplied tool call ID, when available.
+        tool_call_id: Option<&'a str>,
+        /// Internal Rig call ID correlating this call's events.
+        internal_call_id: &'a str,
+        /// The backend-assigned task id.
+        task_id: &'a str,
+        /// The newly observed lifecycle status.
+        status: crate::tool::ToolTaskStatus,
+    },
+    /// A deferred task reached a terminal result, before it is delivered to
+    /// the model. The task counterpart of [`ToolResult`](Self::ToolResult) —
+    /// the plain `ToolResult` event does **not** fire for a deferred call.
+    /// Honors [`Flow::Continue`], [`Flow::RewriteResult`] (chained across a
+    /// [`HookStack`] exactly like `ToolResult`; `outcome` stays raw) and
+    /// [`Flow::Terminate`]. [`Flow::CancelTask`] is fail-closed here — the
+    /// task is already terminal.
+    ToolTaskResult {
+        /// Name of the tool the task ran.
+        tool_name: &'a str,
+        /// Provider-supplied tool call ID, when available.
+        tool_call_id: Option<&'a str>,
+        /// Internal Rig call ID correlating this call's events.
+        internal_call_id: &'a str,
+        /// The backend-assigned task id.
+        task_id: &'a str,
+        /// The model-visible task result. Reflects any earlier hook's
+        /// [`RewriteResult`](Flow::RewriteResult).
+        result: &'a str,
+        /// The structured outcome, raw throughout the chain.
+        outcome: &'a ToolOutcome,
+        /// Metadata attached to the result, never sent to the model.
+        extensions: &'a ToolResultExtensions,
+        /// How the launching call completes relative to its turn.
+        policy: crate::agent::run::TaskCompletionPolicy,
+    },
     /// Streaming only: a text delta was received. `aggregated` is the full text
     /// accumulated for the turn so far. Honors [`Flow::Continue`] and
     /// [`Flow::Terminate`].
@@ -634,6 +695,12 @@ pub enum StepEventKind {
     ToolCall,
     /// [`StepEvent::ToolResult`].
     ToolResult,
+    /// [`StepEvent::ToolTaskStarted`].
+    ToolTaskStarted,
+    /// [`StepEvent::ToolTaskStatus`].
+    ToolTaskStatus,
+    /// [`StepEvent::ToolTaskResult`].
+    ToolTaskResult,
     /// [`StepEvent::TextDelta`].
     TextDelta,
     /// [`StepEvent::ToolCallDelta`].
@@ -652,6 +719,9 @@ impl<M: CompletionModel> StepEvent<'_, M> {
             StepEvent::InvalidToolCall(_) => StepEventKind::InvalidToolCall,
             StepEvent::ToolCall { .. } => StepEventKind::ToolCall,
             StepEvent::ToolResult { .. } => StepEventKind::ToolResult,
+            StepEvent::ToolTaskStarted { .. } => StepEventKind::ToolTaskStarted,
+            StepEvent::ToolTaskStatus { .. } => StepEventKind::ToolTaskStatus,
+            StepEvent::ToolTaskResult { .. } => StepEventKind::ToolTaskResult,
             StepEvent::TextDelta { .. } => StepEventKind::TextDelta,
             StepEvent::ToolCallDelta { .. } => StepEventKind::ToolCallDelta,
             StepEvent::StreamResponseFinish { .. } => StepEventKind::StreamResponseFinish,
@@ -1002,12 +1072,31 @@ pub enum Flow {
         /// The corrected tool name.
         tool_name: String,
     },
+    /// [`StepEvent::ToolTaskStarted`] / [`StepEvent::ToolTaskStatus`] only:
+    /// cancel the running deferred task. The driver requests backend
+    /// cancellation and delivers `reason` to the model as the (cancelled)
+    /// call's result. Returned for any other event — including
+    /// [`StepEvent::ToolTaskResult`], where the task is already terminal — it
+    /// is fail-closed and terminates the run (see the module composition
+    /// rules).
+    CancelTask {
+        /// Model-visible text delivered as the cancelled task's result.
+        reason: String,
+    },
 }
 
 impl Flow {
     /// Continue the agent loop as normal.
     pub fn cont() -> Self {
         Self::Continue
+    }
+
+    /// Cancel a running deferred task (task events only); `reason` is
+    /// delivered to the model as the cancelled call's result.
+    pub fn cancel_task(reason: impl Into<String>) -> Self {
+        Self::CancelTask {
+            reason: reason.into(),
+        }
     }
 
     /// Terminate the agent run early with a reason.
@@ -1539,6 +1628,43 @@ where
                         result: result_for_hook,
                         outcome,
                         extensions,
+                    };
+                    match hook.on_event_boxed(ctx, per_hook).await {
+                        Flow::Continue => {}
+                        Flow::RewriteResult { result } => effective = Some(result),
+                        other => return other,
+                    }
+                }
+                match effective {
+                    Some(result) => Flow::RewriteResult { result },
+                    None => Flow::Continue,
+                }
+            }
+            // Chain task-result rewrites exactly like ToolResult: the
+            // model-visible text threads hook-to-hook, the structured
+            // outcome/extensions stay raw for every hook.
+            StepEvent::ToolTaskResult {
+                tool_name,
+                tool_call_id,
+                internal_call_id,
+                task_id,
+                result,
+                outcome,
+                extensions,
+                policy,
+            } => {
+                let mut effective: Option<String> = None;
+                for hook in &self.hooks {
+                    let result_for_hook = effective.as_deref().unwrap_or(result);
+                    let per_hook = StepEvent::ToolTaskResult {
+                        tool_name,
+                        tool_call_id,
+                        internal_call_id,
+                        task_id,
+                        result: result_for_hook,
+                        outcome,
+                        extensions,
+                        policy,
                     };
                     match hook.on_event_boxed(ctx, per_hook).await {
                         Flow::Continue => {}
