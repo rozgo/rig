@@ -452,6 +452,10 @@ pub struct McpTaskHandle {
     notifications: Option<Arc<McpTaskNotifications>>,
     watch: Option<tokio::sync::watch::Receiver<Option<TaskStatusUpdate>>>,
     server_key: Option<String>,
+    /// Whether the connection answers elicitations: `input_required` then
+    /// means "waiting on the elicitation round-trip" rather than a dead end,
+    /// and [`wait`](ToolTaskHandle::wait) keeps waiting instead of failing.
+    elicitation_available: bool,
 }
 
 /// Clamp a server-provided poll interval (ms) against busy-polling.
@@ -468,6 +472,7 @@ impl McpTaskHandle {
         created: CreateTaskResult,
         request_timeout: Option<Duration>,
         notifications: Option<Arc<McpTaskNotifications>>,
+        elicitation_available: bool,
     ) -> Self {
         let immediate_response = created
             .meta
@@ -492,11 +497,14 @@ impl McpTaskHandle {
             notifications,
             watch,
             server_key,
+            elicitation_available,
         }
     }
 
     /// Rehydrate a handle from a persisted descriptor (durable resume). The
-    /// caller supplies the live sink for `descriptor.server_key`.
+    /// caller supplies the live sink for `descriptor.server_key`, and
+    /// `elicitation_available` reflects whether that connection answers
+    /// elicitations (see [`McpTaskResumer::with_elicitation_available`]).
     ///
     /// # Errors
     /// Returns an [`InvalidArgs`](ToolFailureKind::InvalidArgs) failure when
@@ -508,6 +516,7 @@ impl McpTaskHandle {
         descriptor: ToolTaskDescriptor,
         request_timeout: Option<Duration>,
         notifications: Option<Arc<McpTaskNotifications>>,
+        elicitation_available: bool,
     ) -> Result<Self, ToolFailure> {
         if descriptor.backend != ToolTaskDescriptor::BACKEND_MCP {
             return Err(ToolFailure::invalid_args(format!(
@@ -541,6 +550,7 @@ impl McpTaskHandle {
             notifications,
             watch,
             server_key: live_key,
+            elicitation_available,
         })
     }
 
@@ -594,8 +604,9 @@ impl McpTaskHandle {
         let (message, failure) = match status {
             ToolTaskStatus::InputRequired => {
                 let message = format!(
-                    "MCP task '{}' for tool '{}' requires interactive input, which rig does not \
-                     support yet",
+                    "MCP task '{}' for tool '{}' requires interactive input, but no elicitation \
+                     handler is registered on this connection (see \
+                     `McpClientHandler::with_elicitation_handler`)",
                     self.task_id, self.tool_name
                 );
                 (
@@ -793,6 +804,14 @@ impl ToolTaskHandle for McpTaskHandle {
                             // Completed: loop — the next tasks/result returns
                             // promptly with the payload.
                             ToolTaskStatus::Working | ToolTaskStatus::Completed => {}
+                            // With an elicitation handler on the connection,
+                            // input_required means "the elicitation round-trip
+                            // is in flight" (it rides rmcp's request routing to
+                            // create_elicitation, over the tasks/result stream
+                            // this loop keeps open): keep waiting; the task
+                            // transitions back to working once answered.
+                            // Without one, it is a dead end and fails below.
+                            ToolTaskStatus::InputRequired if this.elicitation_available => {}
                             terminal_or_input => {
                                 return this.terminal_failure(terminal_or_input, status_message);
                             }
@@ -850,6 +869,9 @@ pub struct McpTaskResumer {
     sink: rmcp::service::ServerSink,
     request_timeout: Option<Duration>,
     notifications: Option<Arc<McpTaskNotifications>>,
+    /// Whether the connection answers elicitations; resumed handles inherit it
+    /// so `input_required` keeps waiting (see [`McpTaskHandle`]).
+    elicitation_available: bool,
 }
 
 impl McpTaskResumer {
@@ -863,7 +885,15 @@ impl McpTaskResumer {
             sink,
             request_timeout,
             notifications,
+            elicitation_available: false,
         }
+    }
+
+    /// Mark the connection as elicitation-capable, so resumed handles keep
+    /// waiting through `input_required` instead of failing.
+    pub fn with_elicitation_available(mut self, available: bool) -> Self {
+        self.elicitation_available = available;
+        self
     }
 }
 
@@ -888,6 +918,7 @@ impl TaskResumer for McpTaskResumer {
                 descriptor.clone(),
                 self.request_timeout,
                 self.notifications.clone(),
+                self.elicitation_available,
             )
             .map_err(|failure| {
                 ToolError::ToolCallError(
@@ -1664,5 +1695,466 @@ mod tests {
         assert_eq!(registry.lock().len(), 0);
 
         registry.release("task-1");
+    }
+}
+
+#[cfg(test)]
+mod elicitation_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, ElicitRequestParams,
+        ElicitResult, ElicitationAction, ErrorData, GetTaskParams, GetTaskPayloadParams,
+        Implementation, ListToolsResult, Meta, PaginatedRequestParams, ProtocolVersion,
+        RelatedTaskMetadata, ServerCapabilities, ServerInfo, Task, TaskStatus, TaskSupport,
+        TasksCapability, Tool, ToolExecution,
+    };
+    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::{ServerHandler, ServiceExt};
+    use tokio::sync::{Notify, RwLock};
+
+    use super::*;
+    use crate::tool::rmcp::McpClientHandler;
+    use crate::tool::rmcp::elicitation::{McpElicitationHandler, related_task_id};
+    use crate::tool::server::ToolServer;
+    use crate::tool::{ToolCallExtensions, ToolDispatch, ToolOutcome};
+    use crate::wasm_compat::WasmBoxedFuture;
+
+    type TaskEntry = (Task, Option<CallToolResult>);
+
+    /// A task server whose tasks pause in `input_required` and elicit an
+    /// `answer` from the client; an `Accept` completes the task with a payload
+    /// derived from the elicited content, a `Decline`/`Cancel` fails it.
+    #[derive(Clone)]
+    struct ElicitingTaskServer {
+        state: Arc<RwLock<std::collections::HashMap<String, TaskEntry>>>,
+        terminal: Arc<Notify>,
+        next_id: Arc<AtomicUsize>,
+    }
+
+    impl ElicitingTaskServer {
+        fn new() -> Self {
+            Self {
+                state: Arc::default(),
+                terminal: Arc::default(),
+                next_id: Arc::default(),
+            }
+        }
+
+        fn tool() -> Tool {
+            Tool::new(
+                "work".to_string(),
+                "needs human input".to_string(),
+                Arc::new(serde_json::Map::new()),
+            )
+            .with_execution(ToolExecution::from_raw(Some(TaskSupport::Required)))
+        }
+
+        async fn settle(&self, task_id: &str, status: TaskStatus, payload: Option<CallToolResult>) {
+            let mut state = self.state.write().await;
+            if let Some((task, slot)) = state.get_mut(task_id) {
+                task.status = status;
+                *slot = payload;
+            }
+            drop(state);
+            self.terminal.notify_waiters();
+        }
+    }
+
+    impl ServerHandler for ElicitingTaskServer {
+        fn get_info(&self) -> ServerInfo {
+            let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+            capabilities.tasks = Some(TasksCapability::server_default());
+            ServerInfo::new(capabilities)
+                .with_protocol_version(ProtocolVersion::LATEST)
+                .with_server_info(Implementation::new("eliciting-server", "0.1.0"))
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            (name == "work").then(Self::tool)
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(vec![Self::tool()]))
+        }
+
+        async fn enqueue_task(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CreateTaskResult, ErrorData> {
+            let id = format!(
+                "elicit-task-{}",
+                self.next_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let now = "2026-01-01T00:00:00Z".to_string();
+            let task = Task::new(id.clone(), TaskStatus::InputRequired, now.clone(), now)
+                .with_poll_interval(25);
+            self.state
+                .write()
+                .await
+                .insert(id.clone(), (task.clone(), None));
+
+            // Elicit from the client out-of-band (never inside the request
+            // handler, which must answer first).
+            let server = self.clone();
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                let mut meta = Meta::new();
+                meta.0.insert(
+                    RelatedTaskMetadata::META_KEY.to_string(),
+                    serde_json::json!({ "taskId": id }),
+                );
+                let schema = rmcp::model::ElicitationSchema::builder()
+                    .required_string("answer")
+                    .build()
+                    .expect("schema builds");
+                let params = ElicitRequestParams::FormElicitationParams {
+                    meta: Some(meta),
+                    message: "What is the answer?".to_string(),
+                    requested_schema: schema,
+                };
+                match peer.create_elicitation(params).await {
+                    Ok(result) if result.action == ElicitationAction::Accept => {
+                        let answer = result
+                            .content
+                            .as_ref()
+                            .and_then(|content| content.get("answer"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<missing>")
+                            .to_string();
+                        server
+                            .settle(
+                                &id,
+                                TaskStatus::Completed,
+                                Some(CallToolResult::success(vec![ContentBlock::text(format!(
+                                    "elicited:{answer}"
+                                ))])),
+                            )
+                            .await;
+                    }
+                    Ok(_) => {
+                        let mut state = server.state.write().await;
+                        if let Some((task, payload)) = state.get_mut(&id) {
+                            task.status = TaskStatus::Failed;
+                            task.status_message = Some("input declined".to_string());
+                            *payload = Some(CallToolResult::error(vec![ContentBlock::text(
+                                "input declined",
+                            )]));
+                        }
+                        drop(state);
+                        server.terminal.notify_waiters();
+                    }
+                    Err(err) => {
+                        tracing::warn!("elicitation request failed: {err}");
+                    }
+                }
+            });
+
+            Ok(rmcp::model::CreateTaskResult::new(task))
+        }
+
+        async fn get_task_info(
+            &self,
+            request: GetTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::GetTaskResult, ErrorData> {
+            match self.state.read().await.get(&request.task_id) {
+                Some((task, _)) => Ok(rmcp::model::GetTaskResult::new(task.clone())),
+                None => Err(ErrorData::invalid_params("task not found", None)),
+            }
+        }
+
+        async fn get_task_result(
+            &self,
+            request: GetTaskPayloadParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::GetTaskPayloadResult, ErrorData> {
+            loop {
+                let notified = self.terminal.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let state = self.state.read().await;
+                    match state.get(&request.task_id) {
+                        Some((task, Some(payload)))
+                            if matches!(
+                                task.status,
+                                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                            ) =>
+                        {
+                            let value = serde_json::to_value(payload)
+                                .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+                            return Ok(rmcp::model::GetTaskPayloadResult::new(value));
+                        }
+                        Some((task, None))
+                            if matches!(
+                                task.status,
+                                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                            ) =>
+                        {
+                            return Err(ErrorData::invalid_params("task result unavailable", None));
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(ErrorData::invalid_params("task not found", None));
+                        }
+                    }
+                }
+                notified.await;
+            }
+        }
+    }
+
+    /// A recorded elicitation observation: the parsed related-task id and the
+    /// request message.
+    type SeenElicitation = (Option<String>, String);
+
+    /// Answers every form elicitation with `Accept { answer }`, recording the
+    /// message and the parsed related-task id.
+    #[derive(Clone)]
+    struct RecordingElicitationHandler {
+        answer: String,
+        seen: Arc<std::sync::Mutex<Vec<SeenElicitation>>>,
+    }
+
+    impl RecordingElicitationHandler {
+        fn new(answer: &str) -> Self {
+            Self {
+                answer: answer.to_string(),
+                seen: Arc::default(),
+            }
+        }
+
+        fn seen(&self) -> Vec<SeenElicitation> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl McpElicitationHandler for RecordingElicitationHandler {
+        fn elicit(
+            &self,
+            request: ElicitRequestParams,
+        ) -> WasmBoxedFuture<'_, Result<ElicitResult, rmcp::ErrorData>> {
+            Box::pin(async move {
+                use rmcp::model::RequestParamsMeta;
+                let related = related_task_id(request.meta());
+                let message = match &request {
+                    ElicitRequestParams::FormElicitationParams { message, .. } => message.clone(),
+                    ElicitRequestParams::UrlElicitationParams { message, .. } => message.clone(),
+                    _ => String::new(),
+                };
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((related, message));
+                Ok(ElicitResult::new(ElicitationAction::Accept)
+                    .with_content(serde_json::json!({ "answer": self.answer })))
+            })
+        }
+    }
+
+    /// Connect an `ElicitingTaskServer` through an `McpClientHandler` (with or
+    /// without an elicitation handler) and return the shared tool server handle.
+    async fn connect_with(
+        server: ElicitingTaskServer,
+        handler: Option<RecordingElicitationHandler>,
+    ) -> (
+        crate::tool::server::ToolServerHandle,
+        rmcp::service::RunningService<rmcp::service::RoleClient, McpClientHandler>,
+    ) {
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let running = server
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server failed to start");
+            running.waiting().await.ok();
+        });
+        let tool_server_handle = ToolServer::new().run();
+        let mut client = McpClientHandler::new(ClientInfo::default(), tool_server_handle.clone());
+        if let Some(handler) = handler {
+            client = client.with_elicitation_handler(handler);
+        }
+        let service = client
+            .connect((client_from_server, client_to_server))
+            .await
+            .expect("connect failed");
+        (tool_server_handle, service)
+    }
+
+    #[test]
+    fn get_info_declares_elicitation_capability() {
+        let tool_server_handle = ToolServer::new().run();
+        let bare = McpClientHandler::new(ClientInfo::default(), tool_server_handle.clone());
+        assert!(
+            bare.get_info().capabilities.elicitation.is_none(),
+            "no handler ⇒ no capability"
+        );
+
+        let with_handler = McpClientHandler::new(ClientInfo::default(), tool_server_handle)
+            .with_elicitation_handler(RecordingElicitationHandler::new("42"));
+        let capability = with_handler
+            .get_info()
+            .capabilities
+            .elicitation
+            .expect("registered handler must be advertised");
+        assert!(capability.form.is_some(), "default capability is form-mode");
+        assert!(capability.url.is_none());
+    }
+
+    #[tokio::test]
+    async fn elicitation_completes_an_input_required_task() {
+        let server = ElicitingTaskServer::new();
+        let handler = RecordingElicitationHandler::new("blue");
+        let (tool_server_handle, _service) = connect_with(server, Some(handler.clone())).await;
+
+        let dispatch = tool_server_handle
+            .dispatch_tool_structured("work", "{}", &ToolCallExtensions::EMPTY)
+            .await;
+        let ToolDispatch::Deferred(handle) = dispatch else {
+            panic!("required-task tool must defer");
+        };
+        let task_id = handle.task_id().to_string();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("wait must survive input_required and resolve after the elicitation");
+
+        assert!(matches!(result.outcome(), ToolOutcome::Success));
+        assert_eq!(result.model_output(), "elicited:blue");
+        let info = result
+            .extensions()
+            .get::<McpTaskInfo>()
+            .expect("final result carries McpTaskInfo");
+        assert_eq!(info.final_status, ToolTaskStatus::Completed);
+
+        // The handler observed exactly one request, correlated to the task.
+        let seen = handler.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.as_deref(), Some(task_id.as_str()));
+        assert_eq!(seen[0].1, "What is the answer?");
+    }
+
+    #[tokio::test]
+    async fn no_handler_declines_and_input_required_stays_a_failure() {
+        let server = ElicitingTaskServer::new();
+        let (tool_server_handle, _service) = connect_with(server, None).await;
+
+        let dispatch = tool_server_handle
+            .dispatch_tool_structured("work", "{}", &ToolCallExtensions::EMPTY)
+            .await;
+        let ToolDispatch::Deferred(handle) = dispatch else {
+            panic!("required-task tool must defer");
+        };
+
+        // The server's elicitation is auto-declined (today's behavior), so the
+        // task fails server-side; regardless, the handle without the flag
+        // fails fast the moment it observes input_required.
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("wait resolves fast without a handler");
+        let ToolOutcome::Error(failure) = result.outcome() else {
+            panic!("expected a failure outcome, got {:?}", result.outcome());
+        };
+        assert!(
+            failure.code.as_deref() == Some("mcp_task_input_required")
+                || failure.message.contains("input declined"),
+            "either the fail-fast or the server-side decline must surface: {failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_end_to_end_elicitation() {
+        use crate::agent::AgentBuilder;
+        use crate::test_utils::{MockCompletionModel, MockTurn};
+
+        let server = ElicitingTaskServer::new();
+        let handler = RecordingElicitationHandler::new("the moon");
+        let (tool_server_handle, _service) = connect_with(server, Some(handler)).await;
+
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("tc1", "work", serde_json::json!({})),
+            MockTurn::text("done with human help"),
+        ]);
+        let response = AgentBuilder::new(model)
+            .tool_server_handle(tool_server_handle)
+            .build()
+            .runner("ask the human")
+            .max_turns(4)
+            .task_policy(crate::agent::run::TaskCompletionPolicy::JoinTurn)
+            .run()
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(response.output, "done with human help");
+        let history = serde_json::to_string(&response.messages).expect("history serializes");
+        assert!(
+            history.contains("elicited:the moon"),
+            "the elicited value must reach the model: {history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumer_from_elicitation_handler_survives_input_required() {
+        use crate::tool::TaskResumer;
+        use crate::tool::task::ToolTaskDescriptor;
+
+        let server = ElicitingTaskServer::new();
+        let handler = RecordingElicitationHandler::new("resumed answer");
+
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let running = server
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server failed to start");
+            running.waiting().await.ok();
+        });
+        let tool_server_handle = ToolServer::new().run();
+        let client = McpClientHandler::new(ClientInfo::default(), tool_server_handle.clone())
+            .with_elicitation_handler(handler);
+        let service = client
+            .connect((client_from_server, client_to_server))
+            .await
+            .expect("connect failed");
+
+        // Launch a task (goes input_required + elicits), then resume it by
+        // descriptor through the handler-derived resumer: the resumed handle
+        // must keep waiting through input_required and resolve.
+        let dispatch = tool_server_handle
+            .dispatch_tool_structured("work", "{}", &ToolCallExtensions::EMPTY)
+            .await;
+        let ToolDispatch::Deferred(original) = dispatch else {
+            panic!("required-task tool must defer");
+        };
+        let descriptor: ToolTaskDescriptor = original.descriptor();
+        drop(original);
+
+        let resumer = McpTaskResumer::new(service.peer().clone(), None, None)
+            .with_elicitation_available(true);
+        let handle = resumer
+            .resume(&descriptor)
+            .await
+            .expect("resume must not error")
+            .expect("the mcp resumer must claim an mcp descriptor");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("resumed wait must survive input_required");
+        assert!(matches!(result.outcome(), ToolOutcome::Success));
+        assert_eq!(result.model_output(), "elicited:resumed answer");
     }
 }

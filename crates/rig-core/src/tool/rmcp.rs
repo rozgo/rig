@@ -67,7 +67,9 @@ use crate::wasm_compat::WasmBoxedFuture;
 /// [`McpTool`] forward it as a call's MCP `_meta` (see the module docs).
 pub use rmcp::model::Meta;
 
+pub mod elicitation;
 pub mod tasks;
+pub use elicitation::{McpElicitationHandler, related_task_id};
 pub use tasks::{
     MODEL_IMMEDIATE_RESPONSE_META_KEY, McpTaskHandle, McpTaskInfo, McpTaskNotifications,
     McpTaskPolicy, McpTaskResumer, ServerSinkTaskExt,
@@ -108,6 +110,11 @@ pub struct McpTool {
     task_ttl: Option<Duration>,
     /// Shared `notifications/tasks/status` registry; absent ⇒ pure polling.
     task_notifications: Option<Arc<McpTaskNotifications>>,
+    /// Whether the connection answers elicitations (an
+    /// [`McpElicitationHandler`] is registered): deferred tasks that enter
+    /// `input_required` then keep waiting for the round-trip instead of
+    /// failing (see [`McpTaskHandle`]).
+    elicitation_available: bool,
 }
 
 impl McpTool {
@@ -128,6 +135,7 @@ impl McpTool {
             task_policy: McpTaskPolicy::default(),
             task_ttl: None,
             task_notifications: None,
+            elicitation_available: false,
         }
     }
 
@@ -172,6 +180,13 @@ impl McpTool {
         notifications: Arc<McpTaskNotifications>,
     ) -> Self {
         self.task_notifications = Some(notifications);
+        self
+    }
+
+    /// Mark the connection as elicitation-capable, so deferred tasks that
+    /// enter `input_required` keep waiting for the elicitation round-trip.
+    pub(crate) fn with_elicitation_available(mut self, available: bool) -> Self {
+        self.elicitation_available = available;
         self
     }
 
@@ -583,6 +598,7 @@ impl ToolDyn for McpTool {
                     created,
                     self.timeout,
                     self.task_notifications.clone(),
+                    self.elicitation_available,
                 ))),
                 Err(err) => {
                     let failure = err.into_failure();
@@ -648,6 +664,9 @@ pub struct McpClientHandler {
     task_ttl: Option<Duration>,
     /// Shared wakeup registry for `notifications/tasks/status`.
     task_notifications: Arc<McpTaskNotifications>,
+    /// Answers `elicitation/create` requests (SEP-1686 interactive input).
+    /// Absent, rig preserves rmcp's default and declines every request.
+    elicitation: Option<Arc<dyn McpElicitationHandler>>,
     /// Tracks which tool names were registered by this handler so they
     /// can be removed and replaced on list-change notifications.
     managed_tool_names: Arc<RwLock<Vec<String>>>,
@@ -670,6 +689,7 @@ impl McpClientHandler {
             task_policy: McpTaskPolicy::Preferred,
             task_ttl: None,
             task_notifications: Arc::new(McpTaskNotifications::default()),
+            elicitation: None,
             managed_tool_names: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -697,6 +717,23 @@ impl McpClientHandler {
         self
     }
 
+    /// Register the [`McpElicitationHandler`] answering `elicitation/create`
+    /// requests (SEP-1686 interactive input).
+    ///
+    /// Registration advertises the handler's
+    /// [`capability`](McpElicitationHandler::capability) in the client
+    /// handshake and lets deferred tasks that enter `input_required` keep
+    /// waiting for the elicitation round-trip instead of failing. Unregistered
+    /// (the default), every request is declined and `input_required` remains a
+    /// classified failure — exactly rmcp's own defaults.
+    pub fn with_elicitation_handler<H>(mut self, handler: H) -> Self
+    where
+        H: McpElicitationHandler + 'static,
+    {
+        self.elicitation = Some(Arc::new(handler));
+        self
+    }
+
     /// The shared `notifications/tasks/status` registry this handler publishes
     /// into. Tools built by this handler subscribe to it automatically.
     pub fn task_notifications(&self) -> Arc<McpTaskNotifications> {
@@ -709,6 +746,7 @@ impl McpClientHandler {
     /// (`service.peer().clone()`).
     pub fn task_resumer(&self, sink: rmcp::service::ServerSink) -> McpTaskResumer {
         McpTaskResumer::new(sink, self.timeout, Some(self.task_notifications.clone()))
+            .with_elicitation_available(self.elicitation.is_some())
     }
 
     /// Build an [`McpTool`], applying this handler's configured timeout and
@@ -719,6 +757,7 @@ impl McpClientHandler {
             .with_task_policy(self.task_policy)
             .with_task_ttl(self.task_ttl)
             .with_task_notifications(self.task_notifications.clone())
+            .with_elicitation_available(self.elicitation.is_some())
     }
 
     /// Connect to an MCP server, fetch the initial tool list, and register
@@ -765,7 +804,48 @@ impl McpClientHandler {
 
 impl rmcp::handler::client::ClientHandler for McpClientHandler {
     fn get_info(&self) -> rmcp::model::ClientInfo {
-        self.client_info.clone()
+        let mut info = self.client_info.clone();
+        // Servers only send elicitation requests to clients that declared the
+        // capability, so a registered handler must be advertised here.
+        if let Some(handler) = &self.elicitation {
+            info.capabilities.elicitation = Some(handler.capability());
+        }
+        info
+    }
+
+    async fn create_elicitation(
+        &self,
+        mut request: rmcp::model::ElicitRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleClient>,
+    ) -> Result<rmcp::model::ElicitResult, rmcp::ErrorData> {
+        match &self.elicitation {
+            Some(handler) => {
+                // rmcp's router moves the request's `_meta` into
+                // `RequestContext.meta`; re-attach it so the handler can read
+                // the related-task correlation via `related_task_id`.
+                {
+                    use rmcp::model::RequestParamsMeta;
+                    if request.meta().is_none() && !context.meta.is_empty() {
+                        request.set_meta(context.meta.clone());
+                    }
+                }
+                handler.elicit(request).await
+            }
+            // rmcp's own default, preserved explicitly: decline everything.
+            None => Ok(rmcp::model::ElicitResult::new(
+                rmcp::model::ElicitationAction::Decline,
+            )),
+        }
+    }
+
+    async fn on_url_elicitation_notification_complete(
+        &self,
+        params: rmcp::model::ElicitationResponseNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(handler) = &self.elicitation {
+            handler.url_elicitation_complete(params).await;
+        }
     }
 
     async fn on_task_status(
