@@ -68,8 +68,10 @@ use crate::wasm_compat::WasmBoxedFuture;
 pub use rmcp::model::Meta;
 
 pub mod elicitation;
+pub mod notifications;
 pub mod tasks;
 pub use elicitation::{McpElicitationHandler, related_task_id};
+pub use notifications::McpNotificationDelegate;
 pub use tasks::{
     MODEL_IMMEDIATE_RESPONSE_META_KEY, McpTaskHandle, McpTaskInfo, McpTaskNotifications,
     McpTaskPolicy, McpTaskResumer, ServerSinkTaskExt,
@@ -667,6 +669,9 @@ pub struct McpClientHandler {
     /// Answers `elicitation/create` requests (SEP-1686 interactive input).
     /// Absent, rig preserves rmcp's default and declines every request.
     elicitation: Option<Arc<dyn McpElicitationHandler>>,
+    /// Receives the notifications rig has no native concept for, forwarded
+    /// after rig's own handling. Absent, they are dropped (rmcp's defaults).
+    notification_delegate: Option<Arc<dyn McpNotificationDelegate>>,
     /// Tracks which tool names were registered by this handler so they
     /// can be removed and replaced on list-change notifications.
     managed_tool_names: Arc<RwLock<Vec<String>>>,
@@ -690,6 +695,7 @@ impl McpClientHandler {
             task_ttl: None,
             task_notifications: Arc::new(McpTaskNotifications::default()),
             elicitation: None,
+            notification_delegate: None,
             managed_tool_names: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -731,6 +737,19 @@ impl McpClientHandler {
         H: McpElicitationHandler + 'static,
     {
         self.elicitation = Some(Arc::new(handler));
+        self
+    }
+
+    /// Register the [`McpNotificationDelegate`] receiving the MCP
+    /// notifications rig has no native concept for (progress, resource
+    /// updates, cancellations, custom, ...). Rig forwards **after** its own
+    /// handling, so the delegate cannot break rig invariants. Unregistered
+    /// (the default), those notifications are dropped exactly as before.
+    pub fn with_notification_delegate<D>(mut self, delegate: D) -> Self
+    where
+        D: McpNotificationDelegate + 'static,
+    {
+        self.notification_delegate = Some(Arc::new(delegate));
         self
     }
 
@@ -857,6 +876,67 @@ impl rmcp::handler::client::ClientHandler for McpClientHandler {
         // McpTaskHandle wakes immediately instead of at its next poll tick.
         // Notifications are optional per spec; handles keep polling either way.
         self.task_notifications.publish(&params.task);
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_task_status(params).await;
+        }
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_progress(params).await;
+        }
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_resource_updated(params).await;
+        }
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_resource_list_changed().await;
+        }
+    }
+
+    async fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_prompt_list_changed().await;
+        }
+    }
+
+    async fn on_cancelled(
+        &self,
+        params: rmcp::model::CancelledNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_cancelled(params).await;
+        }
+    }
+
+    async fn on_custom_notification(
+        &self,
+        params: rmcp::model::CustomNotification,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_custom_notification(params).await;
+        }
     }
 
     async fn on_tool_list_changed(
@@ -896,6 +976,13 @@ impl rmcp::handler::client::ClientHandler for McpClientHandler {
             tool_count = managed.len(),
             "MCP tool list refreshed successfully"
         );
+        drop(managed);
+
+        // Forward after rig's own handling: the delegate observes a state the
+        // tool server already reflects.
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_tool_list_changed().await;
+        }
     }
 }
 
