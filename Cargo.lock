@@ -10082,6 +10082,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp_elicitation_example"
+version = "0.39.0"
+dependencies = [
+ "anyhow",
+ "rig",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rmcp_example"
 version = "0.39.0"
 dependencies = [

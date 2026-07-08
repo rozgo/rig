@@ -64,6 +64,7 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `reqwest_middleware` | Demonstrates supplying a custom reqwest client with retry middleware. |
 | `rmcp_example` | An example of how you can use `rmcp` with Rig to create an MCP friendly agent. |
 | `rmcp_tasks_example` | First-class MCP tasks (SEP-1686): a slow tool runs as a background task while the agent keeps taking turns and incorporates the result when it lands. |
+| `rmcp_elicitation_example` | MCP elicitation: a background task pauses in `input_required` and asks the human (stdin, fail-closed) for input the final answer incorporates. |
 | `sentiment_classifier` | Demonstrates the smallest typed extractor for classification. |
 | `transcription` | See source. |
 | `vector_search_cohere` | Demonstrates vector search with separate Cohere document and query embeddings. |
