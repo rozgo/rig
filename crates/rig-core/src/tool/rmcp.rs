@@ -346,6 +346,19 @@ pub(crate) fn call_tool_result_to_text(
                     ));
                 }
             },
+            // A link to a server-owned resource (MCP `resource_link`): render
+            // the URI and metadata as text so the model can reference it or
+            // fetch it through the server's resource surface.
+            ContentBlock::ResourceLink(resource) => {
+                let mut chunk = format!("resource {} ({})", resource.uri, resource.name);
+                if let Some(mime_type) = &resource.mime_type {
+                    chunk.push_str(&format!(" [{mime_type}]"));
+                }
+                if let Some(description) = &resource.description {
+                    chunk.push_str(&format!(": {description}"));
+                }
+                chunk
+            }
             ContentBlock::Audio(_) => {
                 return Err(McpToolError::new(
                     ToolFailureKind::Other,
