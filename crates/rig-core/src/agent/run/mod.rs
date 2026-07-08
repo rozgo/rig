@@ -1580,6 +1580,18 @@ impl AgentRun {
     /// permitting), else finish with the descriptors surfaced on
     /// [`PromptResponse::unresolved_tasks`].
     fn finalize_or_drain(&mut self, response: PromptResponse) -> Result<AgentRunStep, PromptError> {
+        // A task that resolved during the model's final turn has left
+        // `deferred_tasks` but its result is still queued for delivery: under
+        // WaitAndResume (budget permitting) grant the same extra turn the
+        // drain path grants, so the resolved result is never silently dropped.
+        // The queued notices become the next prompt via `inject_task_notices`.
+        if !self.pending_task_notices.is_empty()
+            && matches!(self.task_drain, TaskDrainPolicy::WaitAndResume)
+            && self.current_turn <= self.max_turns + 1
+        {
+            self.state = RunState::PreparingRequest;
+            return self.next_step();
+        }
         if self.deferred_tasks.is_empty() {
             self.state = RunState::Done(Box::new(response.clone()));
             return Ok(AgentRunStep::Done(response));
@@ -3361,6 +3373,43 @@ mod task_tests {
         let mut resumed: AgentRun =
             serde_json::from_value(value).expect("pre-task payload deserializes");
         let _ = expect_call_model(&mut resumed);
+    }
+
+    #[test]
+    fn resolution_during_the_final_turn_still_gets_delivered() {
+        // The live-run regression: a ContinueTurns task resolves while the
+        // model is producing its final answer (the driver applies the
+        // resolution at the loop top, clearing `deferred_tasks` and queueing
+        // the notice). Finalizing must not drop the queued result — the run
+        // grants the drain-style extra turn instead.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::ContinueTurns,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_call_model(&mut run);
+        // The task resolves BEFORE the model's final turn is fed back.
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("late but delivered", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+        feed_turn(&mut run, text_turn("premature final answer"));
+
+        // Not Done: the undelivered notice buys the extra turn.
+        let (prompt, _) = expect_call_model(&mut run);
+        let parts = user_parts(&prompt);
+        let UserContent::Text(Text { text, .. }) = parts[0] else {
+            panic!("the queued notice must become the prompt");
+        };
+        assert!(text.contains("late but delivered"));
+
+        feed_turn(&mut run, text_turn("final answer with the result"));
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer with the result");
     }
 
     #[test]
