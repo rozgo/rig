@@ -33,9 +33,11 @@ use crate::{
     completion::{CompletionModel, Document, Usage},
     json_utils,
     message::{AssistantContent, Message, ToolChoice},
-    tool::{ToolContext, ToolOutput, ToolResult},
+    tool::{ToolContext, ToolOutput, ToolResult, ToolTaskStatus},
     wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
 };
+
+use super::run::TaskCompletionPolicy;
 
 /// Opaque process-scoped identifier for one agent run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -362,6 +364,66 @@ pub struct ToolResultEvent<'a> {
     pub tool_context: &'a ToolContext,
 }
 
+/// Event emitted after a tool backend accepts a call as a deferred task.
+#[derive(Clone, Copy)]
+pub struct ToolTaskStartedEvent<'a> {
+    /// Tool name.
+    pub tool_name: &'a str,
+    /// Provider tool-call id.
+    pub tool_call_id: Option<&'a str>,
+    /// Rig correlation id.
+    pub internal_call_id: &'a str,
+    /// Backend-assigned task id.
+    pub task_id: &'a str,
+    /// Backend-provided model-facing launch response, when present.
+    pub immediate_response: Option<&'a str>,
+    /// Completion policy selected for this call.
+    pub policy: TaskCompletionPolicy,
+}
+
+/// Event emitted when a deferred task reports a new non-terminal status.
+#[derive(Clone, Copy)]
+pub struct ToolTaskStatusEvent<'a> {
+    /// Tool name.
+    pub tool_name: &'a str,
+    /// Provider tool-call id.
+    pub tool_call_id: Option<&'a str>,
+    /// Rig correlation id.
+    pub internal_call_id: &'a str,
+    /// Backend-assigned task id.
+    pub task_id: &'a str,
+    /// Newly observed lifecycle status.
+    pub status: ToolTaskStatus,
+}
+
+/// Event emitted after a deferred task reaches a terminal state.
+///
+/// `presentation` contains the running presentation rewrite. `raw_result` and
+/// `tool_context` always contain the original terminal data.
+#[derive(Clone, Copy)]
+pub struct ToolTaskResultEvent<'a> {
+    /// Tool name.
+    pub tool_name: &'a str,
+    /// Provider tool-call id.
+    pub tool_call_id: Option<&'a str>,
+    /// Rig correlation id.
+    pub internal_call_id: &'a str,
+    /// Backend-assigned task id.
+    pub task_id: &'a str,
+    /// Effective arguments used to launch the task.
+    pub args: &'a str,
+    /// Terminal lifecycle status.
+    pub status: ToolTaskStatus,
+    /// Completion policy selected for this call.
+    pub policy: TaskCompletionPolicy,
+    /// Current model-visible presentation, including earlier rewrites.
+    pub presentation: &'a ToolOutput,
+    /// Immutable raw terminal result.
+    pub raw_result: &'a ToolResult,
+    /// Per-dispatch context containing inbound data and result metadata.
+    pub tool_context: &'a ToolContext,
+}
+
 /// Streaming text delta.
 #[derive(Clone, Copy)]
 pub struct TextDelta<'a> {
@@ -409,6 +471,9 @@ pub enum StepEventKind {
     InvalidToolCall,
     ToolCall,
     ToolResult,
+    ToolTaskStarted,
+    ToolTaskStatus,
+    ToolTaskResult,
     TextDelta,
     ToolCallDelta,
     StreamResponseFinish,
@@ -683,6 +748,95 @@ impl ToolResultAction {
     }
 }
 
+/// Action for task-start hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolTaskStartedAction {
+    /// Continue driving the task.
+    Continue,
+    /// Cancel the task and use this reason as its result.
+    Cancel(String),
+    /// Stop the run.
+    Stop(String),
+}
+
+impl ToolTaskStartedAction {
+    /// Creates an action that continues driving the task.
+    pub fn continue_task() -> Self {
+        Self::Continue
+    }
+
+    /// Creates an action that cancels the task.
+    pub fn cancel(reason: impl Into<String>) -> Self {
+        Self::Cancel(reason.into())
+    }
+
+    /// Creates an action that stops the run.
+    pub fn stop(reason: impl Into<String>) -> Self {
+        Self::Stop(reason.into())
+    }
+}
+
+/// Action for task-status hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolTaskStatusAction {
+    /// Continue driving the task.
+    Continue,
+    /// Cancel the task and use this reason as its result.
+    Cancel(String),
+    /// Stop the run.
+    Stop(String),
+}
+
+impl ToolTaskStatusAction {
+    /// Creates an action that continues driving the task.
+    pub fn continue_task() -> Self {
+        Self::Continue
+    }
+
+    /// Creates an action that cancels the task.
+    pub fn cancel(reason: impl Into<String>) -> Self {
+        Self::Cancel(reason.into())
+    }
+
+    /// Creates an action that stops the run.
+    pub fn stop(reason: impl Into<String>) -> Self {
+        Self::Stop(reason.into())
+    }
+}
+
+/// Action for terminal task-result hooks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolTaskResultAction {
+    /// Keep the current presentation.
+    Keep,
+    /// Replace the effective presentation sent to the model and telemetry.
+    Rewrite(ToolOutput),
+    /// Stop the run.
+    Stop(String),
+}
+
+impl ToolTaskResultAction {
+    /// Creates an action that preserves the current presentation.
+    pub fn keep() -> Self {
+        Self::Keep
+    }
+
+    /// Creates a literal-text presentation rewrite.
+    pub fn rewrite(result: impl Into<String>) -> Self {
+        Self::Rewrite(ToolOutput::text(result))
+    }
+
+    /// Creates an explicit structured or multimodal presentation rewrite.
+    pub fn rewrite_output(output: ToolOutput) -> Self {
+        Self::Rewrite(output)
+    }
+
+    /// Creates an action that stops the run.
+    pub fn stop(reason: impl Into<String>) -> Self {
+        Self::Stop(reason.into())
+    }
+}
+
 /// Action for invalid-tool-call hooks and manual invalid-call resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidToolCallAction {
@@ -847,6 +1001,41 @@ where
         async { ToolResultAction::Keep }
     }
 
+    /// Runs after a backend accepts a tool call as a deferred task.
+    ///
+    /// The hook may continue driving the task, cancel it, or stop the run.
+    fn on_tool_task_started(
+        &self,
+        _ctx: &HookContext,
+        _event: ToolTaskStartedEvent<'_>,
+    ) -> impl Future<Output = ToolTaskStartedAction> + WasmCompatSend {
+        async { ToolTaskStartedAction::Continue }
+    }
+
+    /// Runs when a deferred task reports a new non-terminal status.
+    ///
+    /// The hook may continue driving the task, cancel it, or stop the run.
+    fn on_tool_task_status(
+        &self,
+        _ctx: &HookContext,
+        _event: ToolTaskStatusEvent<'_>,
+    ) -> impl Future<Output = ToolTaskStatusAction> + WasmCompatSend {
+        async { ToolTaskStatusAction::Continue }
+    }
+
+    /// Runs after a deferred task resolves and before its presentation is sent
+    /// to the model.
+    ///
+    /// Rewrites affect model-visible presentation and result-content telemetry,
+    /// but not the raw terminal result or typed context.
+    fn on_tool_task_result(
+        &self,
+        _ctx: &HookContext,
+        _event: ToolTaskResultEvent<'_>,
+    ) -> impl Future<Output = ToolTaskResultAction> + WasmCompatSend {
+        async { ToolTaskResultAction::Keep }
+    }
+
     /// Observes a text delta from a streaming response.
     ///
     /// The default action continues the run.
@@ -936,6 +1125,27 @@ where
         ctx: &'a HookContext,
         event: ToolResultEvent<'a>,
     ) -> WasmBoxedFuture<'a, ToolResultAction>
+    where
+        M: 'a;
+    fn tool_task_started<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskStartedEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskStartedAction>
+    where
+        M: 'a;
+    fn tool_task_status<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskStatusEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskStatusAction>
+    where
+        M: 'a;
+    fn tool_task_result<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskResultEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskResultAction>
     where
         M: 'a;
     fn text_delta<'a>(
@@ -1032,6 +1242,36 @@ where
         M: 'a,
     {
         Box::pin(self.on_tool_result(ctx, event))
+    }
+    fn tool_task_started<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskStartedEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskStartedAction>
+    where
+        M: 'a,
+    {
+        Box::pin(self.on_tool_task_started(ctx, event))
+    }
+    fn tool_task_status<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskStatusEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskStatusAction>
+    where
+        M: 'a,
+    {
+        Box::pin(self.on_tool_task_status(ctx, event))
+    }
+    fn tool_task_result<'a>(
+        &'a self,
+        ctx: &'a HookContext,
+        event: ToolTaskResultEvent<'a>,
+    ) -> WasmBoxedFuture<'a, ToolTaskResultAction>
+    where
+        M: 'a,
+    {
+        Box::pin(self.on_tool_task_result(ctx, event))
     }
     fn text_delta<'a>(
         &'a self,
@@ -1256,6 +1496,51 @@ impl<M: CompletionModel> AgentHook<M> for HookStack<M> {
         }
         effective.map_or(ToolResultAction::Keep, ToolResultAction::Rewrite)
     }
+    async fn on_tool_task_started(
+        &self,
+        ctx: &HookContext,
+        event: ToolTaskStartedEvent<'_>,
+    ) -> ToolTaskStartedAction {
+        for hook in &self.hooks {
+            let action = hook.tool_task_started(ctx, event).await;
+            if !matches!(action, ToolTaskStartedAction::Continue) {
+                return action;
+            }
+        }
+        ToolTaskStartedAction::Continue
+    }
+    async fn on_tool_task_status(
+        &self,
+        ctx: &HookContext,
+        event: ToolTaskStatusEvent<'_>,
+    ) -> ToolTaskStatusAction {
+        for hook in &self.hooks {
+            let action = hook.tool_task_status(ctx, event).await;
+            if !matches!(action, ToolTaskStatusAction::Continue) {
+                return action;
+            }
+        }
+        ToolTaskStatusAction::Continue
+    }
+    async fn on_tool_task_result(
+        &self,
+        ctx: &HookContext,
+        event: ToolTaskResultEvent<'_>,
+    ) -> ToolTaskResultAction {
+        let mut effective: Option<ToolOutput> = None;
+        for hook in &self.hooks {
+            let current = ToolTaskResultEvent {
+                presentation: effective.as_ref().unwrap_or(event.presentation),
+                ..event
+            };
+            match hook.tool_task_result(ctx, current).await {
+                ToolTaskResultAction::Keep => {}
+                ToolTaskResultAction::Rewrite(value) => effective = Some(value),
+                stop @ ToolTaskResultAction::Stop(_) => return stop,
+            }
+        }
+        effective.map_or(ToolTaskResultAction::Keep, ToolTaskResultAction::Rewrite)
+    }
     async fn on_text_delta(&self, ctx: &HookContext, event: TextDelta<'_>) -> ObservationAction {
         for hook in &self.hooks {
             let action = hook.text_delta(ctx, event).await;
@@ -1298,6 +1583,8 @@ impl<M: CompletionModel> AgentHook<M> for HookStack<M> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::{
         test_utils::MockCompletionModel,
@@ -1511,6 +1798,157 @@ mod tests {
 
         assert_eq!(action, ToolResultAction::stop("terminal"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone)]
+    struct TaskResultRewriter {
+        seen: Arc<Mutex<Vec<(String, ToolErrorKind, String)>>>,
+        replacement: String,
+    }
+
+    impl AgentHook<MockCompletionModel> for TaskResultRewriter {
+        async fn on_tool_task_result(
+            &self,
+            _ctx: &HookContext,
+            event: ToolTaskResultEvent<'_>,
+        ) -> ToolTaskResultAction {
+            self.seen.lock().unwrap().push((
+                event.presentation.render(),
+                event.raw_result.error().unwrap().kind(),
+                event.tool_context.result::<String>().unwrap().clone(),
+            ));
+            ToolTaskResultAction::rewrite(self.replacement.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn task_result_rewrites_chain_without_mutating_terminal_data() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut stack = HookStack::with(TaskResultRewriter {
+            seen: seen.clone(),
+            replacement: "redacted".into(),
+        });
+        stack.push(TaskResultRewriter {
+            seen: seen.clone(),
+            replacement: "summarized".into(),
+        });
+        let raw = ToolResult::failed(ToolExecutionError::timeout("raw task failure"));
+        let mut context = ToolContext::new();
+        context.insert_result("task-metadata".to_string());
+
+        let action = stack
+            .on_tool_task_result(
+                &HookContext::new(false, None),
+                ToolTaskResultEvent {
+                    tool_name: "work",
+                    tool_call_id: Some("provider-id"),
+                    internal_call_id: "internal-id",
+                    task_id: "task-id",
+                    args: "{}",
+                    status: ToolTaskStatus::Failed,
+                    policy: TaskCompletionPolicy::JoinTurn,
+                    presentation: raw.output(),
+                    raw_result: &raw,
+                    tool_context: &context,
+                },
+            )
+            .await;
+
+        assert_eq!(action, ToolTaskResultAction::rewrite("summarized"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (
+                    "raw task failure".into(),
+                    ToolErrorKind::Timeout,
+                    "task-metadata".into(),
+                ),
+                (
+                    "redacted".into(),
+                    ToolErrorKind::Timeout,
+                    "task-metadata".into(),
+                ),
+            ]
+        );
+        assert_eq!(raw.output().as_text(), Some("raw task failure"));
+    }
+
+    struct TaskLifecycleHook {
+        calls: Arc<AtomicUsize>,
+        cancel: bool,
+    }
+
+    impl AgentHook<MockCompletionModel> for TaskLifecycleHook {
+        async fn on_tool_task_started(
+            &self,
+            _ctx: &HookContext,
+            _event: ToolTaskStartedEvent<'_>,
+        ) -> ToolTaskStartedAction {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.cancel {
+                ToolTaskStartedAction::cancel("cancel at launch")
+            } else {
+                ToolTaskStartedAction::continue_task()
+            }
+        }
+
+        async fn on_tool_task_status(
+            &self,
+            _ctx: &HookContext,
+            _event: ToolTaskStatusEvent<'_>,
+        ) -> ToolTaskStatusAction {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.cancel {
+                ToolTaskStatusAction::cancel("cancel after status")
+            } else {
+                ToolTaskStatusAction::continue_task()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_terminal_actions_short_circuit_later_hooks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut stack = HookStack::with(TaskLifecycleHook {
+            calls: calls.clone(),
+            cancel: true,
+        });
+        stack.push(TaskLifecycleHook {
+            calls: calls.clone(),
+            cancel: false,
+        });
+        let context = HookContext::new(false, None);
+
+        let started = stack
+            .on_tool_task_started(
+                &context,
+                ToolTaskStartedEvent {
+                    tool_name: "work",
+                    tool_call_id: None,
+                    internal_call_id: "internal-id",
+                    task_id: "task-id",
+                    immediate_response: None,
+                    policy: TaskCompletionPolicy::JoinTurn,
+                },
+            )
+            .await;
+        assert_eq!(started, ToolTaskStartedAction::cancel("cancel at launch"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let status = stack
+            .on_tool_task_status(
+                &context,
+                ToolTaskStatusEvent {
+                    tool_name: "work",
+                    tool_call_id: None,
+                    internal_call_id: "internal-id",
+                    task_id: "task-id",
+                    status: ToolTaskStatus::Working,
+                },
+            )
+            .await;
+        assert_eq!(status, ToolTaskStatusAction::cancel("cancel after status"));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }
 
@@ -1871,6 +2309,9 @@ mod migrated_tests {
             StepEventKind::InvalidToolCall,
             StepEventKind::ToolCall,
             StepEventKind::ToolResult,
+            StepEventKind::ToolTaskStarted,
+            StepEventKind::ToolTaskStatus,
+            StepEventKind::ToolTaskResult,
             StepEventKind::TextDelta,
             StepEventKind::ToolCallDelta,
             StepEventKind::StreamResponseFinish,

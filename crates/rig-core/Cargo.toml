@@ -96,6 +96,7 @@ reqwest-middleware = { workspace = true, features = [
 hyper-util = { workspace = true, features = ["service", "server"] }
 rmcp = { workspace = true, features = [
   "client",
+  "elicitation",
   "macros",
   "reqwest",                                  # required for some strange reason
   "transport-streamable-http-client",

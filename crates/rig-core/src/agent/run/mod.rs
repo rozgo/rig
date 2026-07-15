@@ -10,7 +10,11 @@
 //!   feed the result back via [`AgentRun::model_response`].
 //! - [`AgentRunStep::CallTools`]: execute the listed tool calls (with whatever
 //!   concurrency the driver chooses) and feed the results back via
-//!   [`AgentRun::tool_results`].
+//!   [`AgentRun::tool_results`] (or [`AgentRun::tool_batch_results`] when a
+//!   call was dispatched as a deferred task).
+//! - [`AgentRunStep::AwaitTasks`]: wait on the listed deferred tool tasks and
+//!   feed each terminal result back via [`AgentRun::task_resolved`]. Waiting
+//!   consumes no turns.
 //! - [`AgentRunStep::Done`]: the run is complete.
 //!
 //! Because the machine never awaits anything, it is runtime-agnostic and the
@@ -43,6 +47,10 @@
 //!             // Execute `calls`, then: run.tool_results(results)?;
 //!             # let _ = calls;
 //!         }
+//!         AgentRunStep::AwaitTasks { pending } => {
+//!             // Wait on each task, then: run.task_resolved(id, resolution)?;
+//!             # let _ = pending;
+//!         }
 //!         AgentRunStep::Done(response) => {
 //!             println!("{}", response.output);
 //!             break;
@@ -69,10 +77,12 @@ use crate::{
         CompletionCall, PromptResponse, TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER,
         assistant_text_from_choice, build_full_history, build_history_for_request,
         invalid_tool_retry_user_message, is_empty_assistant_turn, tool_result_message,
+        tool_result_output,
     },
     completion::{Message, PromptError, Usage},
     json_utils,
     message::{AssistantContent, ToolCall, ToolChoice, ToolResult, ToolResultContent, UserContent},
+    tool::{ToolOutput, ToolTaskDescriptor, ToolTaskStatus},
 };
 
 pub use streamed::{
@@ -122,10 +132,20 @@ pub enum AgentRunStep {
         turn: usize,
     },
     /// Execute these tool calls and feed the results back via
-    /// [`AgentRun::tool_results`].
+    /// [`AgentRun::tool_results`] (or [`AgentRun::tool_batch_results`] when a
+    /// call may defer behind a task).
     CallTools {
         /// The tool calls of the current assistant turn, in emission order.
         calls: Vec<PendingToolCall>,
+    },
+    /// Wait for these deferred tool tasks and feed each terminal result back
+    /// via [`AgentRun::task_resolved`]. Emitted while a tool batch holds open
+    /// for [`TaskCompletionPolicy::JoinTurn`] tasks, and while a finished run
+    /// drains [`TaskCompletionPolicy::ContinueTurns`] tasks under
+    /// [`TaskDrainPolicy::WaitAndResume`]. Waiting consumes no turns.
+    AwaitTasks {
+        /// The outstanding tasks, in the order they were recorded.
+        pending: Vec<PendingTask>,
     },
     /// The run is complete.
     Done(PromptResponse),
@@ -147,6 +167,231 @@ pub struct PendingToolCall {
     /// tool-call deltas. Drivers generate a fresh ID when absent.
     #[serde(default)]
     pub internal_call_id: Option<String>,
+}
+
+/// How a deferred (task-backed) tool call completes relative to the turn that
+/// launched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TaskCompletionPolicy {
+    /// Hold the tool batch open: the batch's tool results are committed (as
+    /// one user message, preserving the batch's slot order) only after every
+    /// deferred handle resolves. The model only ever sees real results; message
+    /// shapes are identical to a run without tasks.
+    #[default]
+    JoinTurn,
+    /// Fill the call's tool_result slot immediately (with the task's
+    /// immediate response, or a synthesized launch notice) and continue the
+    /// run; the terminal result is injected into a later turn's prompt as
+    /// labeled user content. The model keeps working while the task runs.
+    ContinueTurns,
+}
+
+/// What to do when the model produces its final answer while
+/// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) tasks are still
+/// outstanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TaskDrainPolicy {
+    /// Wait for the still-pending tasks, inject their results, and run one
+    /// extra model turn so the final answer can incorporate them — bounded by
+    /// the run's `max_turns` (an exhausted budget degrades to
+    /// [`CancelAndFinish`](Self::CancelAndFinish) with a warning).
+    #[default]
+    WaitAndResume,
+    /// Finish with the model's answer; the driver best-effort cancels the
+    /// still-pending tasks. Their descriptors are surfaced on
+    /// [`PromptResponse::unresolved_tasks`].
+    CancelAndFinish,
+    /// Finish immediately and leave the tasks running;
+    /// [`PromptResponse::unresolved_tasks`] carries the descriptors and the
+    /// caller owns their lifecycle.
+    Detach,
+}
+
+/// A launched, not-yet-terminal deferred tool task, as recorded in the run
+/// state.
+///
+/// Serializable: carries the [`ToolTaskDescriptor`] resume token, never the
+/// live handle — a suspended run persists these and the driver rehydrates
+/// handles on resume via a [`TaskResumer`](crate::tool::TaskResumer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PendingTask {
+    /// Rig-generated id correlating this task with its tool call, hook events
+    /// and stream items.
+    pub internal_call_id: String,
+    /// The (effective, hook-rewritten) tool call that launched the task.
+    pub tool_call: ToolCall,
+    /// Serializable resume token for the backend task.
+    pub descriptor: ToolTaskDescriptor,
+    /// The completion policy resolved for this call at dispatch time.
+    pub policy: TaskCompletionPolicy,
+    /// The backend's model-facing immediate response, if any.
+    pub immediate_response: Option<String>,
+    /// One-based model-call index of the turn that launched the task.
+    pub launched_turn: usize,
+    /// Last observed status (updated via [`AgentRun::task_status`]).
+    #[serde(default)]
+    pub last_status: Option<ToolTaskStatus>,
+}
+
+impl PendingTask {
+    /// Record a launched deferred task. `immediate_response` defaults to the
+    /// descriptor's hint; override with [`Self::with_immediate_response`].
+    pub fn new(
+        internal_call_id: impl Into<String>,
+        tool_call: ToolCall,
+        descriptor: ToolTaskDescriptor,
+        policy: TaskCompletionPolicy,
+        launched_turn: usize,
+    ) -> Self {
+        let immediate_response = descriptor.immediate_response.clone();
+        Self {
+            internal_call_id: internal_call_id.into(),
+            tool_call,
+            descriptor,
+            policy,
+            immediate_response,
+            launched_turn,
+            last_status: None,
+        }
+    }
+
+    /// Set the model-facing immediate response used to fill the tool_result
+    /// slot under [`TaskCompletionPolicy::ContinueTurns`].
+    pub fn with_immediate_response(mut self, response: impl Into<String>) -> Self {
+        self.immediate_response = Some(response.into());
+        self
+    }
+}
+
+/// One call's outcome in a tool batch that may contain deferred tasks, fed to
+/// [`AgentRun::tool_batch_results`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ToolCallResolution {
+    /// The call completed inline (or was hook-skipped / preresolved): the
+    /// finished tool-result content, exactly what [`AgentRun::tool_results`]
+    /// accepts today.
+    Completed(UserContent),
+    /// The call was dispatched as a deferred task; the driver retains the
+    /// live handle and answers via [`AgentRun::task_resolved`].
+    // Boxed: PendingTask (tool call + descriptor) dwarfs the Completed variant.
+    Deferred(Box<PendingTask>),
+}
+
+/// The delivered terminal result of a deferred task, fed to
+/// [`AgentRun::task_resolved`]. Drivers produce this after their task-result
+/// hook has run (rewrites already applied).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TaskResolution {
+    /// Canonical model-visible output after task-result hook rewrites.
+    pub output: ToolOutput,
+    /// The terminal status the task ended in.
+    pub status: ToolTaskStatus,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedTaskResolution {
+    output: OneOrMany<ToolResultContent>,
+    status: ToolTaskStatus,
+}
+
+impl Serialize for TaskResolution {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SerializedTaskResolution {
+            output: self.output.as_content().clone(),
+            status: self.status,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskResolution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = SerializedTaskResolution::deserialize(deserializer)?;
+        Ok(Self {
+            output: ToolOutput::content(value.output),
+            status: value.status,
+        })
+    }
+}
+
+impl TaskResolution {
+    /// Build a resolution from canonical typed output.
+    pub fn new(output: impl Into<ToolOutput>, status: ToolTaskStatus) -> Self {
+        Self {
+            output: output.into(),
+            status,
+        }
+    }
+}
+
+/// The model-facing text filling a [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns)
+/// call's tool_result slot when the backend supplied no immediate response.
+pub(crate) fn task_launch_notice_text(task: &PendingTask) -> String {
+    format!(
+        "Task `{}` for tool `{}` has been started in the background; its result will be \
+         delivered in a later message when ready. Do not call the tool again for the same \
+         request.",
+        task.descriptor.task_id, task.tool_call.function.name,
+    )
+}
+
+/// Shape a resolved [`JoinTurn`](TaskCompletionPolicy::JoinTurn) task's result
+/// into the tool_result content filling its held batch slot.
+fn task_slot_content(task: &PendingTask, resolution: &TaskResolution) -> UserContent {
+    let id = task.tool_call.id.clone();
+    let call_id = task.tool_call.call_id.clone();
+    tool_result_output(id, call_id, resolution.output.clone())
+}
+
+/// The labeled user-content sequence injected into a later turn's prompt when
+/// a [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) task resolves.
+/// Images remain images; JSON uses a stable text representation because
+/// [`UserContent`] has no standalone JSON variant.
+pub(crate) fn task_result_notice_content(
+    task: &PendingTask,
+    resolution: &TaskResolution,
+) -> Vec<UserContent> {
+    let verb = match resolution.status {
+        ToolTaskStatus::Completed => "completed",
+        ToolTaskStatus::Failed => "failed",
+        ToolTaskStatus::Cancelled => "was cancelled",
+        _ => "finished",
+    };
+    let header = format!(
+        "Background task update: tool `{}` (task `{}`, launched on turn {} via tool call `{}`) \
+         {verb}. The result follows.",
+        task.tool_call.function.name,
+        task.descriptor.task_id,
+        task.launched_turn,
+        task.tool_call.id,
+    );
+    let mut content = vec![UserContent::text(header)];
+    content.extend(
+        resolution
+            .output
+            .as_content()
+            .clone()
+            .into_iter()
+            .map(|item| match item {
+                ToolResultContent::Text(text) => UserContent::Text(text),
+                ToolResultContent::Image(image) => UserContent::Image(image),
+                ToolResultContent::Json { value } => {
+                    UserContent::text(json_utils::serialize_json_value(&value))
+                }
+            }),
+    );
+    content
 }
 
 /// A completed model turn fed back to [`AgentRun::model_response`].
@@ -261,10 +506,32 @@ enum RunState {
     /// Carrying the calls in the state keeps a serialized run self-contained:
     /// a resumed process re-obtains them from [`AgentRun::next_step`].
     ExecutingTools(Vec<PendingToolCall>),
+    /// Waiting for [`AgentRun::task_resolved`] for each pending deferred task.
+    /// Idempotent like `ExecutingTools`: a resumed process re-obtains the
+    /// pending set (as serializable descriptors) from [`AgentRun::next_step`].
+    AwaitingTasks(Box<AwaitingTasksState>),
     /// Terminal: the run completed successfully.
     Done(Box<PromptResponse>),
     /// Terminal: the run returned an error.
     Failed,
+}
+
+/// A tool batch held open on deferred tasks, or (when `draining_for_done` is
+/// set) the pre-`Done` drain of run-level
+/// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwaitingTasksState {
+    /// Result slots in the order supplied when the batch was created; `None` =
+    /// owned by a pending join task (empty on the drain path).
+    slots: Vec<Option<UserContent>>,
+    /// The outstanding tasks; a join task carries the index of the slot its
+    /// resolution fills, a draining task carries `None` (its resolution is
+    /// queued as a prompt notice instead).
+    pending: Vec<(Option<usize>, PendingTask)>,
+    /// Set when this state drains still-running `ContinueTurns` tasks before
+    /// finalizing the run under [`TaskDrainPolicy::WaitAndResume`].
+    #[serde(default)]
+    draining_for_done: bool,
 }
 
 /// The sans-IO agent loop state machine. See the [module docs](self) for the
@@ -306,6 +573,17 @@ pub struct AgentRun {
     /// [`AgentRunStep::CallModel`] is emitted.
     #[serde(default)]
     streamed_completion_call_recorded: bool,
+    /// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) tasks that
+    /// outlive their launching turn, awaiting resolution.
+    #[serde(default)]
+    deferred_tasks: Vec<PendingTask>,
+    /// Resolved `ContinueTurns` results awaiting injection into the next
+    /// [`AgentRunStep::CallModel`] prompt, in resolution order.
+    #[serde(default)]
+    pending_task_notices: Vec<(PendingTask, TaskResolution)>,
+    /// What to do when the model finalizes while deferred tasks are pending.
+    #[serde(default)]
+    task_drain: TaskDrainPolicy,
     state: RunState,
 }
 
@@ -330,8 +608,19 @@ impl AgentRun {
             invalid_tool_call_retries: 0,
             rollback_pending: false,
             streamed_completion_call_recorded: false,
+            deferred_tasks: Vec::new(),
+            pending_task_notices: Vec::new(),
+            task_drain: TaskDrainPolicy::default(),
             state: RunState::PreparingRequest,
         }
+    }
+
+    /// Set what happens when the model produces its final answer while
+    /// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) tasks are still
+    /// outstanding. Defaults to [`TaskDrainPolicy::WaitAndResume`].
+    pub fn with_task_drain(mut self, policy: TaskDrainPolicy) -> Self {
+        self.task_drain = policy;
+        self
     }
 
     /// Set the input chat history preceding the prompt.
@@ -555,6 +844,13 @@ impl AgentRun {
     pub fn next_step(&mut self) -> Result<AgentRunStep, PromptError> {
         match std::mem::replace(&mut self.state, RunState::Failed) {
             RunState::PreparingRequest => {
+                // Deliver resolved ContinueTurns task results before assembling
+                // the request: appended to the pending user message *after* its
+                // tool_result parts (providers require tool results first), or
+                // as a fresh user message when the last message is the
+                // assistant's (the post-drain path, where it becomes the prompt).
+                self.inject_task_notices();
+
                 let Some((prompt_ref, history_for_turn)) = self.new_messages.split_last() else {
                     return Err(PromptError::prompt_cancelled(
                         self.full_history(),
@@ -662,8 +958,7 @@ impl AgentRun {
                     if let Some(content) = final_content {
                         response = response.with_content(content);
                     }
-                    self.state = RunState::Done(Box::new(response.clone()));
-                    return Ok(AgentRunStep::Done(response));
+                    return self.finalize_or_drain(response);
                 }
 
                 if !is_empty_assistant_turn(&choice) {
@@ -730,8 +1025,7 @@ impl AgentRun {
                             .with_messages(self.new_messages.clone())
                             .with_completion_calls(self.completion_calls.clone())
                             .with_content(choice.clone());
-                    self.state = RunState::Done(Box::new(response.clone()));
-                    Ok(AgentRunStep::Done(response))
+                    self.finalize_or_drain(response)
                 }
             }
             RunState::ExecutingTools(calls) => {
@@ -741,6 +1035,19 @@ impl AgentRun {
                     calls: calls.clone(),
                 };
                 self.state = RunState::ExecutingTools(calls);
+                Ok(step)
+            }
+            RunState::AwaitingTasks(awaiting) => {
+                // Idempotent, like ExecutingTools: a resumed process re-obtains
+                // the pending deferred tasks from the state itself.
+                let step = AgentRunStep::AwaitTasks {
+                    pending: awaiting
+                        .pending
+                        .iter()
+                        .map(|(_, task)| task.clone())
+                        .collect(),
+                };
+                self.state = RunState::AwaitingTasks(awaiting);
                 Ok(step)
             }
             RunState::Done(response) => {
@@ -1036,6 +1343,363 @@ impl AgentRun {
         self.new_messages.push(Message::User { content });
         self.state = RunState::PreparingRequest;
         Ok(())
+    }
+
+    /// Feed the batch outcome for the pending [`AgentRunStep::CallTools`] when
+    /// the driver may have dispatched calls as deferred tasks.
+    ///
+    /// `resolutions` must answer every pending call exactly once, matched by
+    /// tool call id as a multiset (the same validation as
+    /// [`tool_results`](Self::tool_results); a batch of only
+    /// [`ToolCallResolution::Completed`] entries behaves identically to it):
+    ///
+    /// - every `Completed` fills its result slot immediately;
+    /// - every `Deferred` task with [`TaskCompletionPolicy::ContinueTurns`]
+    ///   fills its slot with the task's immediate response (or a synthesized
+    ///   launch notice) and moves into the run-level deferred set — the run
+    ///   continues while the task executes;
+    /// - every `Deferred` task with [`TaskCompletionPolicy::JoinTurn`] leaves
+    ///   its slot empty and parks the batch in
+    ///   [`AgentRunStep::AwaitTasks`] until [`task_resolved`](Self::task_resolved)
+    ///   fills every slot.
+    ///
+    /// When no join tasks remain, the batch commits as one user message in the
+    /// order the resolutions were provided.
+    pub fn tool_batch_results(
+        &mut self,
+        resolutions: Vec<ToolCallResolution>,
+    ) -> Result<(), PromptError> {
+        // An all-inline batch is exactly the existing path — delegate so the
+        // two entry points cannot drift.
+        if !resolutions
+            .iter()
+            .any(|resolution| matches!(resolution, ToolCallResolution::Deferred(_)))
+        {
+            let contents: Vec<UserContent> = resolutions
+                .into_iter()
+                .filter_map(|resolution| match resolution {
+                    ToolCallResolution::Completed(content) => Some(content),
+                    ToolCallResolution::Deferred(_) => None,
+                })
+                .collect();
+            return self.tool_results(contents);
+        }
+
+        let RunState::ExecutingTools(pending) = &self.state else {
+            return Err(self
+                .protocol_violation("tool_batch_results called without a pending CallTools step"));
+        };
+        // Match resolutions against pending calls by tool call ID as a
+        // multiset, so duplicate provider IDs within one turn stay answerable.
+        let mut unanswered: Vec<String> = pending
+            .iter()
+            .map(|call| call.tool_call.id.clone())
+            .collect();
+        for resolution in &resolutions {
+            let id = match resolution {
+                ToolCallResolution::Completed(UserContent::ToolResult(tool_result)) => {
+                    &tool_result.id
+                }
+                ToolCallResolution::Completed(_) => {
+                    return Err(self.protocol_violation(
+                        "tool_batch_results received content that is not a tool result",
+                    ));
+                }
+                ToolCallResolution::Deferred(task) => &task.tool_call.id,
+            };
+            let Some(index) = unanswered
+                .iter()
+                .position(|unanswered_id| unanswered_id == id)
+            else {
+                return Err(self.protocol_violation(&format!(
+                    "tool_batch_results received a result for unknown or already-answered tool call id `{id}`"
+                )));
+            };
+            unanswered.swap_remove(index);
+        }
+        if !unanswered.is_empty() {
+            return Err(self.protocol_violation(&format!(
+                "tool_batch_results left pending tool call id(s) unanswered: {unanswered:?}"
+            )));
+        }
+
+        let mut slots: Vec<Option<UserContent>> = Vec::with_capacity(resolutions.len());
+        let mut join_pending: Vec<(Option<usize>, PendingTask)> = Vec::new();
+        for resolution in resolutions {
+            match resolution {
+                ToolCallResolution::Completed(content) => slots.push(Some(content)),
+                ToolCallResolution::Deferred(task) => match task.policy {
+                    TaskCompletionPolicy::ContinueTurns => {
+                        let text = task
+                            .immediate_response
+                            .clone()
+                            .unwrap_or_else(|| task_launch_notice_text(&task));
+                        slots.push(Some(tool_result_message(
+                            task.tool_call.id.clone(),
+                            task.tool_call.call_id.clone(),
+                            text,
+                        )));
+                        self.deferred_tasks.push(*task);
+                    }
+                    TaskCompletionPolicy::JoinTurn => {
+                        let slot_index = slots.len();
+                        slots.push(None);
+                        join_pending.push((Some(slot_index), *task));
+                    }
+                },
+            }
+        }
+
+        if join_pending.is_empty() {
+            // Every slot filled inline (or by a ContinueTurns immediate
+            // response): commit the batch now, exactly like `tool_results`.
+            let contents: Vec<UserContent> = slots.into_iter().flatten().collect();
+            let Some(content) = OneOrMany::from_iter_optional(contents) else {
+                return Err(
+                    self.protocol_violation("internal: tool results vanished during validation")
+                );
+            };
+            self.new_messages.push(Message::User { content });
+            self.state = RunState::PreparingRequest;
+        } else {
+            self.state = RunState::AwaitingTasks(Box::new(AwaitingTasksState {
+                slots,
+                pending: join_pending,
+                draining_for_done: false,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Feed the terminal result of a deferred task.
+    ///
+    /// - A [`JoinTurn`](TaskCompletionPolicy::JoinTurn) task (the run is in
+    ///   [`AgentRunStep::AwaitTasks`] for its batch) fills its held tool_result
+    ///   slot; when the last slot fills, the batch commits in the slot order
+    ///   established by [`tool_batch_results`](Self::tool_batch_results).
+    /// - A [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) task is
+    ///   removed from the run-level deferred set and its result queued as a
+    ///   labeled content for the next [`AgentRunStep::CallModel`] prompt —
+    ///   valid in **any** non-terminal state.
+    ///
+    /// # Errors
+    /// A protocol violation (state preserved) for an unknown or
+    /// already-resolved `internal_call_id`, or when the run is terminal.
+    pub fn task_resolved(
+        &mut self,
+        internal_call_id: &str,
+        resolution: TaskResolution,
+    ) -> Result<(), PromptError> {
+        if !resolution.status.is_terminal() {
+            return Err(self.protocol_violation(&format!(
+                "task_resolved requires a terminal status, got `{}`",
+                resolution.status
+            )));
+        }
+
+        // Run-level ContinueTurns task first: valid in any non-terminal state.
+        if let Some(position) = self
+            .deferred_tasks
+            .iter()
+            .position(|task| task.internal_call_id == internal_call_id)
+        {
+            if matches!(self.state, RunState::Done(_) | RunState::Failed) {
+                return Err(self.protocol_violation("task_resolved called after the run finished"));
+            }
+            let task = self.deferred_tasks.remove(position);
+            self.pending_task_notices.push((task, resolution));
+            return Ok(());
+        }
+
+        let RunState::AwaitingTasks(awaiting) = &mut self.state else {
+            return Err(self.protocol_violation(&format!(
+                "task_resolved received an unknown or already-resolved internal call id `{internal_call_id}`"
+            )));
+        };
+        let Some(position) = awaiting
+            .pending
+            .iter()
+            .position(|(_, task)| task.internal_call_id == internal_call_id)
+        else {
+            return Err(self.protocol_violation(&format!(
+                "task_resolved received an unknown or already-resolved internal call id `{internal_call_id}`"
+            )));
+        };
+        let (slot_index, task) = awaiting.pending.remove(position);
+        let last_pending = awaiting.pending.is_empty();
+        if awaiting.draining_for_done {
+            self.pending_task_notices.push((task, resolution));
+        } else if let Some(index) = slot_index {
+            let content = task_slot_content(&task, &resolution);
+            if let Some(slot) = awaiting.slots.get_mut(index) {
+                *slot = Some(content);
+            }
+        }
+
+        if last_pending {
+            // The state was just matched as AwaitingTasks; take it and either
+            // commit the join batch or (drain path) let the queued notices
+            // form the next prompt.
+            if let RunState::AwaitingTasks(awaiting) =
+                std::mem::replace(&mut self.state, RunState::PreparingRequest)
+                && !awaiting.draining_for_done
+            {
+                let contents: Vec<UserContent> = awaiting.slots.into_iter().flatten().collect();
+                let Some(content) = OneOrMany::from_iter_optional(contents) else {
+                    self.state = RunState::Failed;
+                    return Err(PromptError::prompt_cancelled(
+                        self.full_history(),
+                        "tool execution produced no tool results",
+                    ));
+                };
+                self.new_messages.push(Message::User { content });
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a non-terminal status observation for a pending deferred task.
+    /// Updates the task's [`PendingTask::last_status`]; never transitions the
+    /// run state. An unknown `internal_call_id` is a protocol violation.
+    pub fn task_status(
+        &mut self,
+        internal_call_id: &str,
+        status: ToolTaskStatus,
+    ) -> Result<(), PromptError> {
+        if let Some(task) = self
+            .deferred_tasks
+            .iter_mut()
+            .find(|task| task.internal_call_id == internal_call_id)
+        {
+            task.last_status = Some(status);
+            return Ok(());
+        }
+        if let RunState::AwaitingTasks(awaiting) = &mut self.state
+            && let Some((_, task)) = awaiting
+                .pending
+                .iter_mut()
+                .find(|(_, task)| task.internal_call_id == internal_call_id)
+        {
+            task.last_status = Some(status);
+            return Ok(());
+        }
+        Err(self.protocol_violation(&format!(
+            "task_status received an unknown internal call id `{internal_call_id}`"
+        )))
+    }
+
+    /// The deferred tasks currently awaiting resolution: join tasks held by an
+    /// [`AgentRunStep::AwaitTasks`] batch, then run-level
+    /// [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns) tasks. The
+    /// resume-inspection surface: a driver rehydrates a live handle for each
+    /// entry's descriptor.
+    pub fn pending_tasks(&self) -> Vec<&PendingTask> {
+        let mut tasks: Vec<&PendingTask> = Vec::new();
+        if let RunState::AwaitingTasks(awaiting) = &self.state {
+            tasks.extend(awaiting.pending.iter().map(|(_, task)| task));
+        }
+        tasks.extend(self.deferred_tasks.iter());
+        tasks
+    }
+
+    /// Move queued task-result notices into the outgoing prompt: appended
+    /// after the pending user message's existing content (tool_result parts
+    /// must stay first for provider compatibility), or as a fresh user message
+    /// when the last message is the assistant's (the post-drain path).
+    fn inject_task_notices(&mut self) {
+        if self.pending_task_notices.is_empty() {
+            return;
+        }
+        let notices: Vec<UserContent> = self
+            .pending_task_notices
+            .drain(..)
+            .flat_map(|(task, resolution)| task_result_notice_content(&task, &resolution))
+            .collect();
+        match self.new_messages.last_mut() {
+            Some(Message::User { content }) => {
+                for notice in notices {
+                    content.push(notice);
+                }
+            }
+            _ => {
+                if let Some(content) = OneOrMany::from_iter_optional(notices) {
+                    self.new_messages.push(Message::User { content });
+                }
+            }
+        }
+    }
+
+    /// Finalize the run, or — when [`ContinueTurns`](TaskCompletionPolicy::ContinueTurns)
+    /// tasks are still outstanding — apply the [`TaskDrainPolicy`]: park in a
+    /// draining [`AgentRunStep::AwaitTasks`] under `WaitAndResume` (budget
+    /// permitting), else finish with the descriptors surfaced on
+    /// [`PromptResponse::unresolved_tasks`].
+    fn finalize_or_drain(&mut self, response: PromptResponse) -> Result<AgentRunStep, PromptError> {
+        // A task that resolved during the model's final turn has left
+        // `deferred_tasks` but its result is still queued for delivery: under
+        // WaitAndResume (budget permitting) grant the same extra turn the
+        // drain path grants, so the resolved result is never silently dropped.
+        // The queued notices become the next prompt via `inject_task_notices`.
+        if !self.pending_task_notices.is_empty()
+            && matches!(self.task_drain, TaskDrainPolicy::WaitAndResume)
+            && self.current_turn < self.max_turns
+        {
+            self.state = RunState::PreparingRequest;
+            return self.next_step();
+        }
+        if self.deferred_tasks.is_empty() {
+            self.state = RunState::Done(Box::new(response.clone()));
+            return Ok(AgentRunStep::Done(response));
+        }
+        match self.task_drain {
+            // The extra turn the drain buys must fit the multi-turn budget
+            // (same guard shape as the next CallModel's check).
+            TaskDrainPolicy::WaitAndResume if self.current_turn < self.max_turns => {
+                let pending: Vec<(Option<usize>, PendingTask)> =
+                    std::mem::take(&mut self.deferred_tasks)
+                        .into_iter()
+                        .map(|task| (None, task))
+                        .collect();
+                let step_pending: Vec<PendingTask> =
+                    pending.iter().map(|(_, task)| task.clone()).collect();
+                self.state = RunState::AwaitingTasks(Box::new(AwaitingTasksState {
+                    slots: Vec::new(),
+                    pending,
+                    draining_for_done: true,
+                }));
+                Ok(AgentRunStep::AwaitTasks {
+                    pending: step_pending,
+                })
+            }
+            TaskDrainPolicy::WaitAndResume => {
+                // Never raise MaxTurnsError for a run whose model already
+                // produced its final answer; degrade to cancel-and-finish.
+                tracing::warn!(
+                    pending = self.deferred_tasks.len(),
+                    "turn budget exhausted while deferred tasks are pending; \
+                     finishing without their results"
+                );
+                self.finish_with_unresolved(response)
+            }
+            TaskDrainPolicy::CancelAndFinish | TaskDrainPolicy::Detach => {
+                self.finish_with_unresolved(response)
+            }
+        }
+    }
+
+    /// Finish the run carrying the still-pending tasks' descriptors on
+    /// [`PromptResponse::unresolved_tasks`]; the driver decides whether to
+    /// cancel or detach the live handles.
+    fn finish_with_unresolved(
+        &mut self,
+        mut response: PromptResponse,
+    ) -> Result<AgentRunStep, PromptError> {
+        response.unresolved_tasks = std::mem::take(&mut self.deferred_tasks)
+            .into_iter()
+            .map(|task| task.descriptor)
+            .collect();
+        self.state = RunState::Done(Box::new(response.clone()));
+        Ok(AgentRunStep::Done(response))
     }
 
     /// Scan forward for the next invalid tool call; finish the turn when the
@@ -2508,5 +3172,545 @@ mod tests {
         );
         let response = expect_done(&mut resumed);
         assert_eq!(response.output, "done");
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+    use crate::message::{ImageMediaType, Text, ToolFunction, ToolResultContent};
+    use serde_json::json;
+
+    fn tool_names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn text_turn(text: &str) -> ModelTurn {
+        ModelTurn::new(
+            None,
+            OneOrMany::one(AssistantContent::text(text)),
+            Usage::new(),
+            tool_names(&["add", "work"]),
+            tool_names(&["add", "work"]),
+        )
+    }
+
+    fn tool_call(id: &str, name: &str) -> AssistantContent {
+        AssistantContent::ToolCall(ToolCall::new(
+            id.to_string(),
+            ToolFunction::new(name.to_string(), json!({"x": 1})),
+        ))
+    }
+
+    fn calls_turn(items: Vec<AssistantContent>) -> ModelTurn {
+        ModelTurn::new(
+            None,
+            OneOrMany::many(items).expect("at least one item"),
+            Usage::new(),
+            tool_names(&["add", "work"]),
+            tool_names(&["add", "work"]),
+        )
+    }
+
+    fn tool_result(id: &str, output: &str) -> UserContent {
+        UserContent::tool_result(
+            id.to_string(),
+            OneOrMany::one(ToolResultContent::text(output)),
+        )
+    }
+
+    fn task(
+        call_id: &str,
+        task_id: &str,
+        policy: TaskCompletionPolicy,
+        turn: usize,
+    ) -> PendingTask {
+        let tool_call = ToolCall::new(
+            call_id.to_string(),
+            ToolFunction::new("work".to_string(), json!({"x": 1})),
+        );
+        PendingTask::new(
+            format!("internal-{call_id}"),
+            tool_call,
+            ToolTaskDescriptor::new(ToolTaskDescriptor::BACKEND_MCP, task_id, "work"),
+            policy,
+            turn,
+        )
+    }
+
+    fn expect_call_model(run: &mut AgentRun) -> (Message, usize) {
+        match run.next_step().expect("next_step should succeed") {
+            AgentRunStep::CallModel { prompt, turn, .. } => (prompt, turn),
+            step => panic!("expected CallModel, got {step:?}"),
+        }
+    }
+
+    fn expect_call_tools(run: &mut AgentRun) -> Vec<PendingToolCall> {
+        match run.next_step().expect("next_step should succeed") {
+            AgentRunStep::CallTools { calls } => calls,
+            step => panic!("expected CallTools, got {step:?}"),
+        }
+    }
+
+    fn expect_await_tasks(run: &mut AgentRun) -> Vec<PendingTask> {
+        match run.next_step().expect("next_step should succeed") {
+            AgentRunStep::AwaitTasks { pending } => pending,
+            step => panic!("expected AwaitTasks, got {step:?}"),
+        }
+    }
+
+    fn expect_done(run: &mut AgentRun) -> PromptResponse {
+        match run.next_step().expect("next_step should succeed") {
+            AgentRunStep::Done(response) => response,
+            step => panic!("expected Done, got {step:?}"),
+        }
+    }
+
+    fn feed_turn(run: &mut AgentRun, turn: ModelTurn) {
+        match run.model_response(turn).expect("turn accepted") {
+            ModelTurnOutcome::Continue { .. } => {}
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// Drive a fresh run to `ExecutingTools` with the given assistant items.
+    fn run_to_tools(items: Vec<AssistantContent>, max_turns: usize) -> AgentRun {
+        let mut run = AgentRun::new("prompt").max_turns(max_turns);
+        let _ = expect_call_model(&mut run);
+        feed_turn(&mut run, calls_turn(items));
+        let _ = expect_call_tools(&mut run);
+        run
+    }
+
+    fn user_parts(message: &Message) -> Vec<&UserContent> {
+        match message {
+            Message::User { content } => content.iter().collect(),
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_turn_deferral_holds_batch_until_all_tasks_resolve() {
+        let mut run = run_to_tools(
+            vec![tool_call("call_1", "add"), tool_call("call_2", "work")],
+            3,
+        );
+        let join = task("call_2", "task-1", TaskCompletionPolicy::JoinTurn, 1);
+        run.tool_batch_results(vec![
+            ToolCallResolution::Completed(tool_result("call_1", "42")),
+            ToolCallResolution::Deferred(Box::new(join)),
+        ])
+        .expect("batch accepted");
+
+        // The batch holds open; the step is idempotent like ExecutingTools.
+        let pending = expect_await_tasks(&mut run);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].internal_call_id, "internal-call_2");
+        let again = expect_await_tasks(&mut run);
+        assert_eq!(again.len(), 1);
+
+        run.task_resolved(
+            "internal-call_2",
+            TaskResolution::new("task output", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+
+        // The commit preserves the batch's slot order: inline result first.
+        let (prompt, turn) = expect_call_model(&mut run);
+        assert_eq!(turn, 2);
+        let parts = user_parts(&prompt);
+        assert_eq!(parts.len(), 2);
+        let UserContent::ToolResult(first) = parts[0] else {
+            panic!("first part must be the inline tool result");
+        };
+        assert_eq!(first.id, "call_1");
+        let UserContent::ToolResult(second) = parts[1] else {
+            panic!("second part must be the resolved task result");
+        };
+        assert_eq!(second.id, "call_2");
+    }
+
+    #[test]
+    fn continue_turns_deferral_fills_slot_and_run_continues() {
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        // Backend-provided immediate response fills the slot verbatim.
+        let deferred = task("call_1", "task-1", TaskCompletionPolicy::ContinueTurns, 1)
+            .with_immediate_response("crunching in the background");
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(deferred))])
+            .expect("batch accepted");
+
+        assert_eq!(run.pending_tasks().len(), 1);
+        let (prompt, turn) = expect_call_model(&mut run);
+        assert_eq!(turn, 2, "the run continues immediately");
+        let parts = user_parts(&prompt);
+        let UserContent::ToolResult(result) = parts[0] else {
+            panic!("slot must be a tool result");
+        };
+        assert_eq!(result.id, "call_1");
+        let ToolResultContent::Text(Text { text, .. }) = result.content.first() else {
+            panic!("immediate response must be text");
+        };
+        assert_eq!(text, "crunching in the background");
+
+        // Without an immediate response the synthesized launch notice fills it.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        let deferred = task("call_1", "task-2", TaskCompletionPolicy::ContinueTurns, 1);
+        let expected_notice = task_launch_notice_text(&deferred);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(deferred))])
+            .expect("batch accepted");
+        let (prompt, _) = expect_call_model(&mut run);
+        let parts = user_parts(&prompt);
+        let UserContent::ToolResult(result) = parts[0] else {
+            panic!("slot must be a tool result");
+        };
+        let ToolResultContent::Text(Text { text, .. }) = result.content.first() else {
+            panic!("launch notice must be text");
+        };
+        assert_eq!(*text, expected_notice);
+        assert!(text.contains("task-2"), "notice names the task id");
+    }
+
+    #[test]
+    fn continue_turns_resolution_injects_notice_into_next_call_model() {
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        let deferred = task("call_1", "task-1", TaskCompletionPolicy::ContinueTurns, 1);
+        let resolution = TaskResolution::new("the answer is 42", ToolTaskStatus::Completed);
+        let expected_notice = task_result_notice_content(&deferred, &resolution);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(deferred))])
+            .expect("batch accepted");
+
+        // The task resolves before the next model call is assembled.
+        run.task_resolved("internal-call_1", resolution)
+            .expect("resolution accepted");
+        assert!(run.pending_tasks().is_empty());
+
+        let (prompt, _) = expect_call_model(&mut run);
+        let parts = user_parts(&prompt);
+        assert_eq!(parts.len(), 3, "tool_result slot + task header + result");
+        assert!(
+            matches!(parts[0], UserContent::ToolResult(_)),
+            "tool results must stay first"
+        );
+        assert_eq!(parts[1], &expected_notice[0]);
+        assert_eq!(parts[2], &expected_notice[1]);
+        let UserContent::Text(Text { text, .. }) = parts[1] else {
+            panic!("the task header must be appended as a text part");
+        };
+        assert!(text.starts_with("Background task update:"));
+        let UserContent::Text(Text { text, .. }) = parts[2] else {
+            panic!("the text result must remain text");
+        };
+        assert_eq!(text, "the answer is 42");
+    }
+
+    #[test]
+    fn awaiting_tasks_serializes_and_resumes_idempotently() {
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_await_tasks(&mut run);
+
+        let serialized = serde_json::to_string(&run).expect("run serializes mid-await");
+        let mut resumed: AgentRun =
+            serde_json::from_str(&serialized).expect("run deserializes mid-await");
+
+        // The resumed machine re-obtains the pending set from its own state.
+        let pending = expect_await_tasks(&mut resumed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].descriptor.task_id, "task-1");
+
+        resumed
+            .task_resolved(
+                "internal-call_1",
+                TaskResolution::new("resumed output", ToolTaskStatus::Completed),
+            )
+            .expect("resolution accepted after resume");
+        let (prompt, _) = expect_call_model(&mut resumed);
+        let parts = user_parts(&prompt);
+        assert!(matches!(parts[0], UserContent::ToolResult(_)));
+    }
+
+    #[test]
+    fn waiting_on_tasks_consumes_no_turns() {
+        // The two-call budget covers the tool turn and the post-task answer;
+        // holding a join batch open must not consume either call.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 2);
+        let turn_before = run.turn();
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_await_tasks(&mut run);
+        let _ = expect_await_tasks(&mut run);
+        run.task_status("internal-call_1", ToolTaskStatus::Working)
+            .expect("status accepted");
+        assert_eq!(run.turn(), turn_before, "waiting consumes no turns");
+
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("done", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+        let (_, turn) = expect_call_model(&mut run);
+        assert_eq!(turn, 2, "the post-batch model call is the second turn");
+        feed_turn(&mut run, text_turn("final answer"));
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer");
+    }
+
+    #[test]
+    fn done_with_pending_tasks_wait_and_resume_runs_one_extra_turn() {
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::ContinueTurns,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_call_model(&mut run);
+        // The model answers while the task is still running: default policy
+        // drains instead of finishing.
+        feed_turn(&mut run, text_turn("premature final answer"));
+        let pending = expect_await_tasks(&mut run);
+        assert_eq!(pending.len(), 1);
+
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("late result", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+
+        // One extra model turn carries the drained result as the prompt.
+        let (prompt, _) = expect_call_model(&mut run);
+        let parts = user_parts(&prompt);
+        assert_eq!(parts.len(), 2);
+        let UserContent::Text(Text { text, .. }) = parts[1] else {
+            panic!("the drained result must follow its task header");
+        };
+        assert_eq!(text, "late result");
+
+        feed_turn(&mut run, text_turn("final answer incorporating the task"));
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer incorporating the task");
+        assert!(response.unresolved_tasks.is_empty());
+    }
+
+    #[test]
+    fn done_with_pending_tasks_detach_finishes_with_unresolved() {
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3)
+            .with_task_drain(TaskDrainPolicy::Detach);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::ContinueTurns,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_call_model(&mut run);
+        feed_turn(&mut run, text_turn("final answer"));
+
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer");
+        assert_eq!(response.unresolved_tasks.len(), 1);
+        assert_eq!(response.unresolved_tasks[0].task_id, "task-1");
+    }
+
+    #[test]
+    fn done_with_exhausted_budget_degrades_to_finish_with_unresolved() {
+        // The tool turn plus the final answer exhaust the exact two-call
+        // budget, so the default WaitAndResume drain degrades instead of
+        // attempting a third model call.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 2);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::ContinueTurns,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_call_model(&mut run);
+        feed_turn(&mut run, text_turn("final answer"));
+
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer");
+        assert_eq!(response.unresolved_tasks.len(), 1);
+    }
+
+    #[test]
+    fn task_feedback_protocol_violations_preserve_state() {
+        // tool_batch_results with a deferral outside ExecutingTools.
+        let mut run = AgentRun::new("prompt");
+        let err = run
+            .tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+                "call_1",
+                "task-1",
+                TaskCompletionPolicy::JoinTurn,
+                1,
+            )))])
+            .expect_err("must reject outside CallTools");
+        assert!(err.to_string().contains("tool_batch_results"));
+        // The run is still drivable.
+        let _ = expect_call_model(&mut run);
+
+        // Unknown and duplicate task resolutions.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        )))])
+        .expect("batch accepted");
+        run.task_resolved(
+            "internal-unknown",
+            TaskResolution::new("x", ToolTaskStatus::Completed),
+        )
+        .expect_err("unknown id must be rejected");
+        run.task_status("internal-unknown", ToolTaskStatus::Working)
+            .expect_err("unknown id must be rejected");
+        let err = run
+            .task_resolved(
+                "internal-call_1",
+                TaskResolution::new("not done", ToolTaskStatus::Working),
+            )
+            .expect_err("a non-terminal resolution must be rejected");
+        assert!(err.to_string().contains("requires a terminal status"));
+        // Still awaiting after the rejected feedback.
+        let pending = expect_await_tasks(&mut run);
+        assert_eq!(pending.len(), 1);
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("done", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("again", ToolTaskStatus::Completed),
+        )
+        .expect_err("duplicate resolution must be rejected");
+
+        // Mismatched batch answers.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_9",
+            "task-9",
+            TaskCompletionPolicy::JoinTurn,
+            1,
+        )))])
+        .expect_err("a deferral for an unknown call id must be rejected");
+        let _ = expect_call_tools(&mut run);
+    }
+
+    #[test]
+    fn pre_task_serialized_run_still_deserializes() {
+        // A run serialized before the task fields existed must round-trip:
+        // strip the new keys from a current serialization to emulate it.
+        let run = AgentRun::new("prompt").max_turns(2);
+        let mut value = serde_json::to_value(&run).expect("run serializes");
+        let object = value.as_object_mut().expect("run serializes as an object");
+        object.remove("deferred_tasks");
+        object.remove("pending_task_notices");
+        object.remove("task_drain");
+        let mut resumed: AgentRun =
+            serde_json::from_value(value).expect("pre-task payload deserializes");
+        let _ = expect_call_model(&mut resumed);
+    }
+
+    #[test]
+    fn resolution_during_the_final_turn_still_gets_delivered() {
+        // The live-run regression: a ContinueTurns task resolves while the
+        // model is producing its final answer (the driver applies the
+        // resolution at the loop top, clearing `deferred_tasks` and queueing
+        // the notice). Finalizing must not drop the queued result — the run
+        // grants the drain-style extra turn instead.
+        let mut run = run_to_tools(vec![tool_call("call_1", "work")], 3);
+        run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(task(
+            "call_1",
+            "task-1",
+            TaskCompletionPolicy::ContinueTurns,
+            1,
+        )))])
+        .expect("batch accepted");
+        let _ = expect_call_model(&mut run);
+        // The task resolves BEFORE the model's final turn is fed back.
+        run.task_resolved(
+            "internal-call_1",
+            TaskResolution::new("late but delivered", ToolTaskStatus::Completed),
+        )
+        .expect("resolution accepted");
+        feed_turn(&mut run, text_turn("premature final answer"));
+
+        // Not Done: the undelivered notice buys the extra turn.
+        let (prompt, _) = expect_call_model(&mut run);
+        let parts = user_parts(&prompt);
+        let UserContent::Text(Text { text, .. }) = parts[1] else {
+            panic!("the queued result must follow its task header");
+        };
+        assert_eq!(text, "late but delivered");
+
+        feed_turn(&mut run, text_turn("final answer with the result"));
+        let response = expect_done(&mut run);
+        assert_eq!(response.output, "final answer with the result");
+    }
+
+    #[test]
+    fn notice_content_is_pinned_and_preserves_rich_output() {
+        let pending = task("call_1", "task-9", TaskCompletionPolicy::ContinueTurns, 2);
+        assert_eq!(
+            task_launch_notice_text(&pending),
+            "Task `task-9` for tool `work` has been started in the background; its result will \
+             be delivered in a later message when ready. Do not call the tool again for the same \
+             request.",
+        );
+        let completed = task_result_notice_content(
+            &pending,
+            &TaskResolution::new("42", ToolTaskStatus::Completed),
+        );
+        assert_eq!(
+            completed,
+            vec![
+                UserContent::text(
+                    "Background task update: tool `work` (task `task-9`, launched on turn 2 via \
+                     tool call `call_1`) completed. The result follows."
+                ),
+                UserContent::text("42"),
+            ]
+        );
+
+        let cancelled = task_result_notice_content(
+            &pending,
+            &TaskResolution::new("deadline exceeded", ToolTaskStatus::Cancelled),
+        );
+        assert_eq!(
+            cancelled[0],
+            UserContent::text(
+                "Background task update: tool `work` (task `task-9`, launched on turn 2 via tool \
+                 call `call_1`) was cancelled. The result follows."
+            )
+        );
+        assert_eq!(cancelled[1], UserContent::text("deadline exceeded"));
+
+        let rich = ToolOutput::content(
+            OneOrMany::many([
+                ToolResultContent::image_base64("iVBORw0KGgo=", Some(ImageMediaType::PNG), None),
+                ToolResultContent::json(json!({ "answer": 42 })),
+            ])
+            .expect("two rich content blocks"),
+        );
+        let rich_notice = task_result_notice_content(
+            &pending,
+            &TaskResolution::new(rich, ToolTaskStatus::Completed),
+        );
+        assert!(matches!(rich_notice[1], UserContent::Image(_)));
+        assert_eq!(rich_notice[2], UserContent::text(r#"{"answer":42}"#));
     }
 }

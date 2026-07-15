@@ -12,8 +12,8 @@ use crate::tool::ErasedTool;
 use crate::{
     completion::{CompletionError, ToolDefinition},
     tool::{
-        DynamicTool, RegisteredTool, Tool, ToolContext, ToolDispatch, ToolResult, ToolSet,
-        dispatch_tool,
+        DispatchedTool, DynamicTool, RegisteredTool, Tool, ToolContext, ToolDispatch, ToolResult,
+        ToolSet, dispatch_tool,
     },
     vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn, request::Filter},
 };
@@ -56,7 +56,7 @@ impl ToolRegistrySnapshot {
         tool_name: &str,
         args: &str,
         context: &ToolContext,
-    ) -> ToolDispatch {
+    ) -> DispatchedTool {
         let tool = self.tools.get(tool_name).cloned();
         dispatch_tool(tool_name, args.to_string(), tool, context).await
     }
@@ -399,6 +399,11 @@ impl ToolServerHandle {
 
     /// Look up and execute a tool through the canonical structured path.
     ///
+    /// A deferred dispatch is awaited transparently, preserving the historical
+    /// one-result contract. This convenience path has no run-level task
+    /// deadline or cancellation policy; use an agent runner when those controls
+    /// are required.
+    ///
     /// The implementation handle is cloned under a brief read lock, so a long
     /// execution never blocks registration changes. The tool receives one
     /// snapshot of the supplied inbound values. Its result metadata is
@@ -411,10 +416,18 @@ impl ToolServerHandle {
         context: &mut ToolContext,
     ) -> ToolResult {
         context.clear_dispatch_result();
-        let ToolDispatch {
-            result,
-            context: dispatch_context,
+        let DispatchedTool {
+            outcome,
+            context: mut dispatch_context,
         } = self.dispatch(tool_name, args, context).await;
+        let result = match outcome {
+            ToolDispatch::Completed(result) => result,
+            ToolDispatch::Deferred(handle) => {
+                let (result, task_context) = handle.wait().await.into_parts();
+                dispatch_context.accept_dispatch_result(task_context);
+                result
+            }
+        };
         context.accept_dispatch_result(dispatch_context);
         result
     }
@@ -425,7 +438,7 @@ impl ToolServerHandle {
         tool_name: &str,
         args: &str,
         context: &ToolContext,
-    ) -> ToolDispatch {
+    ) -> DispatchedTool {
         #[cfg(feature = "rmcp")]
         let tool = {
             let mut state = self.0.write().await;
@@ -732,19 +745,28 @@ mod tests {
         let dispatch = snapshot
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(dispatch.result.output().render(), "first implementation");
+        assert_eq!(
+            dispatch.outcome.resolve().await.result().output().render(),
+            "first implementation"
+        );
 
         let live = handle
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(live.result.output().render(), "second implementation");
+        assert_eq!(
+            live.outcome.resolve().await.result().output().render(),
+            "second implementation"
+        );
 
         let next_snapshot = handle.snapshot_tool_defs(None).await.unwrap();
         assert_eq!(next_snapshot.definitions()[0].description, "second schema");
         let dispatch = next_snapshot
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(dispatch.result.output().render(), "second implementation");
+        assert_eq!(
+            dispatch.outcome.resolve().await.result().output().render(),
+            "second implementation"
+        );
     }
 
     #[tokio::test]

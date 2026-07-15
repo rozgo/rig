@@ -207,6 +207,9 @@ async fn streamed_hand_driven_multi_turn_run_completes() {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => break response,
                 }
             };
@@ -349,6 +352,9 @@ async fn streamed_repair_continues_the_same_stream() {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => break response,
                 }
             };
@@ -445,6 +451,9 @@ async fn streamed_skip_abandons_the_turn_and_recovers() {
                     AgentRunStep::CallTools { calls } => {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
+                    }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
                     }
                     AgentRunStep::Done(response) => break response,
                 }

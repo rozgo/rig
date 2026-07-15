@@ -169,6 +169,9 @@ async fn main() -> Result<()> {
                 run_resumed.tool_results(results)?;
                 run = run_resumed;
             }
+            AgentRunStep::AwaitTasks { .. } => {
+                anyhow::bail!("this example never defers tool calls");
+            }
             AgentRunStep::Done(response) => {
                 println!("✓ {}", response.output);
                 println!(

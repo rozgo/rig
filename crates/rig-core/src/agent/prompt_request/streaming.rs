@@ -3,27 +3,47 @@ use crate::{
     agent::completion::{PreparedCompletionRequest, build_prepared_completion_request},
     agent::hook::{
         AgentHook, HookContext, HookStack, InvalidToolCallAction, ModelTurnFinished, StepEventKind,
-        StreamResponseFinish, TextDelta, ToolCallDelta,
+        StreamResponseFinish, TextDelta, ToolCallDelta, ToolTaskResultEvent, ToolTaskStatusAction,
+        ToolTaskStatusEvent,
     },
-    agent::prompt_request::{assistant_text_from_choice, is_empty_assistant_turn},
+    agent::prompt_request::{
+        assistant_text_from_choice, is_empty_assistant_turn, tool_result_message,
+        tool_result_output,
+    },
     agent::run::{
-        AgentRun, AgentRunStep, PendingToolCall,
+        AgentRun, AgentRunStep, PendingTask, PendingToolCall, TaskCompletionPolicy,
+        TaskDrainPolicy, TaskResolution, ToolCallResolution,
         streamed::{StreamedResolution, StreamedTurnAssembler, StreamedTurnEvent},
+        task_launch_notice_text,
     },
     agent::runner::{
-        AgentRunner, CompletionCallOutcome, ToolExecution, acquire_agent_span, append_run_messages,
-        build_chat_span, new_execute_tool_span, observe_action, resolve_completion_call,
-        run_single_tool,
+        AgentRunner, CompletionCallOutcome, DeferredToolCall, SingleToolResolution, ToolExecution,
+        ToolResultDecision, acquire_agent_span, append_run_messages, build_chat_span,
+        new_execute_tool_span, observe_action, record_tool_result, resolve_completion_call,
+        run_single_tool, task_result_decision,
+    },
+    agent::task_wait::{
+        TaskDriveConfig, TaskDriveEvent, TaskResolvedEvent, TaskTable, cancel_task_handle,
     },
     completion::GetTokenUsage,
-    message::{AssistantContent, UserContent},
+    json_utils,
+    message::{AssistantContent, ToolCall, ToolResult, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, ToolCallDeltaContent},
-    tool::{ToolContext, server::ToolRegistrySnapshot},
+    tool::{
+        ToolContext, ToolExecutionError, ToolTaskHandle, ToolTaskResult, ToolTaskStatus,
+        server::ToolRegistrySnapshot,
+    },
     wasm_compat::{WasmBoxedFuture, WasmCompatSend},
 };
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future::ready,
+    mem,
+    pin::Pin,
+    sync::{Arc, atomic::Ordering},
+};
 use tracing_futures::Instrument;
 
 use super::{CompletionCall, PromptResponse, forward_prompt_setters};
@@ -81,6 +101,44 @@ pub enum MultiTurnStreamItem<R> {
         /// ([`StreamedAssistantContent::ToolCall::internal_call_id`]) and the
         /// resulting [`StreamedUserContent::ToolResult`].
         internal_call_id: String,
+    },
+    /// A tool call accepted by its backend as a deferred task.
+    ToolTaskStarted {
+        /// Effective tool call after hook rewrites.
+        tool_call: ToolCall,
+        /// Rig correlation id.
+        internal_call_id: String,
+        /// Backend-assigned task id.
+        task_id: String,
+        /// Completion policy selected for this call.
+        policy: TaskCompletionPolicy,
+        /// Backend-provided model-facing launch response, when present.
+        immediate_response: Option<String>,
+    },
+    /// A newly observed non-terminal task status.
+    ToolTaskStatus {
+        /// Rig correlation id.
+        internal_call_id: String,
+        /// Backend-assigned task id.
+        task_id: String,
+        /// Newly observed status.
+        status: ToolTaskStatus,
+    },
+    /// The terminal result of a deferred task.
+    ToolTaskResult {
+        /// Rig correlation id.
+        internal_call_id: String,
+        /// Backend-assigned task id.
+        task_id: String,
+        /// Canonical task output shaped as a tool result for stream consumers.
+        /// `JoinTurn` delivers it directly; `ContinueTurns` injects its content
+        /// into a labeled later-turn update because the original tool-result
+        /// slot already contains the launch notice.
+        tool_result: ToolResult,
+        /// Terminal task status.
+        status: ToolTaskStatus,
+        /// Completion policy selected for this call.
+        policy: TaskCompletionPolicy,
     },
     /// A streamed user content item: the **result** of an executed (or
     /// hook-skipped) tool call. The tool batch commits and surfaces atomically at
@@ -425,6 +483,7 @@ where
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
         tool_snapshot: Arc<ToolRegistrySnapshot>,
+        tasks: &'a mut TaskTable,
     ) -> DriveStream<'a, Self::Raw>;
 
     /// Record run-level telemetry onto the agent span at `Done`. Gated on
@@ -472,19 +531,127 @@ where
     S: TurnSource<M>,
 {
     async_stream::stream! {
-        // Run-scoped hook context: minted once, shared by every hook event on
-        // both surfaces. `is_streaming` records which surface is driving; the
-        // per-turn index is advanced on each `CallModel` step below.
         let hook_ctx = HookContext::new(is_streaming, runner.agent_name.clone());
-        // Set only after a model turn commits successfully and consumed by its
-        // immediately following CallTools step. This keeps the sans-IO run state
-        // serializable while pinning execution to the definitions sent that turn.
         let mut pending_tool_snapshot: Option<Arc<ToolRegistrySnapshot>> = None;
+        let mut tasks = TaskTable::new();
+        let mut task_feedback: Vec<TaskFeedback> = Vec::new();
+        let mut deferred_stop: Option<String> = None;
 
         'outer: loop {
+            if let Some(reason) = deferred_stop.take() {
+                tasks.graceful_cancel("the run was stopped by a hook").await;
+                yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
+                break 'outer;
+            }
+
+            for feedback in task_feedback.drain(..) {
+                match feedback {
+                    TaskFeedback::Status { internal_call_id, status } => {
+                        if let Err(error) = run.task_status(&internal_call_id, status) {
+                            tracing::debug!(%error, "stale task status observation dropped");
+                        }
+                    }
+                    TaskFeedback::Resolved { internal_call_id, resolution } => {
+                        if let Err(error) = run.task_resolved(&internal_call_id, resolution) {
+                            tasks.graceful_cancel("the run failed").await;
+                            yield Err(Box::new(error).into());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            let unresumed: Vec<PendingTask> = run
+                .pending_tasks()
+                .into_iter()
+                .filter(|task| !tasks.is_live(&task.internal_call_id))
+                .cloned()
+                .collect();
+            for pending in unresumed {
+                let mut handle = None;
+                let mut resume_error = None;
+                for resumer in &runner.task_resumers {
+                    match resumer.resume(&pending.descriptor).await {
+                        Ok(Some(resumed)) => {
+                            handle = Some(resumed);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                task_id = %pending.descriptor.task_id,
+                                %error,
+                                "a task resumer failed for a persisted task"
+                            );
+                            resume_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(handle) = handle {
+                    tasks.launch(
+                        handle,
+                        &pending,
+                        TaskDriveConfig {
+                            poll_fallback: runner.task_poll_interval,
+                            deadline: runner.task_deadline,
+                        },
+                        &tracing::Span::current(),
+                        runner.tool_context.for_dispatch(),
+                    );
+                    continue;
+                }
+
+                let error = resume_error.unwrap_or_else(|| {
+                    ToolExecutionError::not_found(format!(
+                        "deferred task `{}` for tool `{}` could not be resumed: no registered \
+                         resumer accepted its descriptor",
+                        pending.descriptor.task_id, pending.tool_call.function.name,
+                    ))
+                });
+                let event = TaskDriveEvent::Resolved(Box::new(TaskResolvedEvent {
+                    internal_call_id: pending.internal_call_id.clone(),
+                    tool_name: pending.tool_call.function.name.clone(),
+                    tool_use_id: pending.tool_call.id.clone(),
+                    call_id: pending.tool_call.call_id.clone(),
+                    task_id: pending.descriptor.task_id.clone(),
+                    args: json_utils::serialize_json_value(&pending.tool_call.function.arguments),
+                    policy: pending.policy,
+                    result: ToolTaskResult::failed(error),
+                }));
+                let (items, feedback, stop) =
+                    process_task_event::<M, S::Raw>(&runner, &hook_ctx, &mut tasks, event).await;
+                for item in items {
+                    yield Ok(DriveItem::Item(item));
+                }
+                if let Some(feedback) = feedback {
+                    match feedback {
+                        TaskFeedback::Status { internal_call_id, status } => {
+                            if let Err(error) = run.task_status(&internal_call_id, status) {
+                                tracing::debug!(%error, "stale task status observation dropped");
+                            }
+                        }
+                        TaskFeedback::Resolved { internal_call_id, resolution } => {
+                            if let Err(error) = run.task_resolved(&internal_call_id, resolution) {
+                                tasks.graceful_cancel("the run failed").await;
+                                yield Err(Box::new(error).into());
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if let Some(reason) = stop {
+                    tasks.graceful_cancel("the run was stopped by a hook").await;
+                    yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
+                    break 'outer;
+                }
+            }
+
             let step = match run.next_step() {
                 Ok(step) => step,
                 Err(err) => {
+                    tasks.graceful_cancel("the run failed").await;
                     yield Err(Box::new(err).into());
                     break 'outer;
                 }
@@ -501,6 +668,7 @@ where
                     let request_patch =
                         match resolve_completion_call(&runner.hooks, &hook_ctx, &prompt, &history, turn).await {
                             CompletionCallOutcome::Terminate(reason) => {
+                                tasks.graceful_cancel("the run was stopped by a hook").await;
                                 yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
                                 break 'outer;
                             }
@@ -543,6 +711,7 @@ where
                     {
                         Ok(prepared) => prepared,
                         Err(err) => {
+                            tasks.graceful_cancel("the run failed").await;
                             yield Err(err.into());
                             break 'outer;
                         }
@@ -565,24 +734,68 @@ where
                         prompt,
                     );
                     let mut errored = false;
-                    while let Some(item) = turn_stream.next().await {
-                        match item {
-                            Ok(item) => yield Ok(DriveItem::Item(item)),
-                            Err(err) => {
+                    loop {
+                        enum StepOrTask<I> {
+                            Step(Option<I>),
+                            Task(Box<TaskDriveEvent>),
+                        }
+                        let next = if tasks.is_empty() {
+                            StepOrTask::Step(turn_stream.next().await)
+                        } else {
+                            use futures::future::{Either, select};
+                            let step = turn_stream.next();
+                            futures::pin_mut!(step);
+                            let task = tasks.next_event();
+                            futures::pin_mut!(task);
+                            match select(step, task).await {
+                                Either::Left((item, _)) => StepOrTask::Step(item),
+                                Either::Right((Some(event), _)) => {
+                                    StepOrTask::Task(Box::new(event))
+                                }
+                                Either::Right((None, _)) => continue,
+                            }
+                        };
+                        match next {
+                            StepOrTask::Step(None) => break,
+                            StepOrTask::Step(Some(Ok(item))) => {
+                                yield Ok(DriveItem::Item(item));
+                            }
+                            StepOrTask::Step(Some(Err(error))) => {
                                 errored = true;
-                                yield Err(err);
+                                yield Err(error);
                                 break;
+                            }
+                            StepOrTask::Task(event) => {
+                                let (items, feedback, stop) = process_task_event::<M, S::Raw>(
+                                    &runner,
+                                    &hook_ctx,
+                                    &mut tasks,
+                                    *event,
+                                )
+                                .await;
+                                for item in items {
+                                    yield Ok(DriveItem::Item(item));
+                                }
+                                if let Some(feedback) = feedback {
+                                    task_feedback.push(feedback);
+                                }
+                                if let Some(reason) = stop {
+                                    deferred_stop = Some(reason);
+                                    break;
+                                }
                             }
                         }
                     }
                     drop(turn_stream);
                     if errored {
+                        tasks.graceful_cancel("the run failed").await;
                         break 'outer;
                     }
                     pending_tool_snapshot = Some(turn_tool_snapshot);
                 }
                 AgentRunStep::CallTools { calls } => {
                     let Some(tool_snapshot) = pending_tool_snapshot.take() else {
+                        tasks.graceful_cancel("the run failed").await;
                         yield Err(StreamingError::Completion(CompletionError::ResponseError(
                             "agent requested tool execution without a prepared registry snapshot"
                                 .to_string(),
@@ -595,6 +808,7 @@ where
                         &mut run,
                         calls,
                         tool_snapshot,
+                        &mut tasks,
                     );
                     let mut errored = false;
                     while let Some(item) = tool_stream.next().await {
@@ -609,10 +823,85 @@ where
                     }
                     drop(tool_stream);
                     if errored {
+                        tasks.graceful_cancel("the run failed").await;
+                        break 'outer;
+                    }
+                }
+                AgentRunStep::AwaitTasks { pending } => {
+                    let mut awaiting: BTreeSet<String> = pending
+                        .iter()
+                        .map(|task| task.internal_call_id.clone())
+                        .collect();
+                    let mut errored = false;
+                    while !awaiting.is_empty() {
+                        let Some(event) = tasks.next_event().await else {
+                            for internal_call_id in mem::take(&mut awaiting) {
+                                if let Err(error) = run.task_resolved(
+                                    &internal_call_id,
+                                    TaskResolution::new(
+                                        format!(
+                                            "deferred task for call `{internal_call_id}` has no \
+                                             live driver and could not be awaited"
+                                        ),
+                                        ToolTaskStatus::Failed,
+                                    ),
+                                ) {
+                                    yield Err(Box::new(error).into());
+                                    errored = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        };
+                        let (items, feedback, stop) = process_task_event::<M, S::Raw>(
+                            &runner,
+                            &hook_ctx,
+                            &mut tasks,
+                            event,
+                        )
+                        .await;
+                        for item in items {
+                            yield Ok(DriveItem::Item(item));
+                        }
+                        match feedback {
+                            Some(TaskFeedback::Status { internal_call_id, status }) => {
+                                if let Err(error) = run.task_status(&internal_call_id, status) {
+                                    tracing::debug!(%error, "stale task status observation dropped");
+                                }
+                            }
+                            Some(TaskFeedback::Resolved { internal_call_id, resolution }) => {
+                                awaiting.remove(&internal_call_id);
+                                if let Err(error) = run.task_resolved(&internal_call_id, resolution) {
+                                    yield Err(Box::new(error).into());
+                                    errored = true;
+                                    break;
+                                }
+                            }
+                            None => {}
+                        }
+                        if let Some(reason) = stop {
+                            tasks.graceful_cancel("the run was stopped by a hook").await;
+                            yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
+                            errored = true;
+                            break;
+                        }
+                    }
+                    if errored {
+                        tasks.graceful_cancel("the run failed").await;
                         break 'outer;
                     }
                 }
                 AgentRunStep::Done(response) => {
+                    if !tasks.is_empty() {
+                        match runner.task_drain {
+                            TaskDrainPolicy::Detach => tasks.detach(),
+                            TaskDrainPolicy::WaitAndResume | TaskDrainPolicy::CancelAndFinish => {
+                                tasks
+                                    .graceful_cancel("the run finished before the task completed")
+                                    .await;
+                            }
+                        }
+                    }
                     // Run-completion marker, unifying the blocking and streaming
                     // drivers' run-finished logs into one shared event.
                     tracing::info!(
@@ -640,6 +929,149 @@ where
     }
 }
 
+/// Machine feedback produced after processing one task event.
+pub(crate) enum TaskFeedback {
+    Status {
+        internal_call_id: String,
+        status: ToolTaskStatus,
+    },
+    Resolved {
+        internal_call_id: String,
+        resolution: TaskResolution,
+    },
+}
+
+async fn process_task_event<M, R>(
+    runner: &AgentRunner<M>,
+    hook_ctx: &HookContext,
+    tasks: &mut TaskTable,
+    event: TaskDriveEvent,
+) -> (
+    Vec<MultiTurnStreamItem<R>>,
+    Option<TaskFeedback>,
+    Option<String>,
+)
+where
+    M: CompletionModel,
+{
+    match event {
+        TaskDriveEvent::Status {
+            internal_call_id,
+            tool_name,
+            call_id,
+            task_id,
+            status,
+        } => {
+            let mut stop = None;
+            if runner.hooks.observes(StepEventKind::ToolTaskStatus) {
+                match runner
+                    .hooks
+                    .on_tool_task_status(
+                        hook_ctx,
+                        ToolTaskStatusEvent {
+                            tool_name: &tool_name,
+                            tool_call_id: call_id.as_deref(),
+                            internal_call_id: &internal_call_id,
+                            task_id: &task_id,
+                            status,
+                        },
+                    )
+                    .await
+                {
+                    ToolTaskStatusAction::Continue => {}
+                    ToolTaskStatusAction::Cancel(reason) => {
+                        tasks.cancel_one(&internal_call_id, reason);
+                    }
+                    ToolTaskStatusAction::Stop(reason) => stop = Some(reason),
+                }
+            }
+            (
+                vec![MultiTurnStreamItem::ToolTaskStatus {
+                    internal_call_id: internal_call_id.clone(),
+                    task_id,
+                    status,
+                }],
+                Some(TaskFeedback::Status {
+                    internal_call_id,
+                    status,
+                }),
+                stop,
+            )
+        }
+        TaskDriveEvent::Resolved(event) => {
+            let TaskResolvedEvent {
+                internal_call_id,
+                tool_name,
+                tool_use_id,
+                call_id,
+                task_id,
+                args,
+                policy,
+                result,
+            } = *event;
+            let status = result.status();
+            let (task_span, dispatch_context) = tasks.finish(&internal_call_id);
+            let (raw_result, result_context) = result.into_parts();
+            let mut tool_context =
+                dispatch_context.unwrap_or_else(|| runner.tool_context.for_dispatch());
+            tool_context.accept_dispatch_result(result_context);
+            let decision = task_result_decision(
+                runner
+                    .hooks
+                    .on_tool_task_result(
+                        hook_ctx,
+                        ToolTaskResultEvent {
+                            tool_name: &tool_name,
+                            tool_call_id: call_id.as_deref(),
+                            internal_call_id: &internal_call_id,
+                            task_id: &task_id,
+                            args: &args,
+                            status,
+                            policy,
+                            presentation: raw_result.output(),
+                            raw_result: &raw_result,
+                            tool_context: &tool_context,
+                        },
+                    )
+                    .await,
+            );
+            let output = match decision {
+                ToolResultDecision::Keep => raw_result.output().clone(),
+                ToolResultDecision::Replace(output) => output,
+                ToolResultDecision::Terminate(reason) => {
+                    return (Vec::new(), None, Some(reason));
+                }
+            };
+            if let Some(span) = &task_span {
+                span.record("gen_ai.tool.task.status", status.as_str());
+                record_tool_result(span, &raw_result);
+                if runner.record_telemetry_content {
+                    span.record("gen_ai.tool.call.result", output.render());
+                }
+            }
+            let item = tool_result_output(tool_use_id, call_id, output.clone());
+            let items = match item {
+                UserContent::ToolResult(tool_result) => vec![MultiTurnStreamItem::ToolTaskResult {
+                    internal_call_id: internal_call_id.clone(),
+                    task_id,
+                    tool_result,
+                    status,
+                    policy,
+                }],
+                _ => Vec::new(),
+            };
+            (
+                items,
+                Some(TaskFeedback::Resolved {
+                    internal_call_id,
+                    resolution: TaskResolution::new(output, status),
+                }),
+                None,
+            )
+        }
+    }
+}
+
 /// Execute a turn's tool calls **atomically per batch**, shared by both surfaces.
 ///
 /// The batch commits and surfaces all-or-nothing:
@@ -659,8 +1091,9 @@ where
 ///   items surfaced (in call order, only for tools whose body actually ran) and
 ///   the results committed to run history.
 ///
-/// When `forward_items` is `false` (the blocking fold) no stream items are built,
-/// but the collect/commit and fail-fast behavior is identical, so `run()` and
+/// The hook context selects whether lifecycle items are forwarded: the
+/// blocking fold builds none, while the streaming surface forwards them. The
+/// collect/commit and fail-fast behavior stays identical, so `run()` and
 /// `stream()` return the same terminal reason. `chain_tool_span` lets the
 /// blocking surface chain spans into its linear `follows_from` sequence.
 pub(crate) fn drive_tool_calls<'a, M, R, F>(
@@ -669,14 +1102,15 @@ pub(crate) fn drive_tool_calls<'a, M, R, F>(
     run: &'a mut AgentRun,
     calls: Vec<PendingToolCall>,
     tool_snapshot: Arc<ToolRegistrySnapshot>,
+    tasks: &'a mut TaskTable,
     chain_tool_span: F,
-    forward_items: bool,
 ) -> DriveStream<'a, R>
 where
     M: CompletionModel,
     R: WasmCompatSend + 'a,
     F: Fn(tracing::Span) -> tracing::Span + WasmCompatSend + 'a,
 {
+    let forward_items = hook_ctx.is_streaming();
     // Per-call working state: a stable internal_call_id and the execute span,
     // paired with the model's tool call. `span` is `Span::none()` for a
     // preresolved (invalid-recovery) call, which never executes.
@@ -698,13 +1132,21 @@ where
         Executed(Box<crate::message::ToolCall>),
         Skipped,
         Preresolved,
+        Deferred(Box<DeferredToolCall>, tracing::Span),
     }
     // A collected tool outcome, held (not surfaced or committed) until the whole
     // batch settles.
     struct CollectedToolResult {
-        content: UserContent,
+        content: Option<UserContent>,
         internal_call_id: String,
         surface: ToolSurface,
+    }
+    struct TaskLaunch {
+        handle: Box<dyn ToolTaskHandle>,
+        pending: PendingTask,
+        launch_span: tracing::Span,
+        dispatch_context: ToolContext,
+        cancel_reason: Option<String>,
     }
 
     Box::pin(async_stream::stream! {
@@ -750,7 +1192,6 @@ where
         let mut collected: Vec<Option<CollectedToolResult>> =
             (0..call_count).map(|_| None).collect();
         let mut first_error: Option<(usize, PromptError)> = None;
-
         if runner.concurrency <= 1 {
             // Sequential: run in call order, fail-fast on the first terminating
             // error so the remaining tools never start.
@@ -759,7 +1200,7 @@ where
                 if let Some(result) = preresolved_result {
                     if let Some(slot) = collected.get_mut(index) {
                         *slot = Some(CollectedToolResult {
-                            content: result,
+                            content: Some(result),
                             internal_call_id,
                             surface: ToolSurface::Preresolved,
                         });
@@ -774,19 +1215,28 @@ where
                     &internal_call_id,
                     &full_history_for_errors,
                 )
-                .instrument(span)
+                .instrument(span.clone())
                 .await;
                 match outcome {
-                    Ok(outcome) => {
+                    Ok(SingleToolResolution::Completed(outcome)) => {
                         let surface = match outcome.execution {
                             ToolExecution::Executed(effective) => ToolSurface::Executed(effective),
                             ToolExecution::Skipped => ToolSurface::Skipped,
                         };
                         if let Some(slot) = collected.get_mut(index) {
                             *slot = Some(CollectedToolResult {
-                                content: outcome.content,
+                                content: Some(outcome.content),
                                 internal_call_id,
                                 surface,
+                            });
+                        }
+                    }
+                    Ok(SingleToolResolution::Deferred(deferred)) => {
+                        if let Some(slot) = collected.get_mut(index) {
+                            *slot = Some(CollectedToolResult {
+                                content: None,
+                                internal_call_id,
+                                surface: ToolSurface::Deferred(deferred, span),
                             });
                         }
                     }
@@ -809,19 +1259,20 @@ where
                     let tool_snapshot = &tool_snapshot;
                     let full_history_for_errors = &full_history_for_errors;
                     let terminating = terminating.clone();
+                    let launch_span = span.clone();
                     async move {
                         if let Some(result) = preresolved_result {
                             return (
                                 index,
                                 Some(Ok(CollectedToolResult {
-                                    content: result,
+                                    content: Some(result),
                                     internal_call_id,
                                     surface: ToolSurface::Preresolved,
                                 })),
                             );
                         }
                         // `None` marks a dropped (never-started) sibling.
-                        if terminating.load(std::sync::atomic::Ordering::SeqCst) {
+                        if terminating.load(Ordering::SeqCst) {
                             return (index, None);
                         }
                         let outcome = run_single_tool(
@@ -833,18 +1284,25 @@ where
                             full_history_for_errors,
                         )
                         .await;
-                        let mapped = outcome.map(|o| {
-                            let surface = match o.execution {
-                                ToolExecution::Executed(effective) => {
-                                    ToolSurface::Executed(effective)
+                        let mapped = outcome.map(|resolution| match resolution {
+                            SingleToolResolution::Completed(outcome) => {
+                                let surface = match outcome.execution {
+                                    ToolExecution::Executed(effective) => {
+                                        ToolSurface::Executed(effective)
+                                    }
+                                    ToolExecution::Skipped => ToolSurface::Skipped,
+                                };
+                                CollectedToolResult {
+                                    content: Some(outcome.content),
+                                    internal_call_id,
+                                    surface,
                                 }
-                                ToolExecution::Skipped => ToolSurface::Skipped,
-                            };
-                            CollectedToolResult {
-                                content: o.content,
-                                internal_call_id,
-                                surface,
                             }
+                            SingleToolResolution::Deferred(deferred) => CollectedToolResult {
+                                content: None,
+                                internal_call_id,
+                                surface: ToolSurface::Deferred(deferred, launch_span),
+                            },
                         });
                         (index, Some(mapped))
                     }
@@ -868,7 +1326,7 @@ where
                     Err(err) => {
                         // Fail-fast: stop starting new siblings; keep draining
                         // in-flight ones so the lowest call-index terminator wins.
-                        terminating.store(true, std::sync::atomic::Ordering::SeqCst);
+                        terminating.store(true, Ordering::SeqCst);
                         if first_error.as_ref().is_none_or(|(i, _)| index < *i) {
                             first_error = Some((index, err));
                         }
@@ -880,7 +1338,49 @@ where
         // Settle. On termination: surface only the deterministic error — no
         // execution commit, no result, no history commit (all-or-nothing).
         if let Some((_, err)) = first_error {
+            for slot in collected.into_iter().flatten() {
+                if let ToolSurface::Deferred(deferred, _) = slot.surface
+                    && let Err(error) = cancel_task_handle(deferred.handle.as_ref()).await
+                {
+                    tracing::warn!(
+                        task_id = %deferred.pending.descriptor.task_id,
+                        error = %error.message(),
+                        "failed to cancel a deferred task while failing its batch"
+                    );
+                }
+            }
             yield Err(StreamingError::Prompt(Box::new(err)));
+            return;
+        }
+
+        // Validate the entire collection before moving any deferred handle
+        // into the launch set. These branches protect internal invariants; if
+        // one is ever violated, cancel every accepted backend task instead of
+        // abandoning the handles that happen to follow the bad slot.
+        let incomplete = collected.iter().any(|slot| match slot {
+            None => true,
+            Some(result) => {
+                result.content.is_none()
+                    && !matches!(&result.surface, ToolSurface::Deferred(..))
+            }
+        });
+        if incomplete {
+            for slot in collected.into_iter().flatten() {
+                if let ToolSurface::Deferred(deferred, _) = slot.surface
+                    && let Err(error) = cancel_task_handle(deferred.handle.as_ref()).await
+                {
+                    tracing::warn!(
+                        task_id = %deferred.pending.descriptor.task_id,
+                        error = %error.message(),
+                        "failed to cancel a deferred task after an incomplete tool batch"
+                    );
+                }
+            }
+            yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
+                CompletionError::ResponseError(
+                    "tool execution finished without producing every result".to_string(),
+                ),
+            ))));
             return;
         }
 
@@ -892,20 +1392,100 @@ where
         // preresolved call surfaces nothing (already surfaced during the model
         // turn) but is still committed. Every non-dropped slot is filled; a
         // dropped slot only occurs after a termination, handled above.
-        let mut committed: Vec<UserContent> = Vec::with_capacity(call_count);
+        let mut resolutions: Vec<ToolCallResolution> = Vec::with_capacity(call_count);
         let mut surface_items: Vec<MultiTurnStreamItem<R>> =
             Vec::with_capacity(call_count.saturating_mul(2));
+        let mut launches: Vec<TaskLaunch> = Vec::new();
         for slot in collected {
-            let CollectedToolResult { content, internal_call_id, surface } = match slot {
-                Some(collected_result) => collected_result,
-                None => {
-                    yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
-                        CompletionError::ResponseError(
-                            "tool execution finished without producing every result".to_string(),
-                        ),
-                    ))));
-                    return;
+            let Some(CollectedToolResult {
+                content,
+                internal_call_id,
+                surface,
+            }) = slot
+            else {
+                for launch in launches {
+                    if let Err(error) = cancel_task_handle(launch.handle.as_ref()).await {
+                        tracing::warn!(
+                            task_id = %launch.pending.descriptor.task_id,
+                            error = %error.message(),
+                            "failed to cancel a deferred task after an incomplete tool batch"
+                        );
+                    }
                 }
+                yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
+                    CompletionError::ResponseError(
+                        "tool execution finished without producing every result".to_string(),
+                    ),
+                ))));
+                return;
+            };
+            let surface = match surface {
+                ToolSurface::Deferred(deferred, launch_span) => {
+                    let DeferredToolCall {
+                        handle,
+                        pending,
+                        effective_tool_call,
+                        dispatch_context,
+                        cancel_reason,
+                    } = *deferred;
+                    if forward_items {
+                        surface_items.push(MultiTurnStreamItem::ToolTaskStarted {
+                            tool_call: *effective_tool_call,
+                            internal_call_id: internal_call_id.clone(),
+                            task_id: pending.descriptor.task_id.clone(),
+                            policy: pending.policy,
+                            immediate_response: pending.immediate_response.clone(),
+                        });
+                        if pending.policy
+                            == TaskCompletionPolicy::ContinueTurns
+                        {
+                            let text = pending.immediate_response.clone().unwrap_or_else(|| {
+                                task_launch_notice_text(&pending)
+                            });
+                            let item = tool_result_message(
+                                pending.tool_call.id.clone(),
+                                pending.tool_call.call_id.clone(),
+                                text,
+                            );
+                            if let UserContent::ToolResult(tool_result) = item {
+                                surface_items.push(MultiTurnStreamItem::StreamUserItem(
+                                    StreamedUserContent::ToolResult {
+                                        tool_result,
+                                        internal_call_id: internal_call_id.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    resolutions.push(ToolCallResolution::Deferred(Box::new(pending.clone())));
+                    launches.push(TaskLaunch {
+                        handle,
+                        pending,
+                        launch_span,
+                        dispatch_context,
+                        cancel_reason,
+                    });
+                    continue;
+                }
+                surface => surface,
+            };
+
+            let Some(content) = content else {
+                for launch in launches {
+                    if let Err(error) = cancel_task_handle(launch.handle.as_ref()).await {
+                        tracing::warn!(
+                            task_id = %launch.pending.descriptor.task_id,
+                            error = %error.message(),
+                            "failed to cancel a deferred task after an incomplete tool batch"
+                        );
+                    }
+                }
+                yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
+                    CompletionError::ResponseError(
+                        "tool execution finished without producing every result".to_string(),
+                    ),
+                ))));
+                return;
             };
             if forward_items {
                 // An executed call also surfaces its execution commit; a skipped
@@ -921,6 +1501,7 @@ where
                     }
                     ToolSurface::Skipped => true,
                     ToolSurface::Preresolved => false,
+                    ToolSurface::Deferred(..) => false,
                 };
                 if surface_result
                     && let UserContent::ToolResult(tool_result) = &content
@@ -933,12 +1514,45 @@ where
                     ));
                 }
             }
-            committed.push(content);
+            resolutions.push(ToolCallResolution::Completed(content));
         }
 
-        if let Err(err) = run.tool_results(committed) {
+        if let Err(err) = run.tool_batch_results(resolutions) {
+            for launch in launches {
+                if let Err(error) = cancel_task_handle(launch.handle.as_ref()).await {
+                    tracing::warn!(
+                        task_id = %launch.pending.descriptor.task_id,
+                        error = %error.message(),
+                        "failed to cancel a deferred task after batch commit failure"
+                    );
+                }
+            }
             yield Err(Box::new(err).into());
             return;
+        }
+
+        for launch in launches {
+            let TaskLaunch {
+                handle,
+                pending,
+                launch_span,
+                dispatch_context,
+                cancel_reason,
+            } = launch;
+            let internal_call_id = pending.internal_call_id.clone();
+            tasks.launch(
+                handle,
+                &pending,
+                TaskDriveConfig {
+                    poll_fallback: runner.task_poll_interval,
+                    deadline: runner.task_deadline,
+                },
+                &launch_span,
+                dispatch_context,
+            );
+            if let Some(reason) = cancel_reason {
+                tasks.cancel_one(&internal_call_id, reason);
+            }
         }
 
         for item in surface_items {
@@ -1356,18 +1970,13 @@ where
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
         tool_snapshot: Arc<ToolRegistrySnapshot>,
+        tasks: &'a mut TaskTable,
     ) -> DriveStream<'a, M::StreamingResponse> {
         // The streaming surface chains nothing onto its tool spans, and forwards
         // the ToolCall/ToolResult items to the consumer.
-        drive_tool_calls(
-            runner,
-            hook_ctx,
-            run,
-            calls,
-            tool_snapshot,
-            |span| span,
-            true,
-        )
+        drive_tool_calls(runner, hook_ctx, run, calls, tool_snapshot, tasks, |span| {
+            span
+        })
     }
 
     fn record_run_level_telemetry(
@@ -1480,10 +2089,47 @@ where
             true,
         )
         .filter_map(|item| {
-            std::future::ready(match item {
+            ready(match item {
                 Ok(DriveItem::Item(item)) => Some(Ok(item)),
                 Ok(DriveItem::Done(_)) => None,
                 Err(err) => Some(Err(err)),
+            })
+        });
+
+        Box::pin(driver.instrument(agent_span))
+    }
+
+    /// Stream a previously suspended [`AgentRun`] to completion instead of
+    /// starting a fresh run. This is the streaming counterpart of
+    /// [`run_from`](AgentRunner::run_from): registered
+    /// task resumers rehydrate deferred task descriptors, and conversation
+    /// memory is bypassed because the supplied run already owns its history.
+    pub fn stream_from(self, run: AgentRun) -> StreamingResult<M::StreamingResponse> {
+        let (agent_span, created_agent_span) = acquire_agent_span(
+            self.agent_name_or_default(),
+            self.preamble.as_deref(),
+            self.record_telemetry_content,
+        );
+        let source = StreamingTurnSource::new(
+            &self.hooks,
+            self.agent_name_or_default().to_string(),
+            created_agent_span,
+            self.record_telemetry_content,
+        );
+        let driver = drive_agent(
+            self,
+            source,
+            run,
+            agent_span.clone(),
+            created_agent_span,
+            None,
+            true,
+        )
+        .filter_map(|item| {
+            ready(match item {
+                Ok(DriveItem::Item(item)) => Some(Ok(item)),
+                Ok(DriveItem::Done(_)) => None,
+                Err(error) => Some(Err(error)),
             })
         });
 
@@ -2128,14 +2774,15 @@ mod migrated_tests {
 
         let hook_context = HookContext::new(true, None);
         hook_context.set_turn(1);
+        let mut tasks = TaskTable::new();
         let mut stream = drive_tool_calls::<MockCompletionModel, MockResponse, _>(
             &runner,
             &hook_context,
             &mut run,
             calls,
             tool_snapshot,
+            &mut tasks,
             |span| span,
-            true,
         );
 
         let mut saw_commit = false;

@@ -113,10 +113,14 @@ pub(crate) mod extensions;
 mod output;
 mod result;
 pub mod server;
+mod task;
 
 pub use extensions::{MissingToolContext, ToolContext};
 pub use output::{IntoToolOutput, ToolOutput};
 pub use result::{ToolErrorKind, ToolExecutionError, ToolResult};
+pub use task::{
+    TaskResumer, ToolDispatch, ToolTaskDescriptor, ToolTaskHandle, ToolTaskResult, ToolTaskStatus,
+};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -232,6 +236,17 @@ pub(crate) trait ErasedTool: WasmCompatSend + WasmCompatSync {
         args: String,
         context: &'a mut ToolContext,
     ) -> WasmBoxedFuture<'a, ToolResult>;
+
+    /// Dispatch through the canonical tool boundary. Ordinary tools complete
+    /// inline; protocol adapters may override this to return a live deferred
+    /// task without creating a parallel execution API.
+    fn dispatch<'a>(
+        &'a self,
+        args: String,
+        context: &'a mut ToolContext,
+    ) -> WasmBoxedFuture<'a, ToolDispatch> {
+        Box::pin(async move { ToolDispatch::Completed(self.execute(args, context).await) })
+    }
 }
 
 impl<T> ErasedTool for T
@@ -450,8 +465,8 @@ impl RegisteredTool {
         self.erased().is_live()
     }
 
-    pub(crate) async fn execute(&self, args: String, context: &mut ToolContext) -> ToolResult {
-        self.erased().execute(args, context).await
+    pub(crate) async fn dispatch(&self, args: String, context: &mut ToolContext) -> ToolDispatch {
+        self.erased().dispatch(args, context).await
     }
 }
 
@@ -472,8 +487,8 @@ impl ToolRegistration {
 }
 
 /// The outcome of one isolated tool dispatch.
-pub(crate) struct ToolDispatch {
-    pub(crate) result: ToolResult,
+pub(crate) struct DispatchedTool {
+    pub(crate) outcome: ToolDispatch,
     pub(crate) context: ToolContext,
 }
 
@@ -488,20 +503,20 @@ pub(crate) async fn dispatch_tool(
     args: String,
     tool: Option<RegisteredTool>,
     context: &ToolContext,
-) -> ToolDispatch {
+) -> DispatchedTool {
     let mut dispatch_context = context.for_dispatch();
-    let result = match tool {
+    let outcome = match tool {
         Some(tool) => {
             tracing::debug!(target: "rig", tool_name = name, "calling tool with args:\n{args}");
-            tool.execute(args, &mut dispatch_context).await
+            tool.dispatch(args, &mut dispatch_context).await
         }
-        None => ToolResult::failed(
+        None => ToolDispatch::Completed(ToolResult::failed(
             ToolExecutionError::not_found(format!("no tool named `{name}` is registered"))
                 .with_model_feedback(format!("tool `{name}` not found")),
-        ),
+        )),
     };
-    ToolDispatch {
-        result,
+    DispatchedTool {
+        outcome,
         context: dispatch_context,
     }
 }
@@ -618,6 +633,11 @@ impl ToolSet {
 
     /// Execute one registered tool through the canonical structured path.
     ///
+    /// A deferred dispatch is awaited transparently, preserving the historical
+    /// one-result contract. This convenience path has no run-level task
+    /// deadline or cancellation policy; use an agent runner when those controls
+    /// are required.
+    ///
     /// The tool receives a snapshot of inbound context. Result metadata is
     /// published back to `context`; mutations to inbound values are discarded.
     pub async fn execute(
@@ -628,10 +648,18 @@ impl ToolSet {
     ) -> ToolResult {
         context.clear_dispatch_result();
         let tool = self.get(name).cloned();
-        let ToolDispatch {
-            result,
-            context: dispatch_context,
+        let DispatchedTool {
+            outcome,
+            context: mut dispatch_context,
         } = dispatch_tool(name, args.into(), tool, context).await;
+        let result = match outcome {
+            ToolDispatch::Completed(result) => result,
+            ToolDispatch::Deferred(handle) => {
+                let (result, task_context) = handle.wait().await.into_parts();
+                dispatch_context.accept_dispatch_result(task_context);
+                result
+            }
+        };
         context.accept_dispatch_result(dispatch_context);
         result
     }

@@ -25,9 +25,13 @@
 //! # }
 //! ```
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use futures::StreamExt;
@@ -40,6 +44,7 @@ use super::{
         CompletionResponse as CompletionResponseEvent, HookContext, HookStack,
         InvalidToolCallAction, ModelTurnFinished, ObservationAction, RequestPatch,
         ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
+        ToolTaskResultAction, ToolTaskStartedAction, ToolTaskStartedEvent,
     },
     prompt_request::{
         PromptResponse,
@@ -50,8 +55,10 @@ use super::{
         tool_result_output,
     },
     run::{
-        AgentRun, DEFAULT_OUTPUT_RETRIES, ModelTurn, ModelTurnOutcome, OutputMode, PendingToolCall,
+        AgentRun, DEFAULT_OUTPUT_RETRIES, ModelTurn, ModelTurnOutcome, OutputMode, PendingTask,
+        PendingToolCall, TaskCompletionPolicy, TaskDrainPolicy,
     },
+    task_wait::cancel_task_handle,
 };
 use crate::{
     completion::{CompletionError, CompletionModel, Document, Message, PromptError},
@@ -59,7 +66,8 @@ use crate::{
     memory::ConversationMemory,
     message::{ToolCall, ToolChoice, UserContent},
     tool::{
-        ToolContext, ToolDispatch, ToolOutput, ToolResult,
+        DispatchedTool, TaskResumer, ToolContext, ToolDispatch, ToolOutput, ToolResult,
+        ToolTaskHandle, ToolTaskStatus,
         server::{ToolRegistrySnapshot, ToolServerHandle},
     },
 };
@@ -142,6 +150,28 @@ pub(crate) fn tool_result_decision(action: ToolResultAction) -> ToolResultDecisi
     }
 }
 
+pub(crate) enum TaskStartedDecision {
+    Continue,
+    Cancel(String),
+    Stop(String),
+}
+
+pub(crate) fn task_started_decision(action: ToolTaskStartedAction) -> TaskStartedDecision {
+    match action {
+        ToolTaskStartedAction::Continue => TaskStartedDecision::Continue,
+        ToolTaskStartedAction::Cancel(reason) => TaskStartedDecision::Cancel(reason),
+        ToolTaskStartedAction::Stop(reason) => TaskStartedDecision::Stop(reason),
+    }
+}
+
+pub(crate) fn task_result_decision(action: ToolTaskResultAction) -> ToolResultDecision {
+    match action {
+        ToolTaskResultAction::Keep => ToolResultDecision::Keep,
+        ToolTaskResultAction::Rewrite(result) => ToolResultDecision::Replace(result),
+        ToolTaskResultAction::Stop(reason) => ToolResultDecision::Terminate(reason),
+    }
+}
+
 pub(crate) enum CompletionCallDecision {
     Proceed,
     Patch(RequestPatch),
@@ -194,6 +224,18 @@ where
     pub(crate) memory: Option<Arc<dyn ConversationMemory>>,
     pub(crate) conversation_id: Option<String>,
     pub(crate) hooks: HookStack<M>,
+    /// Default completion policy for calls that defer behind a task.
+    pub(crate) task_completion_policy: TaskCompletionPolicy,
+    /// Per-tool completion-policy overrides.
+    pub(crate) task_completion_policies: BTreeMap<String, TaskCompletionPolicy>,
+    /// Per-task driving budget measured from launch or rehydration.
+    pub(crate) task_deadline: Option<Duration>,
+    /// Fallback task status cadence when a handle provides no hint.
+    pub(crate) task_poll_interval: Option<Duration>,
+    /// Policy applied when a final answer leaves tasks pending.
+    pub(crate) task_drain: TaskDrainPolicy,
+    /// Backends able to rehydrate persisted task descriptors.
+    pub(crate) task_resumers: Vec<Arc<dyn TaskResumer>>,
 }
 
 impl<M> AgentRunner<M>
@@ -226,6 +268,12 @@ where
             memory: agent.memory.clone(),
             conversation_id: agent.default_conversation_id.clone(),
             hooks: agent.hooks.clone(),
+            task_completion_policy: TaskCompletionPolicy::default(),
+            task_completion_policies: BTreeMap::new(),
+            task_deadline: None,
+            task_poll_interval: None,
+            task_drain: TaskDrainPolicy::default(),
+            task_resumers: Vec::new(),
         }
     }
 
@@ -332,6 +380,61 @@ where
         self
     }
 
+    /// Set the default completion policy for deferred tool calls.
+    pub fn task_completion_policy(mut self, policy: TaskCompletionPolicy) -> Self {
+        self.task_completion_policy = policy;
+        self
+    }
+
+    /// Override the deferred completion policy for one tool name.
+    pub fn task_completion_policy_for(
+        mut self,
+        tool_name: impl Into<String>,
+        policy: TaskCompletionPolicy,
+    ) -> Self {
+        self.task_completion_policies
+            .insert(tool_name.into(), policy);
+        self
+    }
+
+    /// Bound every deferred task by a wall-clock driving budget. A rehydrated
+    /// task receives a fresh budget because a process-safe monotonic launch
+    /// instant cannot be persisted.
+    pub fn task_deadline(mut self, deadline: Duration) -> Self {
+        self.task_deadline = Some(deadline);
+        self
+    }
+
+    /// Set the fallback status cadence for handles without a poll hint.
+    pub fn task_poll_interval(mut self, interval: Duration) -> Self {
+        self.task_poll_interval = Some(interval);
+        self
+    }
+
+    /// Set the policy applied when a final answer leaves tasks pending.
+    pub fn task_drain(mut self, policy: TaskDrainPolicy) -> Self {
+        self.task_drain = policy;
+        self
+    }
+
+    /// Register a backend that can rehydrate persisted task descriptors when
+    /// this runner resumes an [`AgentRun`] through [`run_from`](Self::run_from)
+    /// or [`stream_from`](Self::stream_from).
+    pub fn task_resumer<R>(mut self, resumer: R) -> Self
+    where
+        R: TaskResumer + 'static,
+    {
+        self.task_resumers.push(Arc::new(resumer));
+        self
+    }
+
+    pub(crate) fn task_completion_policy_for_tool(&self, tool_name: &str) -> TaskCompletionPolicy {
+        self.task_completion_policies
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.task_completion_policy)
+    }
+
     pub(crate) fn agent_name_or_default(&self) -> &str {
         self.agent_name.as_deref().unwrap_or(UNKNOWN_AGENT_NAME)
     }
@@ -349,6 +452,7 @@ where
             history_override.or_else(|| self.chat_history.clone()),
             self.tool_choice.clone(),
         )
+        .with_task_drain(self.task_drain)
     }
 }
 
@@ -496,6 +600,30 @@ pub(crate) struct ToolCallOutcome {
     pub execution: ToolExecution,
 }
 
+/// A tool call accepted as a deferred task.
+pub(crate) struct DeferredToolCall {
+    /// Live backend handle owned by the driver.
+    pub handle: Box<dyn ToolTaskHandle>,
+    /// Serializable task state committed to [`AgentRun`].
+    pub pending: PendingTask,
+    /// Effective hook-rewritten call surfaced by streaming.
+    pub effective_tool_call: Box<ToolCall>,
+    /// Per-dispatch context retained until the terminal result hook.
+    pub dispatch_context: ToolContext,
+    /// Cancellation requested by the task-start hook. The task table applies
+    /// it after the batch commits, keeping the terminal outcome on the typed
+    /// task lifecycle instead of routing it through the inline tool hook.
+    pub cancel_reason: Option<String>,
+}
+
+/// Outcome of one tool dispatch.
+pub(crate) enum SingleToolResolution {
+    /// The call completed inline.
+    Completed(ToolCallOutcome),
+    /// The backend accepted the call as a deferred task.
+    Deferred(Box<DeferredToolCall>),
+}
+
 /// Execute a single tool call, firing the `ToolCall` and `ToolResult` hooks and
 /// shaping the result. **Shared by the blocking and streaming drivers** so a
 /// tool call behaves identically in both: same hook events, same fail-closed
@@ -512,7 +640,7 @@ pub(crate) async fn run_single_tool<M>(
     tool_call: &ToolCall,
     internal_call_id: &str,
     error_history: &[Message],
-) -> Result<ToolCallOutcome, PromptError>
+) -> Result<SingleToolResolution, PromptError>
 where
     M: CompletionModel,
 {
@@ -520,6 +648,8 @@ where
     let tool_context = &runner.tool_context;
     let record_content = runner.record_telemetry_content;
     let tool_name = &tool_call.function.name;
+    let task_policy = runner.task_completion_policy_for_tool(tool_name);
+    let launched_turn = ctx.turn();
     // `mut` so a tool-call hook can rewrite the arguments the tool
     // runs with (the model's emitted arguments are otherwise used verbatim).
     let mut args = json_utils::serialize_json_value(&tool_call.function.arguments);
@@ -609,15 +739,85 @@ where
         None => {
             let mut effective_tool_call = tool_call.clone();
             effective_tool_call.function.arguments = effective_args;
-            let ToolDispatch {
-                result: exec,
+            let DispatchedTool {
+                outcome,
                 context: dispatch_context,
             } = tool_snapshot.dispatch(tool_name, &args, tool_context).await;
-            (
-                exec,
-                ToolExecution::Executed(Box::new(effective_tool_call)),
-                dispatch_context,
-            )
+            match outcome {
+                ToolDispatch::Completed(exec) => (
+                    exec,
+                    ToolExecution::Executed(Box::new(effective_tool_call)),
+                    dispatch_context,
+                ),
+                ToolDispatch::Deferred(handle) => {
+                    tool_span.record("gen_ai.tool.task.id", handle.task_id());
+                    tool_span.record("gen_ai.tool.task.status", ToolTaskStatus::Working.as_str());
+                    let action = hooks
+                        .on_tool_task_started(
+                            ctx,
+                            ToolTaskStartedEvent {
+                                tool_name,
+                                tool_call_id: tool_call.call_id.as_deref(),
+                                internal_call_id,
+                                task_id: handle.task_id(),
+                                immediate_response: handle.immediate_response(),
+                                policy: task_policy,
+                            },
+                        )
+                        .await;
+                    match task_started_decision(action) {
+                        TaskStartedDecision::Continue => {
+                            let pending = PendingTask::new(
+                                internal_call_id,
+                                effective_tool_call.clone(),
+                                handle.descriptor(),
+                                task_policy,
+                                launched_turn,
+                            );
+                            return Ok(SingleToolResolution::Deferred(Box::new(
+                                DeferredToolCall {
+                                    handle,
+                                    pending,
+                                    effective_tool_call: Box::new(effective_tool_call),
+                                    dispatch_context,
+                                    cancel_reason: None,
+                                },
+                            )));
+                        }
+                        TaskStartedDecision::Cancel(reason) => {
+                            let pending = PendingTask::new(
+                                internal_call_id,
+                                effective_tool_call.clone(),
+                                handle.descriptor(),
+                                task_policy,
+                                launched_turn,
+                            );
+                            return Ok(SingleToolResolution::Deferred(Box::new(
+                                DeferredToolCall {
+                                    handle,
+                                    pending,
+                                    effective_tool_call: Box::new(effective_tool_call),
+                                    dispatch_context,
+                                    cancel_reason: Some(reason),
+                                },
+                            )));
+                        }
+                        TaskStartedDecision::Stop(reason) => {
+                            if let Err(error) = cancel_task_handle(handle.as_ref()).await {
+                                tracing::warn!(
+                                    task_id = %handle.task_id(),
+                                    error = %error.message(),
+                                    "failed to cancel a task while stopping the run"
+                                );
+                            }
+                            return Err(PromptError::prompt_cancelled(
+                                error_history.to_vec(),
+                                reason,
+                            ));
+                        }
+                    }
+                }
+            }
         }
     };
     // Presentation rewrites happen after execution. The raw structured result
@@ -652,14 +852,14 @@ where
             if record_content {
                 tool_span.record("gen_ai.tool.call.result", replacement.render());
             }
-            Ok(ToolCallOutcome {
+            Ok(SingleToolResolution::Completed(ToolCallOutcome {
                 content: tool_result_output(
                     tool_call.id.clone(),
                     tool_call.call_id.clone(),
                     replacement,
                 ),
                 execution,
-            })
+            }))
         }
         ToolResultDecision::Keep => {
             if record_content {
@@ -670,12 +870,15 @@ where
                 tool_call.call_id.clone(),
                 exec.output().clone(),
             );
-            Ok(ToolCallOutcome { content, execution })
+            Ok(SingleToolResolution::Completed(ToolCallOutcome {
+                content,
+                execution,
+            }))
         }
     }
 }
 
-fn record_tool_result(span: &tracing::Span, result: &ToolResult) {
+pub(crate) fn record_tool_result(span: &tracing::Span, result: &ToolResult) {
     span.record("gen_ai.tool.call.outcome", result.status_name());
     if let Some(error) = result.error() {
         span.record("gen_ai.tool.error.type", error.kind().as_str());
@@ -694,6 +897,8 @@ pub(crate) fn new_execute_tool_span() -> tracing::Span {
         gen_ai.tool.type = "function",
         gen_ai.tool.name = tracing::field::Empty,
         gen_ai.tool.call.id = tracing::field::Empty,
+        gen_ai.tool.task.id = tracing::field::Empty,
+        gen_ai.tool.task.status = tracing::field::Empty,
         gen_ai.tool.call.arguments = tracing::field::Empty,
         gen_ai.tool.call.result = tracing::field::Empty,
         gen_ai.tool.call.outcome = tracing::field::Empty,
@@ -865,19 +1070,14 @@ where
         run: &'a mut AgentRun,
         calls: Vec<PendingToolCall>,
         tool_snapshot: Arc<ToolRegistrySnapshot>,
+        tasks: &'a mut super::task_wait::TaskTable,
     ) -> DriveStream<'a, M::Response> {
         // The blocking surface chains tool spans into its linear `follows_from`
         // sequence (chat -> tool -> chat), and discards the yielded items, so it
         // skips building them.
-        drive_tool_calls(
-            runner,
-            hook_ctx,
-            run,
-            calls,
-            tool_snapshot,
-            |span| self.chain_span(span),
-            false,
-        )
+        drive_tool_calls(runner, hook_ctx, run, calls, tool_snapshot, tasks, |span| {
+            self.chain_span(span)
+        })
     }
 
     fn record_run_level_telemetry(
@@ -968,6 +1168,47 @@ where
         }
 
         // The engine yields `Done` unless it errored (handled above).
+        response.ok_or_else(|| {
+            PromptError::CompletionError(CompletionError::ResponseError(
+                "agent run ended without producing a final response".to_string(),
+            ))
+        })
+    }
+
+    /// Drive a previously suspended [`AgentRun`] to completion instead of
+    /// starting a fresh run. Deferred tasks recorded in the state are
+    /// rehydrated through the registered
+    /// [`TaskResumer`]s. A task no resumer accepts
+    /// resolves as a classified not-found result, so a stale descriptor cannot
+    /// wedge the run. Conversation memory is bypassed because the supplied run
+    /// already owns its history.
+    pub async fn run_from(self, run: AgentRun) -> Result<PromptResponse, PromptError> {
+        let (agent_span, created_agent_span) = acquire_agent_span(
+            self.agent_name_or_default(),
+            self.preamble.as_deref(),
+            self.record_telemetry_content,
+        );
+        let record_telemetry_content = self.record_telemetry_content;
+        let driver = drive_agent(
+            self,
+            UnaryTurnSource::new(record_telemetry_content),
+            run,
+            agent_span,
+            created_agent_span,
+            None,
+            false,
+        );
+        futures::pin_mut!(driver);
+
+        let mut response = None;
+        while let Some(item) = driver.next().await {
+            match item {
+                Ok(DriveItem::Done(done)) => response = Some(*done),
+                Ok(DriveItem::Item(_)) => {}
+                Err(error) => return Err(streaming_error_into_prompt(error)),
+            }
+        }
+
         response.ok_or_else(|| {
             PromptError::CompletionError(CompletionError::ResponseError(
                 "agent run ended without producing a final response".to_string(),
@@ -1560,6 +1801,529 @@ mod migrated_tests {
             serde_json::to_value(&blocking_messages).expect("serialize blocking"),
             serde_json::to_value(&streaming_messages).expect("serialize streaming"),
         );
+    }
+
+    mod deferred_task_lifecycle {
+        use std::sync::{Arc, Mutex};
+
+        use futures::StreamExt;
+        use serde_json::json;
+
+        use crate::OneOrMany;
+        use crate::agent::prompt_request::streaming::MultiTurnStreamItem;
+        use crate::agent::run::{
+            AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingTask, TaskCompletionPolicy,
+            ToolCallResolution,
+        };
+        use crate::agent::{
+            AgentBuilder, AgentHook, HookContext, ToolResultAction, ToolResultEvent,
+            ToolTaskResultAction, ToolTaskResultEvent, ToolTaskStartedAction, ToolTaskStartedEvent,
+            ToolTaskStatusAction, ToolTaskStatusEvent,
+        };
+        use crate::completion::{CompletionModel, Usage};
+        use crate::message::{AssistantContent, ToolCall, ToolFunction};
+        use crate::streaming::StreamedUserContent;
+        use crate::test_utils::{
+            MockCompletionModel, MockRequestId, MockStreamEvent, MockTaskResumer, MockTaskTool,
+            MockTurn, SessionId,
+        };
+        use crate::tool::{
+            ErasedTool, TaskResumer, ToolContext, ToolDispatch, ToolExecutionError,
+            ToolTaskDescriptor, ToolTaskHandle, ToolTaskStatus,
+        };
+        use crate::wasm_compat::WasmBoxedFuture;
+
+        const RAW_OUTPUT: &str = "private task output";
+        const REWRITTEN_OUTPUT: &str = "task output safe for the model";
+
+        struct FailingTaskResumer;
+
+        impl TaskResumer for FailingTaskResumer {
+            fn resume<'a>(
+                &'a self,
+                _descriptor: &'a ToolTaskDescriptor,
+            ) -> WasmBoxedFuture<'a, Result<Option<Box<dyn ToolTaskHandle>>, ToolExecutionError>>
+            {
+                Box::pin(async { Err(ToolExecutionError::network("task resume transport failed")) })
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum RecordedTaskEvent {
+            Started {
+                task_id: String,
+                policy: TaskCompletionPolicy,
+                immediate_response: Option<String>,
+            },
+            Status(ToolTaskStatus),
+            Result {
+                task_id: String,
+                status: ToolTaskStatus,
+                policy: TaskCompletionPolicy,
+                presentation: String,
+                raw: String,
+                session_id: Option<String>,
+                request_id: Option<String>,
+            },
+            InlineResult,
+        }
+
+        #[derive(Clone, Default)]
+        struct TaskLifecycleHook {
+            events: Arc<Mutex<Vec<RecordedTaskEvent>>>,
+            rewrite_result: bool,
+            cancel_at_start: bool,
+        }
+
+        impl TaskLifecycleHook {
+            fn rewriting() -> Self {
+                Self {
+                    rewrite_result: true,
+                    ..Self::default()
+                }
+            }
+
+            fn cancelling() -> Self {
+                Self {
+                    cancel_at_start: true,
+                    ..Self::default()
+                }
+            }
+
+            fn events(&self) -> Vec<RecordedTaskEvent> {
+                self.events.lock().expect("task events").clone()
+            }
+
+            fn record(&self, event: RecordedTaskEvent) {
+                self.events.lock().expect("task events").push(event);
+            }
+        }
+
+        impl<M: CompletionModel> AgentHook<M> for TaskLifecycleHook {
+            async fn on_tool_result(
+                &self,
+                _ctx: &HookContext,
+                _event: ToolResultEvent<'_>,
+            ) -> ToolResultAction {
+                self.record(RecordedTaskEvent::InlineResult);
+                ToolResultAction::keep()
+            }
+
+            async fn on_tool_task_started(
+                &self,
+                _ctx: &HookContext,
+                event: ToolTaskStartedEvent<'_>,
+            ) -> ToolTaskStartedAction {
+                self.record(RecordedTaskEvent::Started {
+                    task_id: event.task_id.to_string(),
+                    policy: event.policy,
+                    immediate_response: event.immediate_response.map(str::to_owned),
+                });
+                if self.cancel_at_start {
+                    ToolTaskStartedAction::cancel("cancelled by task policy")
+                } else {
+                    ToolTaskStartedAction::continue_task()
+                }
+            }
+
+            async fn on_tool_task_status(
+                &self,
+                _ctx: &HookContext,
+                event: ToolTaskStatusEvent<'_>,
+            ) -> ToolTaskStatusAction {
+                self.record(RecordedTaskEvent::Status(event.status));
+                ToolTaskStatusAction::continue_task()
+            }
+
+            async fn on_tool_task_result(
+                &self,
+                _ctx: &HookContext,
+                event: ToolTaskResultEvent<'_>,
+            ) -> ToolTaskResultAction {
+                self.record(RecordedTaskEvent::Result {
+                    task_id: event.task_id.to_string(),
+                    status: event.status,
+                    policy: event.policy,
+                    presentation: event.presentation.render(),
+                    raw: event.raw_result.output().render(),
+                    session_id: event
+                        .tool_context
+                        .get::<SessionId>()
+                        .map(|session| session.0.clone()),
+                    request_id: event
+                        .tool_context
+                        .result::<MockRequestId>()
+                        .map(|request| request.0.clone()),
+                });
+                if self.rewrite_result {
+                    ToolTaskResultAction::rewrite(REWRITTEN_OUTPUT)
+                } else {
+                    ToolTaskResultAction::keep()
+                }
+            }
+        }
+
+        fn scripted_task(task_id: &str) -> MockTaskTool {
+            let tool = MockTaskTool::new(task_id).with_immediate_response("rendering started");
+            *tool.state.output.lock().expect("task output") = RAW_OUTPUT.to_string();
+            tool.state.set_statuses(vec![
+                ToolTaskStatus::Working,
+                ToolTaskStatus::InputRequired,
+                ToolTaskStatus::Completed,
+            ]);
+            tool
+        }
+
+        fn task_context() -> ToolContext {
+            let mut context = ToolContext::new();
+            context.insert(SessionId("session-7".to_string()));
+            context
+        }
+
+        async fn suspended_join_run(tool: &MockTaskTool) -> AgentRun {
+            let mut run = AgentRun::new("render this").max_turns(3);
+            assert!(matches!(
+                run.next_step().expect("first step"),
+                AgentRunStep::CallModel { .. }
+            ));
+
+            let tool_call = ToolCall::new(
+                "tc-task".to_string(),
+                ToolFunction::new(MockTaskTool::NAME.to_string(), json!({})),
+            );
+            let names = [MockTaskTool::NAME.to_string()].into_iter().collect();
+            let turn = ModelTurn::new(
+                None,
+                OneOrMany::one(AssistantContent::ToolCall(tool_call.clone())),
+                Usage::new(),
+                names,
+                [MockTaskTool::NAME.to_string()].into_iter().collect(),
+            );
+            assert!(matches!(
+                run.model_response(turn).expect("tool turn"),
+                ModelTurnOutcome::Continue { .. }
+            ));
+            assert!(matches!(
+                run.next_step().expect("tool step"),
+                AgentRunStep::CallTools { .. }
+            ));
+
+            let mut context = ToolContext::new();
+            let dispatch = ErasedTool::dispatch(tool, "{}".to_string(), &mut context).await;
+            let ToolDispatch::Deferred(handle) = dispatch else {
+                panic!("mock task must defer");
+            };
+            let pending = PendingTask::new(
+                "internal-tc-task",
+                tool_call,
+                handle.descriptor(),
+                TaskCompletionPolicy::JoinTurn,
+                1,
+            );
+            drop(handle);
+            run.tool_batch_results(vec![ToolCallResolution::Deferred(Box::new(pending))])
+                .expect("deferred batch");
+            run
+        }
+
+        #[tokio::test]
+        async fn blocking_task_uses_only_typed_lifecycle_hooks() {
+            let tool = scripted_task("task-blocking");
+            let hook = TaskLifecycleHook::rewriting();
+            let model = MockCompletionModel::from_turns([
+                MockTurn::tool_call("tc-task", MockTaskTool::NAME, json!({"kind": "render"})),
+                MockTurn::text("render complete"),
+            ]);
+            let agent = AgentBuilder::new(model).build();
+            agent
+                .tool_server_handle
+                .add_erased_tool(Arc::new(tool))
+                .await;
+
+            let response = agent
+                .runner("render this")
+                .max_turns(2)
+                .tool_context(task_context())
+                .task_completion_policy(TaskCompletionPolicy::JoinTurn)
+                .add_hook(hook.clone())
+                .run()
+                .await
+                .expect("blocking task run");
+
+            assert_eq!(response.output, "render complete");
+            assert_eq!(
+                hook.events(),
+                vec![
+                    RecordedTaskEvent::Started {
+                        task_id: "task-blocking".to_string(),
+                        policy: TaskCompletionPolicy::JoinTurn,
+                        immediate_response: Some("rendering started".to_string()),
+                    },
+                    RecordedTaskEvent::Status(ToolTaskStatus::Working),
+                    RecordedTaskEvent::Status(ToolTaskStatus::InputRequired),
+                    RecordedTaskEvent::Result {
+                        task_id: "task-blocking".to_string(),
+                        status: ToolTaskStatus::Completed,
+                        policy: TaskCompletionPolicy::JoinTurn,
+                        presentation: RAW_OUTPUT.to_string(),
+                        raw: RAW_OUTPUT.to_string(),
+                        session_id: Some("session-7".to_string()),
+                        request_id: Some("task:task-blocking".to_string()),
+                    },
+                ]
+            );
+
+            let history = serde_json::to_string(&response.messages).expect("serialize history");
+            assert!(history.contains(REWRITTEN_OUTPUT));
+            assert!(!history.contains(RAW_OUTPUT));
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum StreamTaskEvent {
+            Started,
+            Status(ToolTaskStatus),
+            Result(ToolTaskStatus, String),
+        }
+
+        #[tokio::test]
+        async fn streaming_surfaces_the_same_typed_task_lifecycle() {
+            let tool = scripted_task("task-streaming");
+            let hook = TaskLifecycleHook::rewriting();
+            let model = MockCompletionModel::from_stream_turns([
+                vec![
+                    MockStreamEvent::tool_call_name_delta("tc-task", "ic-task", MockTaskTool::NAME),
+                    MockStreamEvent::tool_call_arguments_delta(
+                        "tc-task",
+                        "ic-task",
+                        "{\"kind\":\"render\"}",
+                    ),
+                    MockStreamEvent::tool_call(
+                        "tc-task",
+                        MockTaskTool::NAME,
+                        json!({"kind": "render"}),
+                    ),
+                    MockStreamEvent::final_response_with_total_tokens(0),
+                ],
+                vec![
+                    MockStreamEvent::text("render complete"),
+                    MockStreamEvent::final_response_with_total_tokens(0),
+                ],
+            ]);
+            let agent = AgentBuilder::new(model).build();
+            agent
+                .tool_server_handle
+                .add_erased_tool(Arc::new(tool))
+                .await;
+
+            let mut stream = agent
+                .runner("render this")
+                .max_turns(2)
+                .tool_context(task_context())
+                .task_completion_policy(TaskCompletionPolicy::JoinTurn)
+                .add_hook(hook.clone())
+                .stream()
+                .await;
+            let mut lifecycle = Vec::new();
+            let mut ordinary_results = 0;
+            let mut execution_commits = 0;
+            let mut final_response = None;
+            while let Some(item) = stream.next().await {
+                match item.expect("stream item") {
+                    MultiTurnStreamItem::ToolTaskStarted { .. } => {
+                        lifecycle.push(StreamTaskEvent::Started);
+                    }
+                    MultiTurnStreamItem::ToolTaskStatus { status, .. } => {
+                        lifecycle.push(StreamTaskEvent::Status(status));
+                    }
+                    MultiTurnStreamItem::ToolTaskResult {
+                        status,
+                        tool_result,
+                        ..
+                    } => {
+                        let output = tool_result
+                            .content
+                            .first_ref()
+                            .as_text()
+                            .expect("text task result")
+                            .to_string();
+                        lifecycle.push(StreamTaskEvent::Result(status, output));
+                    }
+                    MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                        ..
+                    }) => ordinary_results += 1,
+                    MultiTurnStreamItem::ToolExecutionCommitted { .. } => execution_commits += 1,
+                    MultiTurnStreamItem::FinalResponse(response) => {
+                        final_response = Some(response);
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                lifecycle,
+                vec![
+                    StreamTaskEvent::Started,
+                    StreamTaskEvent::Status(ToolTaskStatus::Working),
+                    StreamTaskEvent::Status(ToolTaskStatus::InputRequired),
+                    StreamTaskEvent::Result(
+                        ToolTaskStatus::Completed,
+                        REWRITTEN_OUTPUT.to_string(),
+                    ),
+                ]
+            );
+            assert_eq!(ordinary_results, 0);
+            assert_eq!(execution_commits, 0);
+            assert!(
+                !hook.events().contains(&RecordedTaskEvent::InlineResult),
+                "deferred completion must not fall through the inline result hook"
+            );
+            assert_eq!(
+                final_response.expect("final response").output(),
+                "render complete"
+            );
+        }
+
+        #[tokio::test]
+        async fn task_start_cancellation_stays_on_the_typed_task_path() {
+            let tool = MockTaskTool::new("task-cancel");
+            let state = tool.state.clone();
+            let hook = TaskLifecycleHook::cancelling();
+            let model = MockCompletionModel::from_turns([
+                MockTurn::tool_call("tc-task", MockTaskTool::NAME, json!({})),
+                MockTurn::text("cancel acknowledged"),
+            ]);
+            let agent = AgentBuilder::new(model).build();
+            agent
+                .tool_server_handle
+                .add_erased_tool(Arc::new(tool))
+                .await;
+
+            let response = agent
+                .runner("start then cancel")
+                .max_turns(2)
+                .tool_context(task_context())
+                .task_completion_policy(TaskCompletionPolicy::JoinTurn)
+                .add_hook(hook.clone())
+                .run()
+                .await
+                .expect("cancelled task run");
+
+            assert_eq!(response.output, "cancel acknowledged");
+            assert_eq!(state.cancel_count(), 1);
+            assert!(hook.events().iter().any(|event| matches!(
+                event,
+                RecordedTaskEvent::Result {
+                    status: ToolTaskStatus::Cancelled,
+                    raw,
+                    ..
+                } if raw.contains("cancelled by task policy")
+            )));
+            assert!(
+                !hook.events().contains(&RecordedTaskEvent::InlineResult),
+                "task-start cancellation must terminate through ToolTaskResult"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_from_rehydrates_a_serialized_task() {
+            let tool = MockTaskTool::new("task-resume");
+            let state = tool.state.clone();
+            let run = suspended_join_run(&tool).await;
+            let serialized = serde_json::to_string(&run).expect("serialize suspended run");
+            let resumed: AgentRun =
+                serde_json::from_str(&serialized).expect("deserialize suspended run");
+            state.complete("resumed task output");
+
+            let resumer = MockTaskResumer::new(state);
+            let seen = resumer.seen.clone();
+            let response = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+                "resumed run complete",
+            )]))
+            .build()
+            .runner("unused for an explicit run")
+            .tool_context(task_context())
+            .task_resumer(resumer)
+            .run_from(resumed)
+            .await
+            .expect("resume run");
+
+            assert_eq!(response.output, "resumed run complete");
+            assert_eq!(seen.lock().expect("resumer calls").len(), 1);
+            let history = serde_json::to_string(&response.messages).expect("serialize history");
+            assert!(history.contains("resumed task output"));
+        }
+
+        #[tokio::test]
+        async fn run_from_turns_an_unclaimed_descriptor_into_a_task_failure() {
+            let tool = MockTaskTool::new("task-lost");
+            let run = suspended_join_run(&tool).await;
+            let response = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+                "continued after task loss",
+            )]))
+            .build()
+            .runner("unused for an explicit run")
+            .run_from(run)
+            .await
+            .expect("unclaimed task should not wedge the run");
+
+            assert_eq!(response.output, "continued after task loss");
+            let history = serde_json::to_string(&response.messages).expect("serialize history");
+            assert!(history.contains("could not be resumed"));
+        }
+
+        #[tokio::test]
+        async fn run_from_preserves_a_resumer_failure_classification() {
+            let tool = MockTaskTool::new("task-resumer-error");
+            let run = suspended_join_run(&tool).await;
+            let response = AgentBuilder::new(MockCompletionModel::from_turns([MockTurn::text(
+                "continued after resume failure",
+            )]))
+            .build()
+            .runner("unused for an explicit run")
+            .task_resumer(FailingTaskResumer)
+            .run_from(run)
+            .await
+            .expect("resumer failure should resolve the task instead of wedging");
+
+            assert_eq!(response.output, "continued after resume failure");
+            let history = serde_json::to_string(&response.messages).expect("serialize history");
+            assert!(history.contains("task resume transport failed"));
+            assert!(!history.contains("no registered resumer accepted"));
+        }
+
+        #[tokio::test]
+        async fn stream_from_rehydrates_and_surfaces_a_terminal_task_result() {
+            let tool = MockTaskTool::new("task-stream-resume");
+            let state = tool.state.clone();
+            let run = suspended_join_run(&tool).await;
+            state.complete("stream-resumed output");
+            let model = MockCompletionModel::from_stream_turns([vec![
+                MockStreamEvent::text("stream resume complete"),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ]]);
+            let mut stream = AgentBuilder::new(model)
+                .build()
+                .runner("unused for an explicit run")
+                .task_resumer(MockTaskResumer::new(state))
+                .stream_from(run);
+
+            let mut task_output = None;
+            let mut final_output = None;
+            while let Some(item) = stream.next().await {
+                match item.expect("stream item") {
+                    MultiTurnStreamItem::ToolTaskResult { tool_result, .. } => {
+                        task_output = tool_result.content.first_ref().as_text().map(str::to_owned);
+                    }
+                    MultiTurnStreamItem::FinalResponse(response) => {
+                        final_output = Some(response.output().to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(task_output.as_deref(), Some("stream-resumed output"));
+            assert_eq!(final_output.as_deref(), Some("stream resume complete"));
+        }
     }
 
     /// Structured tool-execution results reach `ToolResultEvent` as machine

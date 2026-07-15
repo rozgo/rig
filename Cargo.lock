@@ -9955,6 +9955,7 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -9972,6 +9973,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp_elicitation_example"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "rig",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rmcp_example"
 version = "0.40.0"
 dependencies = [
@@ -9982,6 +9996,19 @@ dependencies = [
  "rmcp",
  "schemars 1.2.1",
  "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rmcp_tasks_example"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "rig",
+ "rmcp",
  "serde_json",
  "tokio",
  "tracing",

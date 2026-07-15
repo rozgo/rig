@@ -148,6 +148,9 @@ async fn repair_renames_tool_call_and_executes_it() {
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => break response,
                 }
             };
@@ -248,6 +251,9 @@ async fn skip_suppresses_every_call_in_the_turn() {
                         }
                         run.tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
+                    }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
                     }
                     AgentRunStep::Done(response) => break response,
                 }

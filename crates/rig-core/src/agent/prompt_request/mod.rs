@@ -5,7 +5,7 @@ use crate::{
     OneOrMany,
     completion::{CompletionModel, Message, PromptError, Usage},
     message::{AssistantContent, ToolResultContent, UserContent},
-    tool::{ToolContext, ToolOutput},
+    tool::{ToolContext, ToolOutput, ToolTaskDescriptor},
     wasm_compat::{WasmBoxedFuture, WasmCompatSend},
 };
 use serde::{Deserialize, Serialize};
@@ -297,6 +297,13 @@ pub struct PromptResponse {
     /// Where [`output`](Self::output) is the concatenated text, this preserves
     /// the individual content parts (text, reasoning, images, …).
     pub content: OneOrMany<AssistantContent>,
+    /// Deferred tool tasks still pending when the run finished (see
+    /// [`TaskDrainPolicy`](crate::agent::run::TaskDrainPolicy)): under
+    /// `Detach` they are still running and the caller owns their lifecycle
+    /// (resume via a [`TaskResumer`](crate::tool::TaskResumer)); under
+    /// `CancelAndFinish` — or a `WaitAndResume` run whose turn budget was
+    /// exhausted — the driver has already requested their cancellation.
+    pub unresolved_tasks: Vec<ToolTaskDescriptor>,
 }
 
 /// Serde shadow for [`PromptResponse`]. `content` is an `Option` here so runs
@@ -305,7 +312,8 @@ pub struct PromptResponse {
 /// keeping [`PromptResponse::output`] and [`PromptResponse::content`] consistent
 /// for legacy data rather than defaulting to empty text. It carries the field
 /// serde attributes for both directions, keeping the serialized shape identical
-/// (`completion_calls` omitted when empty; `messages`/`content` always present).
+/// (`completion_calls`/`unresolved_tasks` omitted when empty;
+/// `messages`/`content` always present).
 #[derive(Serialize, Deserialize)]
 struct PromptResponseRepr {
     output: String,
@@ -315,6 +323,8 @@ struct PromptResponseRepr {
     messages: Option<Vec<Message>>,
     #[serde(default)]
     content: Option<OneOrMany<AssistantContent>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unresolved_tasks: Vec<ToolTaskDescriptor>,
 }
 
 impl From<PromptResponseRepr> for PromptResponse {
@@ -328,6 +338,7 @@ impl From<PromptResponseRepr> for PromptResponse {
             completion_calls: repr.completion_calls,
             messages: repr.messages,
             content,
+            unresolved_tasks: repr.unresolved_tasks,
         }
     }
 }
@@ -340,6 +351,7 @@ impl From<PromptResponse> for PromptResponseRepr {
             completion_calls: response.completion_calls,
             messages: response.messages,
             content: Some(response.content),
+            unresolved_tasks: response.unresolved_tasks,
         }
     }
 }
@@ -359,6 +371,7 @@ impl PromptResponse {
             usage,
             completion_calls: Vec::new(),
             messages: None,
+            unresolved_tasks: Vec::new(),
         }
     }
 
@@ -767,6 +780,7 @@ where
 mod tests {
     use super::{CompletionCall, PromptResponse, PromptResponseRepr, TypedPromptResponse};
     use crate::{
+        OneOrMany,
         agent::{
             AgentBuilder,
             hook::{
@@ -785,7 +799,7 @@ mod tests {
             MockContextProbeTool, MockOperationArgs, MockSubtractTool, MockToolError, MockTurn,
             SessionId,
         },
-        tool::{Tool, ToolContext},
+        tool::{Tool, ToolContext, ToolTaskDescriptor},
     };
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -1179,6 +1193,24 @@ mod tests {
         // output-derived fallback only fills a genuinely absent `content`. (Compare
         // the text directly to sidestep the unrelated `Text::additional_params`
         // serde round-trip asymmetry.)
+        let AssistantContent::Text(text) = round.content().first() else {
+            panic!("expected text content, got {:?}", round.content().first());
+        };
+        assert_eq!(text.text, "structured");
+    }
+
+    #[test]
+    fn prompt_response_roundtrip_preserves_unresolved_tasks_and_content() {
+        let descriptor = ToolTaskDescriptor::new("mcp", "task-1", "render");
+        let mut response = PromptResponse::new("visible text", Usage::new())
+            .with_content(OneOrMany::one(AssistantContent::text("structured")));
+        response.unresolved_tasks.push(descriptor.clone());
+
+        let value = serde_json::to_value(&response).expect("serialize prompt response");
+        let round: PromptResponse =
+            serde_json::from_value(value).expect("deserialize prompt response");
+
+        assert_eq!(round.unresolved_tasks, vec![descriptor]);
         let AssistantContent::Text(text) = round.content().first() else {
             panic!("expected text content, got {:?}", round.content().first());
         };

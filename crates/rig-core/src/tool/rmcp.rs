@@ -76,12 +76,24 @@ use crate::OneOrMany;
 use crate::completion::ToolDefinition;
 use crate::message::{ImageMediaType, MimeType, ToolResultContent};
 use crate::tool::server::{ManagedToolToken, ToolServerHandle};
-use crate::tool::{ErasedTool, ToolContext, ToolExecutionError, ToolOutput, ToolResult};
+use crate::tool::{
+    ErasedTool, ToolContext, ToolDispatch, ToolExecutionError, ToolOutput, ToolResult,
+};
 use crate::wasm_compat::WasmBoxedFuture;
 
 /// Re-export of [`rmcp::model::Meta`]: place one in a [`ToolContext`] to have
 /// Rig's MCP registration methods forward it as a call's `_meta`.
 pub use rmcp::model::Meta;
+
+pub mod elicitation;
+pub mod notifications;
+pub mod tasks;
+pub use elicitation::{McpElicitationHandler, related_task_id};
+pub use notifications::McpNotificationDelegate;
+use tasks::McpTaskNotifications;
+pub use tasks::{
+    MODEL_IMMEDIATE_RESPONSE_META_KEY, McpTaskHandle, McpTaskInfo, McpTaskPolicy, McpTaskResumer,
+};
 
 /// Default per-call timeout applied to MCP tools (see issue #1914).
 ///
@@ -114,6 +126,14 @@ pub(crate) struct McpTool {
     /// On elapse RMCP sends a cancellation notification so both peers can
     /// release request-scoped resources.
     timeout: Option<Duration>,
+    /// Task augmentation policy used by the canonical deferred dispatch path.
+    task_policy: McpTaskPolicy,
+    /// Requested MCP task retention. `None` leaves retention to the server.
+    task_ttl: Option<Duration>,
+    /// Shared task-status notification registry; absent means pure polling.
+    task_notifications: Option<Arc<McpTaskNotifications>>,
+    /// Whether this connection can answer task-related elicitation requests.
+    elicitation_available: bool,
 }
 
 impl McpTool {
@@ -129,6 +149,10 @@ impl McpTool {
             definition,
             client,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            task_policy: McpTaskPolicy::default(),
+            task_ttl: None,
+            task_notifications: None,
+            elicitation_available: false,
         }
     }
 
@@ -141,6 +165,31 @@ impl McpTool {
     /// elapses.
     pub(crate) fn with_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.timeout = timeout.into();
+        self
+    }
+
+    /// Configure when this MCP tool uses task augmentation.
+    pub(crate) fn with_task_policy(mut self, policy: McpTaskPolicy) -> Self {
+        self.task_policy = policy;
+        self
+    }
+
+    /// Configure requested task retention.
+    pub(crate) fn with_task_ttl(mut self, ttl: impl Into<Option<Duration>>) -> Self {
+        self.task_ttl = ttl.into();
+        self
+    }
+
+    pub(crate) fn with_task_notifications(
+        mut self,
+        notifications: Arc<McpTaskNotifications>,
+    ) -> Self {
+        self.task_notifications = Some(notifications);
+        self
+    }
+
+    pub(crate) fn with_elicitation_available(mut self, available: bool) -> Self {
+        self.elicitation_available = available;
         self
     }
 
@@ -301,6 +350,29 @@ async fn bounded_best_effort_cancellation(
 }
 
 impl McpTool {
+    /// Build one validated `tools/call` request shared by inline and task
+    /// dispatch. The caller's typed [`Meta`] is forwarded as MCP `_meta`.
+    fn build_call_params(
+        &self,
+        args: &str,
+        meta: Option<rmcp::model::Meta>,
+    ) -> Result<rmcp::model::CallToolRequestParams, ToolExecutionError> {
+        let name = self.definition.name.clone();
+        let arguments = parse_mcp_arguments(args).map_err(|error| {
+            ToolExecutionError::invalid_args(format!(
+                "MCP tool '{name}' received invalid arguments: {error}"
+            ))
+            .with_source(error)
+        })?;
+        let mut request = arguments
+            .map(|arguments| {
+                rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
+            })
+            .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
+        request.meta = meta;
+        Ok(request)
+    }
+
     /// Execute one MCP request.
     ///
     /// `meta`, when present, is attached as the MCP request's `_meta`
@@ -313,23 +385,8 @@ impl McpTool {
         args: String,
         meta: Option<rmcp::model::Meta>,
     ) -> WasmBoxedFuture<'_, Result<CallToolResult, ToolExecutionError>> {
-        let name = self.definition.name.clone();
-
         Box::pin(async move {
-            // Validate the JSON arguments before contacting the server: malformed
-            // JSON must surface as an InvalidArgs failure, not a silent no-arg call.
-            let arguments = parse_mcp_arguments(&args).map_err(|error| {
-                ToolExecutionError::invalid_args(format!(
-                    "MCP tool '{name}' received invalid arguments: {error}"
-                ))
-                .with_source(error)
-            })?;
-            let mut request = arguments
-                .map(|arguments| {
-                    rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
-                })
-                .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
-            request.meta = meta;
+            let request = self.build_call_params(&args, meta)?;
 
             match call_mcp_tool(&self.client, request, self.timeout).await {
                 Ok(result) => Ok(result),
@@ -531,6 +588,85 @@ impl ErasedTool for McpTool {
             }
         })
     }
+
+    fn dispatch<'a>(
+        &'a self,
+        args: String,
+        context: &'a mut ToolContext,
+    ) -> WasmBoxedFuture<'a, ToolDispatch> {
+        use tasks::ServerSinkTaskExt as _;
+
+        Box::pin(async move {
+            let server_supports = self
+                .client
+                .tasks_capability()
+                .is_some_and(|capability| capability.supports_tools_call());
+            let support = self.definition.task_support();
+            let as_task = match (support, server_supports, self.task_policy) {
+                (rmcp::model::TaskSupport::Forbidden, _, _) => false,
+                (rmcp::model::TaskSupport::Optional, true, McpTaskPolicy::Preferred) => true,
+                (rmcp::model::TaskSupport::Optional, _, _) => false,
+                (rmcp::model::TaskSupport::Required, _, McpTaskPolicy::Never) => {
+                    let message = format!(
+                        "MCP tool '{}' requires task-based invocation but the task policy is Never",
+                        self.definition.name
+                    );
+                    return ToolDispatch::Completed(ToolResult::failed(
+                        ToolExecutionError::other(message)
+                            .with_code("mcp_task_required")
+                            .with_retryable(false),
+                    ));
+                }
+                (rmcp::model::TaskSupport::Required, true, _) => true,
+                (rmcp::model::TaskSupport::Required, false, _) => {
+                    let message = format!(
+                        "MCP tool '{}' requires task-based invocation but the server declared no \
+                         tools/call task capability",
+                        self.definition.name
+                    );
+                    return ToolDispatch::Completed(ToolResult::failed(
+                        ToolExecutionError::provider(message)
+                            .with_code("mcp_task_capability_missing")
+                            .with_retryable(false),
+                    ));
+                }
+            };
+
+            if !as_task {
+                return ToolDispatch::Completed(
+                    <Self as ErasedTool>::execute(self, args, context).await,
+                );
+            }
+
+            let meta = context.get::<rmcp::model::Meta>().cloned();
+            let mut params = match self.build_call_params(&args, meta) {
+                Ok(params) => params,
+                Err(error) => {
+                    return ToolDispatch::Completed(ToolResult::failed(error));
+                }
+            };
+            let mut task_metadata = rmcp::model::TaskMetadata::new();
+            if let Some(ttl) = self.task_ttl {
+                task_metadata =
+                    task_metadata.with_ttl(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+            }
+            params = params.with_task(task_metadata);
+
+            let created = self.client.call_tool_as_task(params, self.timeout).await;
+
+            match created {
+                Ok(created) => ToolDispatch::Deferred(Box::new(McpTaskHandle::from_create_result(
+                    self.client.clone(),
+                    self.definition.name.to_string(),
+                    created,
+                    self.timeout,
+                    self.task_notifications.clone(),
+                    self.elicitation_available,
+                ))),
+                Err(error) => ToolDispatch::Completed(ToolResult::failed(error)),
+            }
+        })
+    }
 }
 
 /// Error type for [`McpClientHandler`] operations.
@@ -592,6 +728,16 @@ pub struct McpClientHandler {
     /// Per-call timeout applied to every MCP tool this handler registers
     /// (see issue #1914). Defaults to [`DEFAULT_MCP_TOOL_TIMEOUT`].
     timeout: Option<Duration>,
+    /// Task policy applied to every registered MCP tool.
+    task_policy: McpTaskPolicy,
+    /// Requested retention for task-augmented calls.
+    task_ttl: Option<Duration>,
+    /// Shared wakeup registry for `notifications/tasks/status`.
+    task_notifications: Arc<McpTaskNotifications>,
+    /// Handler for MCP elicitation requests.
+    elicitation: Option<Arc<dyn McpElicitationHandler>>,
+    /// Delegate for notifications Rig does not consume itself.
+    notification_delegate: Option<Arc<dyn McpNotificationDelegate>>,
     /// Deadline for initial and list-changed tool-list fetches.
     refresh_timeout: Duration,
     /// Tracks the exact registry generation installed for each tool. Refreshes
@@ -615,6 +761,11 @@ impl McpClientHandler {
             client_info,
             tool_server_handle,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            task_policy: McpTaskPolicy::Required,
+            task_ttl: None,
+            task_notifications: Arc::new(McpTaskNotifications::default()),
+            elicitation: None,
+            notification_delegate: None,
             refresh_timeout: DEFAULT_MCP_REFRESH_TIMEOUT,
             managed_tools: Arc::new(RwLock::new(ManagedToolsState::default())),
             refresh_activity: Arc::new(Mutex::new(RefreshActivity::default())),
@@ -631,15 +782,65 @@ impl McpClientHandler {
         self
     }
 
+    /// Set the task augmentation policy for every tool registered by this
+    /// handler. Defaults to [`McpTaskPolicy::Required`], preserving ordinary
+    /// calls for tools whose task support is optional.
+    pub fn with_task_policy(mut self, policy: McpTaskPolicy) -> Self {
+        self.task_policy = policy;
+        self
+    }
+
+    /// Set requested task retention for task-augmented calls.
+    pub fn with_task_ttl(mut self, ttl: impl Into<Option<Duration>>) -> Self {
+        self.task_ttl = ttl.into();
+        self
+    }
+
+    /// Register the handler for MCP elicitation requests.
+    pub fn with_elicitation_handler<H>(mut self, handler: H) -> Self
+    where
+        H: McpElicitationHandler + 'static,
+    {
+        self.elicitation = Some(Arc::new(handler));
+        self
+    }
+
+    /// Register a delegate for notifications not otherwise projected by Rig.
+    pub fn with_notification_delegate<D>(mut self, delegate: D) -> Self
+    where
+        D: McpNotificationDelegate + 'static,
+    {
+        self.notification_delegate = Some(Arc::new(delegate));
+        self
+    }
+
+    /// Shared task-notification registry used by this connection.
+    #[cfg(test)]
+    pub(crate) fn task_notifications(&self) -> Arc<McpTaskNotifications> {
+        self.task_notifications.clone()
+    }
+
+    /// Build a task resumer bound to this connection's peer.
+    pub fn task_resumer(&self, sink: rmcp::service::ServerSink) -> McpTaskResumer {
+        McpTaskResumer::new(sink, self.timeout)
+            .with_notifications(self.task_notifications.clone())
+            .with_elicitation_available(self.elicitation.is_some())
+    }
+
     /// Set the deadline for initial and list-changed tool-list fetches.
     pub fn with_refresh_timeout(mut self, timeout: Duration) -> Self {
         self.refresh_timeout = timeout;
         self
     }
 
-    /// Build the internal MCP adapter with this handler's configured timeout.
+    /// Build the internal MCP adapter with this handler's task and timeout policy.
     fn build_tool(&self, tool: rmcp::model::Tool, client: rmcp::service::ServerSink) -> McpTool {
-        McpTool::from_mcp_server(tool, client).with_timeout(self.timeout)
+        McpTool::from_mcp_server(tool, client)
+            .with_timeout(self.timeout)
+            .with_task_policy(self.task_policy)
+            .with_task_ttl(self.task_ttl)
+            .with_task_notifications(self.task_notifications.clone())
+            .with_elicitation_available(self.elicitation.is_some())
     }
 
     fn begin_refresh(&self) -> u64 {
@@ -778,7 +979,109 @@ impl McpClientHandler {
 
 impl rmcp::handler::client::ClientHandler for McpClientHandler {
     fn get_info(&self) -> rmcp::model::ClientInfo {
-        self.client_info.clone()
+        let mut info = self.client_info.clone();
+        if let Some(handler) = &self.elicitation {
+            info.capabilities.elicitation = Some(handler.capability());
+        }
+        info
+    }
+
+    async fn create_elicitation(
+        &self,
+        mut request: rmcp::model::ElicitRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleClient>,
+    ) -> Result<rmcp::model::ElicitResult, rmcp::ErrorData> {
+        match &self.elicitation {
+            Some(handler) => {
+                use rmcp::model::RequestParamsMeta;
+                if request.meta().is_none() && !context.meta.is_empty() {
+                    request.set_meta(context.meta.clone());
+                }
+                handler.elicit(request).await
+            }
+            None => Ok(rmcp::model::ElicitResult::new(
+                rmcp::model::ElicitationAction::Decline,
+            )),
+        }
+    }
+
+    async fn on_url_elicitation_notification_complete(
+        &self,
+        params: rmcp::model::ElicitationResponseNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(handler) = &self.elicitation {
+            handler.url_elicitation_complete(params).await;
+        }
+    }
+
+    async fn on_task_status(
+        &self,
+        params: rmcp::model::TaskStatusNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        self.task_notifications.publish(&params.task);
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_task_status(params).await;
+        }
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_progress(params).await;
+        }
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_resource_updated(params).await;
+        }
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_resource_list_changed().await;
+        }
+    }
+
+    async fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_prompt_list_changed().await;
+        }
+    }
+
+    async fn on_cancelled(
+        &self,
+        params: rmcp::model::CancelledNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_cancelled(params).await;
+        }
+    }
+
+    async fn on_custom_notification(
+        &self,
+        params: rmcp::model::CustomNotification,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_custom_notification(params).await;
+        }
     }
 
     async fn on_tool_list_changed(
@@ -807,6 +1110,10 @@ impl rmcp::handler::client::ClientHandler for McpClientHandler {
             if !self.finish_or_restart_refresh().await {
                 break;
             }
+        }
+
+        if let Some(delegate) = &self.notification_delegate {
+            delegate.on_tool_list_changed().await;
         }
     }
 }

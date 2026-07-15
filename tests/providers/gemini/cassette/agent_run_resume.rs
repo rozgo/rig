@@ -47,6 +47,9 @@ async fn resume_from_serialized_state_mid_tool_execution() {
                         assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
                     }
                     AgentRunStep::CallTools { calls } => break calls,
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => {
                         panic!("the model should call the add tool before answering: {response:?}")
                     }
@@ -114,6 +117,9 @@ async fn resume_from_serialized_state_mid_tool_execution() {
                         resumed
                             .tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
+                    }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
                     }
                     AgentRunStep::Done(response) => break response,
                 }
@@ -215,6 +221,9 @@ async fn resume_while_invalid_tool_call_awaits_resolution() {
                             .tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
                     }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
+                    }
                     AgentRunStep::Done(response) => break response,
                 }
             };
@@ -308,6 +317,9 @@ async fn resume_after_invalid_tool_call_retry_rollback() {
                         resumed
                             .tool_results(execute_pending_calls(&calls))
                             .expect("tool results should be accepted");
+                    }
+                    AgentRunStep::AwaitTasks { pending } => {
+                        panic!("this run never defers tool calls: {pending:?}")
                     }
                     AgentRunStep::Done(response) => break response,
                 }

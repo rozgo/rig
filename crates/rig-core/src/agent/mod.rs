@@ -110,6 +110,7 @@ pub mod hook;
 pub(crate) mod prompt_request;
 pub mod run;
 pub mod runner;
+pub(crate) mod task_wait;
 mod tool;
 
 /// Fallback display name used in telemetry spans and logs when an agent has no
@@ -124,7 +125,9 @@ pub use hook::{
     AgentHook, CompletionCallAction, CompletionResponse as CompletionResponseEvent, HookContext,
     HookStack, InvalidToolCallAction, InvalidToolCallContext, ModelTurnFinished, ObservationAction,
     RequestPatch, RunId, Scratchpad, StepEventKind, StreamResponseFinish, TextDelta, ToolCall,
-    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent,
+    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent, ToolTaskResultAction,
+    ToolTaskResultEvent, ToolTaskStartedAction, ToolTaskStartedEvent, ToolTaskStatusAction,
+    ToolTaskStatusEvent,
 };
 pub use prompt_request::streaming::{
     MultiTurnStreamItem, StreamingError, StreamingPromptRequest, StreamingResult, stream_to_stdout,
@@ -132,5 +135,8 @@ pub use prompt_request::streaming::{
 pub use prompt_request::{
     CompletionCall, PromptRequest, PromptResponse, TypedPromptRequest, TypedPromptResponse,
 };
-pub use run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, OutputMode, PendingToolCall};
+pub use run::{
+    AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, OutputMode, PendingTask, PendingToolCall,
+    TaskCompletionPolicy, TaskDrainPolicy, TaskResolution, ToolCallResolution,
+};
 pub use runner::AgentRunner;
