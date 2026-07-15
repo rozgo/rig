@@ -74,17 +74,7 @@ impl fmt::Debug for Authenticator {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("{0}")]
-    Message(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
-}
+pub use crate::providers::internal::auth::AuthError;
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
@@ -98,6 +88,7 @@ impl Authenticator {
         access_token_file: Option<PathBuf>,
         api_key_file: Option<PathBuf>,
         device_code_handler: DeviceCodeHandler,
+        allow_device_flow: bool,
     ) -> Self {
         Self {
             source,
@@ -105,6 +96,7 @@ impl Authenticator {
                 access_token_file,
                 api_key_file,
                 device_code_handler,
+                allow_device_flow,
             ),
             state_lock: Arc::new(Mutex::new(())),
         }

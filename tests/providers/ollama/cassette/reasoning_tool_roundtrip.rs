@@ -37,6 +37,7 @@ async fn nonstreaming() {
                 .preamble(reasoning::TOOL_SYSTEM_PROMPT)
                 .tool(WeatherTool::new(call_count.clone()))
                 .additional_params(think_params())
+                .default_max_turns(2)
                 .build();
 
             let mut chat_history = Vec::<Message>::new();
@@ -80,7 +81,7 @@ async fn streaming() {
 
         let stream = agent
             .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
-            .multi_turn(3)
+            .max_turns(3)
             .await;
 
         let stats = reasoning::collect_stream_stats(stream, "ollama").await;

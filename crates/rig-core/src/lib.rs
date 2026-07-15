@@ -93,7 +93,6 @@
 //! - ChatGPT and GitHub Copilot auth-backed clients
 //! - Cohere
 //! - DeepSeek
-//! - Galadriel
 //! - Gemini
 //! - Groq
 //! - Hugging Face
@@ -150,10 +149,6 @@ pub mod audio_generation;
 pub mod client;
 pub mod completion;
 pub mod embeddings;
-
-#[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
-pub mod evals;
 pub mod extractor;
 pub mod http_client;
 pub mod id;
@@ -177,7 +172,6 @@ pub mod streaming;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub mod test_utils;
 pub mod tool;
-pub mod tools;
 pub mod transcription;
 pub mod vector_store;
 pub mod wasm_compat;

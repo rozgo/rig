@@ -40,6 +40,7 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `discord_bot` | See source. |
 | `enum_dispatch` | See source. |
 | `extractor` | Demonstrates typed extraction and extraction with usage metadata. |
+| `force_tool_first_turn` | Demonstrates a per-turn `RequestPatch` footgun and its fix: forcing `tool_choice = Required` on *every* turn loops until `max_turns`, so an `AgentHook` gates the patch on `ctx.turn() == 1` to force the tool only up front. |
 | `gemini_deep_research` | See source. |
 | `gemini_default_api_recovery` | Demonstrates recovering from Gemini emitting a legacy `default_api` tool name. |
 | `gemini_extractor_with_rag` | See source. |
@@ -67,6 +68,7 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `rmcp_elicitation_example` | MCP elicitation: a background task pauses in `input_required` and asks the human (stdin, fail-closed) for input the final answer incorporates. |
 | `sentiment_classifier` | Demonstrates the smallest typed extractor for classification. |
 | `transcription` | See source. |
+| `tool_result_outcomes` | Demonstrates structured disk (`Other`/`EIO`) and network (`Network`/`ENETUNREACH`) tool failures, a run-scoped scratchpad ledger, and ordered recorder/policy hooks that terminate fatal failures while returning recoverable feedback to the model. Run `cargo run -p tool_result_outcomes -- --help` for credential-free usage. |
 | `vector_search_cohere` | Demonstrates vector search with separate Cohere document and query embeddings. |
 | `vector_search_ollama` | Demonstrates vector search against a local Ollama embedding model. |
 | `vector_search` | Demonstrates embedding documents and querying an in-memory vector index with OpenAI. |

@@ -6,6 +6,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.39.0...rig-core-v0.40.0) - 2026-07-10
+
+### Added
+
+- *(core)* expand rig::prelude to cover the everyday API surface ([#2057](https://github.com/0xPlaygrounds/rig/pull/2057)) (by @gold-silver-copper)
+- *(tool)* [**breaking**] structured tool-execution results ([#2015](https://github.com/0xPlaygrounds/rig/pull/2015)) (by @gold-silver-copper)
+- *(agent)* [**breaking**] hook system v2 — composable middleware ([#2012](https://github.com/0xPlaygrounds/rig/pull/2012)) (by @gold-silver-copper)
+- *(ollama)* Extend `think` options with `max` ([#1982](https://github.com/0xPlaygrounds/rig/pull/1982)) (by @m-dreiling)
+- *(examples)* human-in-the-loop tool-call approval — examples + tests ([#1967](https://github.com/0xPlaygrounds/rig/pull/1967)) (by @gold-silver-copper)
+- *(rig-core)* steer the model request per turn from a hook via Flow::OverrideRequest ([#1966](https://github.com/0xPlaygrounds/rig/pull/1966)) (by @gold-silver-copper)
+- *(rig-core)* rewrite tool results from a hook via Flow::RewriteResult ([#1965](https://github.com/0xPlaygrounds/rig/pull/1965)) (by @gold-silver-copper)
+- *(rig-core)* rewrite tool-call arguments from a hook via Flow::RewriteArgs ([#1963](https://github.com/0xPlaygrounds/rig/pull/1963)) (by @gold-silver-copper)
+- *(rig-core)* concurrent tool execution in the streaming driver (parity with blocking tool_concurrency) ([#1957](https://github.com/0xPlaygrounds/rig/pull/1957)) (by @gold-silver-copper)
+- *(rig-core)* ToolCallExtensions — per-call tool context through the agent loop, MCP & sub-agents (supersedes #1537, #1953) ([#1954](https://github.com/0xPlaygrounds/rig/pull/1954)) (by @gold-silver-copper)
+- *(openai)* preserve responses prompt cache parameters ([#1830](https://github.com/0xPlaygrounds/rig/pull/1830)) (by @Kade-Powell)
+- *(streaming)* [**breaking**] surface unmodeled provider output items through the stream ([#1951](https://github.com/0xPlaygrounds/rig/pull/1951)) (by @gold-silver-copper)
+- *(openai-responses)* [**breaking**] preserve unknown Output payloads ([#1950](https://github.com/0xPlaygrounds/rig/pull/1950)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] integrate hooks into AgentRun via a composable AgentRunner ([#1945](https://github.com/0xPlaygrounds/rig/pull/1945)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] broaden provider error-response inspection workspace-wide ([#1944](https://github.com/0xPlaygrounds/rig/pull/1944)) (by @gold-silver-copper)
+- *(message)* add video helper constructors + OpenRouter audio/video conversion tests ([#1942](https://github.com/0xPlaygrounds/rig/pull/1942)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] expose provider error response inspection ([#1859](https://github.com/0xPlaygrounds/rig/pull/1859)) (by @Shaurya-Sethi)
+- *(agent)* add OutputMode to compose structured output with tools ([#1928](https://github.com/0xPlaygrounds/rig/pull/1928)) ([#1929](https://github.com/0xPlaygrounds/rig/pull/1929)) (by @gold-silver-copper)
+
+### Fixed
+
+- *(telemetry)* keep GenAI message span fields empty ([#2066](https://github.com/0xPlaygrounds/rig/pull/2066)) (by @gold-silver-copper)
+- *(chatgpt)* preserve non-success response errors ([#2053](https://github.com/0xPlaygrounds/rig/pull/2053)) (by @gold-silver-copper)
+- *(chatgpt)* fallback on empty SSE output ([#2001](https://github.com/0xPlaygrounds/rig/pull/2001)) (by @gold-silver-copper)
+- *(openai)* preserve reasoning text content ([#1999](https://github.com/0xPlaygrounds/rig/pull/1999)) (by @gold-silver-copper)
+- preserve OpenAI Responses instructions ([#1995](https://github.com/0xPlaygrounds/rig/pull/1995)) (by @gold-silver-copper) - #1995
+- *(openai)* accept null Responses metadata ([#1993](https://github.com/0xPlaygrounds/rig/pull/1993)) (by @gold-silver-copper)
+- *(gemini)* tolerate omitted proto defaults ([#1984](https://github.com/0xPlaygrounds/rig/pull/1984)) (by @gold-silver-copper)
+- *(openai)* make Responses API strict tools opt-in ([#1991](https://github.com/0xPlaygrounds/rig/pull/1991)) (by @gold-silver-copper)
+- *(ollama)* omit `think` when unset so the model default applies ([#1990](https://github.com/0xPlaygrounds/rig/pull/1990)) (by @SarthakB11)
+- *(agent)* stream concurrent tool results as they complete ([#1981](https://github.com/0xPlaygrounds/rig/pull/1981)) (by @gold-silver-copper)
+- *(anthropic)* deserialize explicit null citations as empty vec ([#1972](https://github.com/0xPlaygrounds/rig/pull/1972)) (by @CharmingGroot)
+- *(anthropic)* coerce tool_use.input to an object at the send boundary ([#1964](https://github.com/0xPlaygrounds/rig/pull/1964)) (by @wey-gu)
+- *(openai-compat)* normalize evicted tool-call string arguments to an object ([#1958](https://github.com/0xPlaygrounds/rig/pull/1958)) (by @wey-gu)
+- *(rig-core)* fix epub loader tests + prevent CWD-relative fixture-path regressions ([#1940](https://github.com/0xPlaygrounds/rig/pull/1940)) (by @gold-silver-copper)
+- *(gemini)* default totalTokenCount to avoid deser crash on empty generations ([#1936](https://github.com/0xPlaygrounds/rig/pull/1936)) (by @gold-silver-copper)
+- *(ollama)* preserve assistant reasoning from non-streaming responses ([#1926](https://github.com/0xPlaygrounds/rig/pull/1926)) ([#1927](https://github.com/0xPlaygrounds/rig/pull/1927)) (by @gold-silver-copper)
+
+### Other
+
+- Remove unused derive and core APIs ([#2087](https://github.com/0xPlaygrounds/rig/pull/2087)) (by @gold-silver-copper) - #2087
+- Remove unused stream completion stdout helper ([#2085](https://github.com/0xPlaygrounds/rig/pull/2085)) (by @gold-silver-copper) - #2085
+- Remove unused generation wrapper traits ([#2083](https://github.com/0xPlaygrounds/rig/pull/2083)) (by @gold-silver-copper) - #2083
+- Remove unused Anthropic decoders ([#2082](https://github.com/0xPlaygrounds/rig/pull/2082)) (by @gold-silver-copper) - #2082
+- *(agent)* [**breaking**] unify PromptResponse and FinalResponse into one type ([#2056](https://github.com/0xPlaygrounds/rig/pull/2056)) (by @gold-silver-copper)
+- *(core)* [**breaking**] API paper cuts — duplicate names, hand-copied setters, dead types ([#2055](https://github.com/0xPlaygrounds/rig/pull/2055)) (by @gold-silver-copper)
+- *(openrouter)* use generic completion model ([#2054](https://github.com/0xPlaygrounds/rig/pull/2054)) (by @gold-silver-copper)
+- *(anthropic)* cover ANTHROPIC_BASE_URL from_env ([#2051](https://github.com/0xPlaygrounds/rig/pull/2051)) (by @gold-silver-copper)
+- *(auth)* add non-interactive oauth cassette coverage ([#2050](https://github.com/0xPlaygrounds/rig/pull/2050)) (by @gold-silver-copper)
+- *(providers)* [**breaking**] remove galadriel provider ([#2041](https://github.com/0xPlaygrounds/rig/pull/2041)) (by @gold-silver-copper)
+- *(providers)* [**breaking**] collapse remaining providers onto GenericCompletionModel<Ext> (#2035 phases 2–4) ([#2040](https://github.com/0xPlaygrounds/rig/pull/2040)) (by @gold-silver-copper)
+- *(providers)* [**breaking**] migrate llamafile onto GenericCompletionModel<Ext> (#2035 phase 1) ([#2038](https://github.com/0xPlaygrounds/rig/pull/2038)) (by @gold-silver-copper)
+- *(core)* [**breaking**] delete unused evals module and experimental feature flag ([#2036](https://github.com/0xPlaygrounds/rig/pull/2036)) (by @gold-silver-copper)
+- Flatten Tool metadata API ([#2029](https://github.com/0xPlaygrounds/rig/pull/2029)) (by @gold-silver-copper) - #2029
+- Add Groq agent tool cassette regressions ([#2011](https://github.com/0xPlaygrounds/rig/pull/2011)) (by @gold-silver-copper) - #2011
+- Add Mistral agent tool cassette regressions ([#2010](https://github.com/0xPlaygrounds/rig/pull/2010)) (by @gold-silver-copper) - #2010
+- Add DeepSeek agent tool cassette regressions ([#2009](https://github.com/0xPlaygrounds/rig/pull/2009)) (by @gold-silver-copper) - #2009
+- Add xAI agent tool cassette regressions ([#2008](https://github.com/0xPlaygrounds/rig/pull/2008)) (by @gold-silver-copper) - #2008
+- *(openai)* production-grade Responses API cassette suite + tool_choice and replay-ID fixes ([#2002](https://github.com/0xPlaygrounds/rig/pull/2002)) (by @gold-silver-copper)
+- *(providers)* add provider implementation checklist ([#1997](https://github.com/0xPlaygrounds/rig/pull/1997)) (by @gold-silver-copper)
+- Fix provider ClientBuilder API key aliases ([#1996](https://github.com/0xPlaygrounds/rig/pull/1996)) (by @gold-silver-copper) - #1996
+- Release-N cleanup: correctness fixes + dead-code removal ([#1987](https://github.com/0xPlaygrounds/rig/pull/1987)) (by @gold-silver-copper) - #1987
+- *(agent)* unify streaming/non-streaming seams; fix Anthropic streaming output_schema drop ([#1986](https://github.com/0xPlaygrounds/rig/pull/1986)) (by @gold-silver-copper)
+- *(agent)* unify the streaming and non-streaming drivers over one engine ([#1985](https://github.com/0xPlaygrounds/rig/pull/1985)) (by @gold-silver-copper)
+- *(openai-compat)* genuinely exercise the #1958 tool-call eviction string-leak (+ live cassette) ([#1962](https://github.com/0xPlaygrounds/rig/pull/1962)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] remove the experimental pipeline module ([#1941](https://github.com/0xPlaygrounds/rig/pull/1941)) (by @gold-silver-copper)
+- *(rig-core)* replace nanoid with fastrand for internal IDs ([#1938](https://github.com/0xPlaygrounds/rig/pull/1938)) (by @gold-silver-copper)
+
+### Contributors
+
+* @gold-silver-copper
+* @SarthakB11
+* @m-dreiling
+* @CharmingGroot
+* @wey-gu
+* @Kade-Powell
+* @Shaurya-Sethi
+
+### Changed
+
+- *(agent)* [**breaking**] `max_turns` and `default_max_turns` now bound the exact total number of model calls, including the initial call, tool continuations, and retries. A budget of `0` makes no model call, while `1` permits only the initial call. Unconfigured tool-then-answer flows now need an explicit total budget of `2`. To preserve the former maximum allowance of an explicit old budget `n`, account for the old effective `n + 2` calls; otherwise, set the intended literal total.
+- *(agent)* [**breaking**] unify the blocking and streaming agent-run result types into a single [`PromptResponse`](https://docs.rs/rig-core/latest/rig_core/agent/struct.PromptResponse.html) ([#2046](https://github.com/0xPlaygrounds/rig/issues/2046)). The streaming surface previously returned a separate `FinalResponse` carrying the same run result under different names; it is removed and the terminal `MultiTurnStreamItem::FinalResponse` item now carries `PromptResponse`. One vocabulary works on both surfaces — `output`/`output()`, `usage`/`usage()`, `messages`/`messages()`, `completion_calls`/`completion_calls()`, and `content`/`content()` — and blocking callers gain the structured final-turn `content` for free. Migration: `FinalResponse` → `PromptResponse`, `.response()` → `.output()`, `.history()` → `.messages()`, `.aggregated_usage`/`assistant_content()` are gone (`.usage()`/`.content()`). The streamed `FinalResponse` stream item now serializes its fields as `snake_case` (matching the blocking type and the sibling `CompletionCall`) rather than `camelCase`.
+- *(core)* [**breaking**] API paper-cut cleanups — collapse duplicate public names onto one canonical spelling per concept ([#2047](https://github.com/0xPlaygrounds/rig/issues/2047)):
+  - `StreamingPromptRequest::multi_turn` is removed; use `max_turns`, matching the blocking `PromptRequest`/`TypedPromptRequest` builders.
+  - The earlier low-level streaming stdout helper rename is superseded by the removal noted below; the high-level `agent::stream_to_stdout` helper (which drives a `StreamingResult`) remains unchanged.
+  - The built-in `ThinkTool` moves from `rig::tools` to `rig::tool::builtin`; the one-line `tools` module is removed.
+  - `StreamingPromptRequest`'s forwarding setters (`tool_extensions`, `history`, `conversation`, `without_memory`, `max_invalid_tool_call_retries`) are now generated by the shared `forward_prompt_setters!` macro instead of hand-copied, removing a drift risk (no API change).
+  - The materially identical `AuthError` enums under `providers/chatgpt/auth` and `providers/copilot/auth` are unified into a single shared type (re-exported from each provider's `auth` module; no API change).
+  - Dead code removed: the never-constructed Gemini embedding request structs (`EmbedContentRequest` and friends; the live response types are kept), commented-out lines in the OpenAI Responses API, and a placeholder tool-result error string replaced with a descriptive message (no API change).
+- *(tool)* [**breaking**] flatten `Tool` and `ToolDyn`: tool implementations now provide `description()` and `parameters()` directly, while provider-facing `ToolDefinition`s are generated at registration/request boundaries. `Tool::definition(prompt)` and `ToolDyn::definition(prompt)` are removed, and the registered `Tool::NAME` / `Tool::name()` / `ToolDyn::name()` is the only advertised dispatch identity.
+
+### Removed
+
+- *(core)* [**breaking**] remove unused `Extractor::{get_inner, into_inner}` and the always-failing `TryFrom<String> for Nothing`; no direct replacements are provided.
+- *(core)* [**breaking**] remove the unused public `streaming::stream_completion_to_stdout` helper; use the high-level `agent::stream_to_stdout` helper instead.
+- *(core)* [**breaking**] remove the unused public `AudioGeneration<M>`, `ImageGeneration<M>`, and `Transcription<M>` wrapper traits; use the corresponding `AudioGenerationModel`, `ImageGenerationModel`, and `TranscriptionModel` APIs and request builders directly.
+- *(anthropic)* [**breaking**] remove the unused public `providers::anthropic::decoders` module; Anthropic streaming uses the shared SSE machinery.
 
 ### Added
 
@@ -34,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Dispatch boundary.** `ToolDyn` gains `call_structured` (with a default that wraps `call`), threaded through `ToolType`, `ToolSet::call_structured`, and `ToolServerHandle::call_tool_structured`; the agent loop drives this structured path in the shared `run_single_tool`, so blocking and streaming observe identical outcomes. MCP tools classify a per-call timeout as `Timeout`, a transport error as `Provider`, and a tool-reported error as `Other` (`McpToolError` now carries a `ToolFailureKind`).
   - **Hooks.** `StepEvent::ToolResult` gains `outcome: &ToolOutcome` and `extensions: &ToolResultExtensions` alongside `result`. A `Flow::RewriteResult` still rewrites only the model-visible `result`; the raw `outcome`/`extensions` are unaffected, so a redaction hook cannot mask the true outcome from a later policy hook. **Behavioral changes:** `Flow::Skip` now fires `StepEvent::ToolResult` with a `Skipped` outcome (previously a skipped tool fired no result hook), so result hooks and denial-logging policies observe skips; and a tool error's model-visible text is now the tool's own error `Display` (formatted at the boundary) rather than the previous triple-wrapped `Toolset error: ToolCallError: ToolCallError: …` string. Because fields were added to the `#[non_exhaustive]` `ToolResult` variant, an exhaustive destructure must add `..` (or the new fields).
 - *(agent)* concurrent tool execution on the **streaming** driver, gated behind the existing `tool_concurrency(n)` knob (default `1` = unchanged), bringing it to parity with the blocking path. `tool_concurrency(n)` is now exposed on `StreamingPromptRequest` (alongside `PromptRequest`/`AgentRunner`). A turn with several independent slow tools (HTTP/MCP) now finishes in ≈`max` rather than ≈`sum` under streaming. A turn's `ToolCall` items are emitted in call order, then — once the whole tool batch settles — the per-tool `ToolExecutionStart` + `ToolResult` items are surfaced in call order; persisted message history is deterministic in call order and matches the blocking driver (see the atomic per-batch commit/surface note above). ([#1955](https://github.com/0xPlaygrounds/rig/issues/1955), closes [#1872](https://github.com/0xPlaygrounds/rig/issues/1872))
+- *(core)* `rig::prelude` now re-exports the everyday API surface — not just the provider-client traits — so a basic agent or RAG program compiles with `use rig::prelude::*` plus its provider module and nothing else. Added (all additive re-exports, non-breaking): `Agent`; the completion traits/types `Prompt`, `Chat`, `Completion`, `CompletionModel`, `Message`, `PromptError`, `CompletionError`; the streaming traits `StreamingPrompt`/`StreamingChat` and stream items `MultiTurnStreamItem`/`StreamingResult`; the embedding surface `Embed`, `EmbeddingModel`, `EmbeddingsBuilder`; the tool types `Tool`/`ToolSet`; the vector-store surface `VectorStoreIndex`, `InMemoryVectorStore`, `VectorSearchRequest`; and `OneOrMany`. Deliberately scoped to the common path — advanced surfaces (the hook system, run-loop stepping types, message content blocks, tool-authoring internals, extraction/loaders/memory) stay explicit imports from their modules. The `agent`, `vector_search`, and `agent_stream_chat` examples are updated to demonstrate it. ([#2044](https://github.com/0xPlaygrounds/rig/issues/2044))
 
 ### Changed
 

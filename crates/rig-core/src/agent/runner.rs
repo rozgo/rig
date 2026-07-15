@@ -348,7 +348,7 @@ where
         Self {
             prompt: prompt.into(),
             chat_history: None,
-            max_turns: agent.default_max_turns.unwrap_or_default(),
+            max_turns: agent.default_max_turns.unwrap_or(1),
             max_invalid_tool_call_retries: 0,
             model: agent.model.clone(),
             agent_name: agent.name.clone(),
@@ -395,10 +395,11 @@ impl<M> AgentRunner<M>
 where
     M: CompletionModel,
 {
-    /// Set the maximum multi-turn depth (tool-calling rounds before a final
-    /// answer). Exceeding it returns [`PromptError::MaxTurnsError`].
-    pub fn max_turns(mut self, depth: usize) -> Self {
-        self.max_turns = depth;
+    /// Set the total model-call budget, including the initial call and every
+    /// retry or continuation. Zero emits no model calls; one permits only the
+    /// initial call. Exceeding the budget returns [`PromptError::MaxTurnsError`].
+    pub fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = max_turns;
         self
     }
 
@@ -463,7 +464,7 @@ where
     }
 
     /// Set the retry budget for invalid tool-call recovery. Invalid tool-call
-    /// retries also consume normal multi-turn depth.
+    /// retries also consume the total model-call budget.
     pub fn max_invalid_tool_call_retries(mut self, retries: usize) -> Self {
         self.max_invalid_tool_call_retries = retries;
         self
@@ -1355,9 +1356,9 @@ mod tests {
     };
     use crate::agent::prompt_request::streaming::{MultiTurnStreamItem, StreamingError};
     use crate::agent::run::OutputMode;
-    use crate::completion::{CompletionModel, Message, PromptError, ToolDefinition};
+    use crate::completion::{CompletionModel, Message, Prompt, PromptError};
     use crate::message::{AssistantContent, ToolCall, ToolChoice, ToolFunction, UserContent};
-    use crate::streaming::{StreamedAssistantContent, StreamedUserContent};
+    use crate::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
     use crate::test_utils::{
         MockAddTool, MockBarrierTool, MockCompletionModel, MockOperationArgs, MockStreamEvent,
         MockSubtractTool, MockToolError, MockTurn,
@@ -1445,6 +1446,85 @@ mod tests {
         ])
     }
 
+    /// `AgentRunner::from_agent` preserves the distinction between an absent
+    /// agent default (the implicit one-call budget) and an explicit zero budget.
+    #[tokio::test]
+    async fn from_agent_preserves_implicit_one_and_explicit_zero_budgets() {
+        let implicit_model = blocking_model();
+        let implicit_recorded = implicit_model.clone();
+        let implicit_agent = AgentBuilder::new(implicit_model).tool(MockAddTool).build();
+        let implicit_runner = super::AgentRunner::from_agent(&implicit_agent, "add 2 and 3");
+        assert_eq!(implicit_runner.max_turns, 1);
+
+        let implicit_err = implicit_runner
+            .run()
+            .await
+            .expect_err("implicit budget should reject the second model call");
+        assert!(matches!(
+            implicit_err,
+            PromptError::MaxTurnsError { max_turns: 1, .. }
+        ));
+        assert_eq!(implicit_recorded.request_count(), 1);
+
+        let zero_model = MockCompletionModel::text("should not be requested");
+        let zero_recorded = zero_model.clone();
+        let zero_agent = AgentBuilder::new(zero_model).default_max_turns(0).build();
+        let zero_runner = super::AgentRunner::from_agent(&zero_agent, "do not call");
+        assert_eq!(zero_runner.max_turns, 0);
+
+        let zero_err = zero_runner
+            .run()
+            .await
+            .expect_err("explicit zero budget should reject the initial model call");
+        assert!(matches!(
+            zero_err,
+            PromptError::MaxTurnsError { max_turns: 0, .. }
+        ));
+        assert_eq!(zero_recorded.request_count(), 0);
+    }
+
+    /// The public blocking and streaming prompt surfaces enforce the one-call
+    /// boundary identically after executing a tool-producing first turn.
+    #[tokio::test]
+    async fn prompt_surfaces_reject_second_tool_roundtrip_request_at_budget_one() {
+        let blocking_model = blocking_model();
+        let blocking_recorded = blocking_model.clone();
+        let blocking_agent = AgentBuilder::new(blocking_model).tool(MockAddTool).build();
+        let blocking_err = blocking_agent
+            .prompt("add 2 and 3")
+            .max_turns(1)
+            .await
+            .expect_err("blocking prompt should reject request two");
+        assert!(matches!(
+            blocking_err,
+            PromptError::MaxTurnsError { max_turns: 1, .. }
+        ));
+        assert_eq!(blocking_recorded.request_count(), 1);
+
+        let streaming_model = streaming_model();
+        let streaming_recorded = streaming_model.clone();
+        let streaming_agent = AgentBuilder::new(streaming_model).tool(MockAddTool).build();
+        let mut stream = streaming_agent
+            .stream_prompt("add 2 and 3")
+            .max_turns(1)
+            .await;
+        let mut streaming_err = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                streaming_err = Some(err);
+                break;
+            }
+        }
+        match streaming_err {
+            Some(StreamingError::Prompt(err)) => assert!(matches!(
+                *err,
+                PromptError::MaxTurnsError { max_turns: 1, .. }
+            )),
+            other => panic!("expected streaming max-turns error, got {other:?}"),
+        }
+        assert_eq!(streaming_recorded.request_count(), 1);
+    }
+
     /// run() and stream() of the same tool-calling scenario produce the same
     /// final output, the same final message history, the same tool-result
     /// content, and the same medium-independent hook event sequence.
@@ -1455,7 +1535,7 @@ mod tests {
             .tool(MockAddTool)
             .build()
             .runner("add 2 and 3")
-            .max_turns(3)
+            .max_turns(2)
             .add_hook(blocking_hook.clone())
             .run()
             .await
@@ -1468,7 +1548,7 @@ mod tests {
             .tool(MockAddTool)
             .build()
             .runner("add 2 and 3")
-            .max_turns(3)
+            .max_turns(2)
             .add_hook(streaming_hook.clone())
             .stream()
             .await;
@@ -1485,7 +1565,7 @@ mod tests {
 
         // Same final output.
         assert_eq!(blocking.output, "the answer is 5");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
 
         // Same medium-independent hook event sequence (model call, tool call,
         // tool result, second model call).
@@ -1510,7 +1590,7 @@ mod tests {
         // Same final message history (compared via serialized form to normalize).
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -2509,12 +2589,12 @@ mod tests {
             type Error = crate::test_utils::MockToolError;
             type Args = serde_json::Value;
             type Output = String;
-            async fn definition(&self, _prompt: String) -> crate::completion::ToolDefinition {
-                crate::completion::ToolDefinition {
-                    name: Self::NAME.to_string(),
-                    description: "returns a secret".to_string(),
-                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
-                }
+            fn description(&self) -> String {
+                "returns a secret".to_string()
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
             }
             async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
                 Ok("SUPER_SECRET_TOKEN_42".to_string())
@@ -2700,7 +2780,7 @@ mod tests {
 
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -2726,8 +2806,12 @@ mod tests {
         type Args = MockOperationArgs;
         type Output = i32;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            MockAddTool.definition(String::new()).await
+        fn description(&self) -> String {
+            MockAddTool.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            MockAddTool.parameters()
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -2793,7 +2877,7 @@ mod tests {
     /// its final response.
     async fn drive_to_final_response<R: Send + 'static>(
         mut stream: crate::agent::prompt_request::streaming::StreamingResult<R>,
-    ) -> crate::agent::prompt_request::streaming::FinalResponse {
+    ) -> crate::agent::prompt_request::PromptResponse {
         let mut final_response = None;
         while let Some(item) = stream.next().await {
             if let MultiTurnStreamItem::FinalResponse(resp) =
@@ -2869,7 +2953,7 @@ mod tests {
 
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -2916,7 +3000,7 @@ mod tests {
         .await
         .expect("streamed tools must run concurrently, not deadlock on the first call");
 
-        let messages = final_response.history().expect("history").to_vec();
+        let messages = final_response.messages().expect("history").to_vec();
         // History stays in call order (tc1 then tc2), even though tc2 finished first.
         assert_eq!(
             tool_result_ids(&messages),
@@ -2978,7 +3062,7 @@ mod tests {
         );
         let final_response = final_response.expect("stream should yield a final response");
         assert_eq!(
-            tool_result_ids(final_response.history().expect("history")),
+            tool_result_ids(final_response.messages().expect("history")),
             vec!["tc1".to_string(), "tc2".to_string()]
         );
     }
@@ -3118,8 +3202,12 @@ mod tests {
         type Args = serde_json::Value;
         type Output = i32;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            MockAddTool.definition(String::new()).await
+        fn description(&self) -> String {
+            MockAddTool.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            MockAddTool.parameters()
         }
 
         async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -3429,8 +3517,12 @@ mod tests {
         type Args = serde_json::Value;
         type Output = i32;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            MockAddTool.definition(String::new()).await
+        fn description(&self) -> String {
+            MockAddTool.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            MockAddTool.parameters()
         }
 
         async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -3567,8 +3659,12 @@ mod tests {
         type Error = MockToolError;
         type Args = serde_json::Value;
         type Output = i32;
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            MockAddTool.definition(String::new()).await
+        fn description(&self) -> String {
+            MockAddTool.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            MockAddTool.parameters()
         }
         async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
             if args.get("x").and_then(serde_json::Value::as_i64) == Some(1) {
@@ -3791,7 +3887,7 @@ mod tests {
         );
         let final_response = final_response.expect("stream should yield a final response");
         // The skip result is committed to history (the model sees the reason).
-        let history = final_response.history().expect("history");
+        let history = final_response.messages().expect("history");
         assert!(
             history.iter().any(|m| serde_json::to_string(m)
                 .map(|s| s.contains("blocked by policy"))
@@ -3924,8 +4020,12 @@ mod tests {
         type Args = MockOperationArgs;
         type Output = i32;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            MockAddTool.definition(String::new()).await
+        fn description(&self) -> String {
+            MockAddTool.description()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            MockAddTool.parameters()
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -4231,7 +4331,7 @@ mod tests {
 
         // Same recovered output.
         assert_eq!(blocking.output, "the answer is 5");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
 
         // Both drivers reported the invalid tool call to the hook, then executed
         // the repaired tool, so the shared event sequences match.
@@ -4251,7 +4351,7 @@ mod tests {
         // Same final message history.
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -4419,9 +4519,9 @@ mod tests {
         let final_response =
             final_response.expect("streaming scenario should yield a final response");
         ParityOutcome {
-            output: final_response.response().to_string(),
+            output: final_response.output().to_string(),
             messages: final_response
-                .history()
+                .messages()
                 .expect("streaming history")
                 .to_vec(),
             shared_events: hook.shared_events(),
@@ -4584,7 +4684,7 @@ mod tests {
             final_response.expect("stream should recover and yield a final response");
 
         assert_eq!(blocking.output, "acknowledged");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
         assert_eq!(
             blocking_hook.shared_events(),
             streaming_hook.shared_events()
@@ -4598,7 +4698,7 @@ mod tests {
 
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -4823,7 +4923,7 @@ mod tests {
         let final_response = final_response.expect("stream should yield a final response");
 
         assert_eq!(blocking.output, "acknowledged");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
         assert_eq!(
             blocking_hook.shared_events(),
             streaming_hook.shared_events()
@@ -4840,7 +4940,7 @@ mod tests {
 
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -4963,7 +5063,7 @@ mod tests {
         // model's emitted 2 + 3 = 5 — on both drivers.
         assert_eq!(blocking_hook.tool_results(), vec!["42".to_string()]);
         assert_eq!(blocking.output, "acknowledged");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
         assert_eq!(
             blocking_hook.shared_events(),
             streaming_hook.shared_events()
@@ -5075,7 +5175,7 @@ mod tests {
         let final_response = final_response.expect("stream should yield a final response");
 
         assert_eq!(blocking.output, "acknowledged");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
 
         // The ToolResult event observes the tool's ACTUAL output (5) on both
         // drivers — the replacement is applied after the event fires.
@@ -5086,7 +5186,7 @@ mod tests {
         // byte-identical across drivers.
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -5546,7 +5646,7 @@ mod tests {
             "the overridden history reaches the provider on the streaming surface too"
         );
         assert!(
-            !messages_have_sentinel(final_response.history().expect("history")),
+            !messages_have_sentinel(final_response.messages().expect("history")),
             "the persisted transcript is untouched by the per-turn history override on \
              the streaming surface too"
         );
@@ -5776,12 +5876,12 @@ mod tests {
         type Args = serde_json::Value;
         type Output = String;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: "A real tool sharing the default output-tool name".to_string(),
-                parameters: json!({ "type": "object", "properties": {} }),
-            }
+        fn description(&self) -> String {
+            "A real tool sharing the default output-tool name".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": {} })
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -5942,7 +6042,7 @@ mod tests {
     /// A structured-output Tool-mode output-tool call finalizes the run directly, so
     /// on the streaming surface it is **not** re-emitted as a complete
     /// `StreamAssistantItem(StreamedAssistantContent::ToolCall)` item (it bypasses
-    /// `drive_tool_calls`); its structured result is surfaced in the `FinalResponse`.
+    /// `drive_tool_calls`); its structured result is surfaced in the final `PromptResponse`.
     /// Guards the narrowed `StreamAssistantItem` contract.
     #[tokio::test]
     async fn output_tool_finalization_emits_no_complete_tool_call_stream_item() {
@@ -5969,7 +6069,7 @@ mod tests {
                     saw_complete_output_tool_call = true;
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {
-                    final_has_output = res.response().contains("done");
+                    final_has_output = res.output().contains("done");
                 }
                 _ => {}
             }
@@ -6159,7 +6259,7 @@ mod tests {
         );
 
         assert_eq!(blocking.output, "done");
-        assert_eq!(final_response.response(), blocking.output);
+        assert_eq!(final_response.output(), blocking.output);
         assert_eq!(
             blocking_recorder.shared_events(),
             streaming_recorder.shared_events()
@@ -6170,7 +6270,7 @@ mod tests {
         // 101 (not the model's 1 + 1 = 2).
         let blocking_messages = blocking.messages.expect("blocking messages");
         let streaming_messages = final_response
-            .history()
+            .messages()
             .expect("streaming history")
             .to_vec();
         assert_eq!(
@@ -6235,7 +6335,7 @@ mod tests {
             match item {
                 Err(err) => stream_error = Some(format!("{err}")),
                 Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
-                    panic!("aborted stream must not finalize, got: {}", resp.response())
+                    panic!("aborted stream must not finalize, got: {}", resp.output())
                 }
                 Ok(_) => {}
             }
@@ -6556,11 +6656,11 @@ mod task_driver_tests {
         assert_eq!(immediate.as_deref(), Some("crunching"));
         let final_response = final_response.expect("final response");
         assert_eq!(
-            final_response.response(),
+            final_response.output(),
             "final answer with background result"
         );
         let serialized =
-            serde_json::to_string(&final_response.history().expect("history")).expect("history");
+            serde_json::to_string(&final_response.messages().expect("messages")).expect("messages");
         assert!(
             serialized.contains("Background task update"),
             "the drained result must be injected as a labeled notice"

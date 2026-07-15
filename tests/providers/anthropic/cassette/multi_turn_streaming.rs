@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rig::client::CompletionClient;
-use rig::completion::ToolDefinition;
 use rig::providers::anthropic;
 use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
@@ -42,13 +41,12 @@ impl Tool for Add {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: serde_json::to_value(schema_for!(OperationArgs))
-                .expect("schema should serialize"),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(OperationArgs)).expect("schema should serialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -73,13 +71,12 @@ impl Tool for Subtract {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: serde_json::to_value(schema_for!(OperationArgs))
-                .expect("schema should serialize"),
-        }
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(OperationArgs)).expect("schema should serialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -104,13 +101,12 @@ impl Tool for Multiply {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "multiply".to_string(),
-            description: "Compute the product of x and y (i.e.: x * y).".to_string(),
-            parameters: serde_json::to_value(schema_for!(OperationArgs))
-                .expect("schema should serialize"),
-        }
+    fn description(&self) -> String {
+        "Compute the product of x and y (i.e.: x * y).".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(OperationArgs)).expect("schema should serialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -135,13 +131,12 @@ impl Tool for Divide {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "divide".to_string(),
-            description: "Compute the quotient of x and y.".to_string(),
-            parameters: serde_json::to_value(schema_for!(OperationArgs))
-                .expect("schema should serialize"),
-        }
+    fn description(&self) -> String {
+        "Compute the quotient of x and y.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(OperationArgs)).expect("schema should serialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -171,7 +166,7 @@ async fn multi_turn_streaming_tools() {
 
             let mut stream = agent
                 .stream_prompt(MULTI_TURN_STREAMING_PROMPT)
-                .multi_turn(10)
+                .max_turns(10)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -187,7 +182,7 @@ async fn multi_turn_streaming_tools() {
             assert_eq!(
                 observation.final_response_text.as_deref(),
                 Some(observation.final_turn_text.as_str()),
-                "FinalResponse.response() should match the final turn's streamed text"
+                "FinalResponse.output() should match the final turn's streamed text"
             );
             assert!(
                 observation.tool_results >= 4,

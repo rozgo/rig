@@ -23,7 +23,7 @@ use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{ToolDefinition, Usage};
+use rig::completion::Usage;
 use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rig::tool::Tool;
@@ -50,21 +50,21 @@ impl Tool for ProjectStatusTool {
     type Args = ProjectStatusArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Look up the current status for an internal project ticket.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ticket": {
-                        "type": "string",
-                        "description": "The internal project ticket to look up"
-                    }
-                },
-                "required": ["ticket"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Look up the current status for an internal project ticket.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "The internal project ticket to look up"
+                }
+            },
+            "required": ["ticket"]
+        })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
 
     let mut stream = agent
         .stream_prompt("Check ticket RIG-usage-42 and summarize the result in one sentence.")
-        .multi_turn(4)
+        .max_turns(4)
         .await;
 
     let mut final_response = None;
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
 
     let response = final_response.ok_or_else(|| anyhow!("stream ended without final response"))?;
 
-    println!("\n\nfinal response: {}", response.response());
+    println!("\n\nfinal response: {}", response.output());
     print_usage("aggregate agent usage", response.usage());
 
     if let Some(final_completion_call) = response.completion_calls().last().copied() {

@@ -6,7 +6,6 @@ use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, ToolChoice};
 use rig::providers::deepseek::DEEPSEEK_V4_FLASH;
 use rig::streaming::StreamingChat;
-use rig::tool::Tool;
 
 use super::support::with_deepseek_cassette;
 use crate::support::{
@@ -40,6 +39,7 @@ async fn streaming_chat_with_tools() {
                 .tool(Adder)
                 .tool(Subtract)
                 .additional_params(non_thinking_params())
+                .default_max_turns(2)
                 .build();
 
             let history: &[Message] = &[];
@@ -83,8 +83,8 @@ async fn raw_stream_surfaces_two_distinct_tool_calls_before_text() {
             let request = model
                 .completion_request(TWO_TOOL_STREAM_PROMPT)
                 .preamble(TWO_TOOL_STREAM_PREAMBLE.to_string())
-                .tool(AlphaSignal.definition(String::new()).await)
-                .tool(BetaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
+                .tool(rig::tool::tool_definition(&BetaSignal))
                 .additional_params(non_thinking_params())
                 .build();
 
@@ -121,8 +121,8 @@ async fn raw_stream_tool_call_arguments_are_objects() {
             let request = model
                 .completion_request(TWO_TOOL_STREAM_PROMPT)
                 .preamble(TWO_TOOL_STREAM_PREAMBLE.to_string())
-                .tool(AlphaSignal.definition(String::new()).await)
-                .tool(BetaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
+                .tool(rig::tool::tool_definition(&BetaSignal))
                 .additional_params(non_thinking_params())
                 .build();
 
@@ -159,7 +159,7 @@ async fn streaming_chat_surfaces_two_distinct_tool_calls_before_final_answer() {
             let history: &[Message] = &[];
             let mut stream = agent
                 .stream_chat(TWO_TOOL_STREAM_PROMPT, history)
-                .multi_turn(8)
+                .max_turns(8)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -188,7 +188,7 @@ async fn streaming_chat_emits_tool_call_before_later_text() {
             let history: &[Message] = &[];
             let mut stream = agent
                 .stream_chat(ORDERED_TOOL_STREAM_PROMPT, history)
-                .multi_turn(5)
+                .max_turns(5)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -211,7 +211,7 @@ async fn raw_followup_uses_tool_result_without_new_tool_calls() {
             let request = model
                 .completion_request(ORDERED_TOOL_STREAM_PROMPT)
                 .preamble(ORDERED_TOOL_STREAM_PREAMBLE.to_string())
-                .tool(AlphaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
                 .additional_params(non_thinking_params())
                 .build();
 

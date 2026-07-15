@@ -87,6 +87,7 @@ pub struct ChatGPTBuilder {
     auth_file: Option<PathBuf>,
     default_instructions: Option<String>,
     device_code_handler: auth::DeviceCodeHandler,
+    allow_device_flow: bool,
     originator: String,
     user_agent: Option<String>,
 }
@@ -125,6 +126,7 @@ impl Default for ChatGPTBuilder {
                     .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string()),
             ),
             device_code_handler: auth::DeviceCodeHandler::default(),
+            allow_device_flow: true,
             originator: std::env::var("CHATGPT_ORIGINATOR")
                 .ok()
                 .filter(|value| !value.is_empty())
@@ -213,6 +215,7 @@ impl ProviderBuilder for ChatGPTBuilder {
                 auth,
                 ext.auth_file.clone(),
                 ext.device_code_handler.clone(),
+                ext.allow_device_flow,
             ),
             default_instructions: ext.default_instructions.clone(),
             originator: ext.originator.clone(),
@@ -266,6 +269,19 @@ impl<H> ClientBuilder<H> {
     {
         self.over_ext(|mut ext| {
             ext.device_code_handler = auth::DeviceCodeHandler::new(handler);
+            ext
+        })
+    }
+
+    /// Control whether OAuth may fall back to an interactive device-code login
+    /// when the cached token is missing or cannot be refreshed.
+    ///
+    /// Default is `true` for CLI-style interactive use. Long-running services
+    /// should set this to `false` so a stale refresh token returns an actionable
+    /// auth error instead of printing a device code and waiting unattended.
+    pub fn allow_device_flow(self, allow: bool) -> Self {
+        self.over_ext(|mut ext| {
+            ext.allow_device_flow = allow;
             ext
         })
     }
@@ -442,7 +458,12 @@ where
             .map_err(|err| CompletionError::HttpError(err.into()))?;
 
         let response = self.client.send(req).await?;
+        let status = response.status();
         let text = http_client::text(response).await?;
+        if !status.is_success() {
+            return Err(CompletionError::from_http_response(status, text));
+        }
+
         let raw_response = responses_api::streaming::parse_sse_completion_body(&text, "ChatGPT")?;
 
         match raw_response.clone().try_into() {
@@ -796,5 +817,52 @@ data: [DONE]"#;
 
         assert_eq!(text, "hi");
         assert_eq!(response.usage.total_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn completion_http_non_success_preserves_status_and_body() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel;
+        use crate::test_utils::RecordingHttpClient;
+
+        let cases = [
+            (
+                http::StatusCode::UNAUTHORIZED,
+                r#"{"error":{"message":"expired access token","type":"invalid_request_error"}}"#,
+                "expired access token",
+            ),
+            (
+                http::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+                "rate limited",
+            ),
+        ];
+
+        for (status, body, message) in cases {
+            let http_client = RecordingHttpClient::with_error_response(status, body);
+            let client = crate::providers::chatgpt::Client::builder()
+                .api_key(ChatGPTAuth::AccessToken {
+                    access_token: "test-token".to_string(),
+                    account_id: Some("account-id".to_string()),
+                })
+                .http_client(http_client)
+                .build()
+                .expect("client should build");
+            let model = client.completion_model(GPT_5_4);
+            let request = model.completion_request("hello").build();
+
+            let error = model
+                .completion(request)
+                .await
+                .expect_err("completion should fail with non-success status");
+
+            assert!(matches!(&error, CompletionError::HttpError(_)));
+            assert_eq!(error.provider_response_status(), Some(status));
+            assert_eq!(error.provider_response_body(), Some(body));
+            assert!(
+                error.to_string().contains(message),
+                "error should include provider body: {error}"
+            );
+        }
     }
 }

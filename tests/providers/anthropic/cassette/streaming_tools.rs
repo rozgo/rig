@@ -3,7 +3,6 @@
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, StreamingError, StreamingResult};
 use rig::client::CompletionClient;
-use rig::completion::ToolDefinition;
 use rig::message::{Message, UserContent};
 use rig::providers::anthropic;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
@@ -32,6 +31,7 @@ async fn streaming_tools_smoke() {
                 .preamble(STREAMING_TOOLS_PREAMBLE)
                 .tool(Adder)
                 .tool(Subtract)
+                .default_max_turns(2)
                 .build();
 
             let mut stream = agent.stream_prompt(STREAMING_TOOLS_PROMPT).await;
@@ -59,7 +59,7 @@ async fn streaming_tools_batches_multiple_tool_results_in_one_followup_message()
 
             let mut stream = agent
                 .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .multi_turn(8)
+                .max_turns(8)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -121,7 +121,7 @@ async fn streaming_tool_concurrency_surfaces_results_in_call_order_after_batch_s
 
         let mut stream = agent
             .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-            .multi_turn(8)
+            .max_turns(8)
             .tool_concurrency(2)
             .await;
         let observation = tokio::time::timeout(
@@ -205,8 +205,12 @@ impl Tool for OutOfOrderAlphaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, prompt: String) -> ToolDefinition {
-        AlphaSignal.definition(prompt).await
+    fn description(&self) -> String {
+        AlphaSignal.description()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        AlphaSignal.parameters()
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -224,8 +228,12 @@ impl Tool for OutOfOrderBetaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, prompt: String) -> ToolDefinition {
-        BetaSignal.definition(prompt).await
+    fn description(&self) -> String {
+        BetaSignal.description()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        BetaSignal.parameters()
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -275,9 +283,9 @@ async fn collect_concurrent_tool_observation<R>(
                 observation.events.push("tool_result");
             }
             Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                observation.final_response_text = Some(response.response().to_owned());
+                observation.final_response_text = Some(response.output().to_owned());
                 observation.got_final_response = true;
-                if let Some(history) = response.history() {
+                if let Some(history) = response.messages() {
                     observation.history_tool_results =
                         tool_result_names_in_history(history, &tool_names_by_id);
                     observation.last_history_tool_result_message =

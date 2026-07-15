@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rig::agent::{AgentHook, Flow, StepEvent};
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, Prompt, ToolDefinition};
+use rig::completion::{CompletionModel, Prompt};
 use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -48,15 +48,15 @@ impl Tool for ReadFileHead {
     type Args = ReadFileArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_file_head".to_string(),
-            description: "Read the first line of test.txt using the head command".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-            }),
-        }
+    fn description(&self) -> String {
+        "Read the first line of test.txt using the head command".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -79,15 +79,15 @@ impl Tool for ReadFileTail {
     type Args = ReadFileArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_file_tail".to_string(),
-            description: "Read the last line of test.txt using the tail command".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-            }),
-        }
+    fn description(&self) -> String {
+        "Read the last line of test.txt using the tail command".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -199,7 +199,7 @@ async fn permission_control_streaming_example() -> Result<()> {
             "Use the available tools to read test.txt now. \
              Do not ask any follow-up questions; just read the file and report its content.",
         )
-        .multi_turn(5)
+        .max_turns(5)
         .add_hook(hook)
         .await;
 

@@ -5,7 +5,6 @@ use rig::client::CompletionClient;
 use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, ToolChoice};
 use rig::streaming::StreamingPrompt;
-use rig::tool::Tool;
 
 use crate::copilot::{LIVE_MODEL, with_copilot_cassette};
 use crate::support::{
@@ -29,6 +28,7 @@ async fn streaming_tools_smoke() {
                 .preamble(STREAMING_TOOLS_PREAMBLE)
                 .tool(Adder)
                 .tool(Subtract)
+                .default_max_turns(2)
                 .build();
 
             let mut stream = agent.stream_prompt(STREAMING_TOOLS_PROMPT).await;
@@ -54,6 +54,7 @@ async fn example_streaming_with_tools() {
             .max_tokens(1024)
             .tool(Adder)
             .tool(Subtract)
+            .default_max_turns(2)
             .build();
 
         let mut stream = agent.stream_prompt("Calculate 2 - 5").await;
@@ -94,8 +95,8 @@ async fn raw_stream_surfaces_two_distinct_tool_calls_before_text() {
             let request = model
                 .completion_request(TWO_TOOL_STREAM_PROMPT)
                 .preamble(TWO_TOOL_STREAM_PREAMBLE.to_string())
-                .tool(AlphaSignal.definition(String::new()).await)
-                .tool(BetaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
+                .tool(rig::tool::tool_definition(&BetaSignal))
                 .build();
 
             let observation = collect_raw_stream_observation(
@@ -129,7 +130,7 @@ async fn streaming_tools_surface_two_distinct_tool_calls_before_final_answer() {
 
             let mut stream = agent
                 .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .multi_turn(8)
+                .max_turns(8)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -150,7 +151,7 @@ async fn raw_followup_uses_tool_result_without_new_tool_calls() {
         let request = model
             .completion_request(ORDERED_TOOL_STREAM_PROMPT)
             .preamble(ORDERED_TOOL_STREAM_PREAMBLE.to_string())
-            .tool(AlphaSignal.definition(String::new()).await)
+            .tool(rig::tool::tool_definition(&AlphaSignal))
             .build();
 
         let first_turn = collect_raw_stream_observation(

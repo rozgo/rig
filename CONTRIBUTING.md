@@ -60,6 +60,14 @@ When adding or changing a provider, use this checklist to keep the provider
 integration consistent with Rig's generic client architecture and contributor
 expectations:
 
+- New OpenAI-chat-compatible providers MUST drive completions through
+  `openai::completion::GenericCompletionModel<Ext>` by implementing
+  `OpenAICompatibleProvider` on the provider extension (see `minimax`, `zai`,
+  `groq`, or `deepseek` for the template). Wire-dialect differences belong in
+  the trait's hooks (`completion_path`, `prepare_request`,
+  `finalize_request_body`) — not in a hand-rolled `CompletionModel`, request
+  struct, or `TryFrom<message::Message>` conversion. The same applies to
+  Anthropic-shaped APIs via `AnthropicCompatibleProvider`.
 - `Client` and `ClientBuilder` public aliases use the correct generic types;
   the `ClientBuilder` API-key generic must match `ProviderBuilder::ApiKey`.
 - Provider extension and builder types are defined and wired through the
@@ -82,6 +90,9 @@ expectations:
   streaming normalization patterns.
 - Provider error responses preserve status/body details through the relevant Rig
   error helpers, so callers can inspect provider response details.
+- Non-2xx completion responses surface through the capability error's
+  `from_http_response(status, body)` helper so retry/status logic can inspect
+  `provider_response_status()` and the raw provider body.
 - `ProviderResponseExt`, telemetry spans, and GenAI fields are populated
   consistently with nearby providers where applicable.
 - Tests cover the smallest reliable scope: unit tests, cassette-backed provider

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rig::agent::{AgentHook, Flow, StepEvent, stream_to_stdout};
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, Prompt, ToolDefinition};
+use rig::completion::{CompletionModel, Prompt};
 use rig::providers::groq;
 use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
@@ -51,16 +51,16 @@ impl Tool for ReadFileHead {
     type Args = ReadFileArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_file_head".to_string(),
-            description: "Read the first line of test.txt using the head command".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Read the first line of test.txt using the head command".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -83,16 +83,16 @@ impl Tool for ReadFileTail {
     type Args = ReadFileArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_file_tail".to_string(),
-            description: "Read the last line of test.txt using the tail command".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Read the last line of test.txt using the tail command".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -209,20 +209,20 @@ async fn permission_control_streaming_example() -> Result<()> {
              Both tools take zero arguments and return the file content. \
              Do not ask any follow-up questions. After a tool succeeds, reply with the exact file content.",
         )
-        .multi_turn(5)
+        .max_turns(5)
         .add_hook(hook)
         .await;
 
     let final_response = stream_to_stdout(&mut stream).await?;
     let last = last_result.lock().expect("lock last_result").clone();
-    assert_nonempty_response(final_response.response());
+    assert_nonempty_response(final_response.output());
     anyhow::ensure!(
         final_response
-            .response()
+            .output()
             .to_ascii_lowercase()
             .contains("hello world"),
         "expected the streamed final response to mention the file content, got {:?}",
-        final_response.response()
+        final_response.output()
     );
     anyhow::ensure!(last.as_deref() == Some("hello world"));
     anyhow::ensure!(

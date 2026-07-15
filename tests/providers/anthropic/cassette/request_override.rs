@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rig::agent::{AgentHook, Flow, RequestPatch, StepEvent};
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, Prompt, ToolDefinition};
+use rig::completion::{CompletionModel, Prompt};
 use rig::message::ToolChoice;
 use rig::providers::anthropic;
 use rig::streaming::StreamingPrompt;
@@ -56,16 +56,16 @@ impl Tool for GetWeather {
     type Args = WeatherArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Get the current weather for a location.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "location": { "type": "string", "description": "City name" } },
-                "required": ["location"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Get the current weather for a location.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "location": { "type": "string", "description": "City name" } },
+            "required": ["location"]
+        })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -88,16 +88,16 @@ impl Tool for GetTime {
     type Args = TimeArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Get the current time in a timezone.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "timezone": { "type": "string", "description": "IANA timezone" } },
-                "required": ["timezone"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Get the current time in a timezone.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "timezone": { "type": "string", "description": "IANA timezone" } },
+            "required": ["timezone"]
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -231,7 +231,7 @@ async fn request_overridden_by_hook_streaming() {
                 .add_hook(ForceWeatherOnlyOnFirstTurn)
                 .build();
 
-            let mut stream = agent.stream_prompt(PROMPT).multi_turn(5).await;
+            let mut stream = agent.stream_prompt(PROMPT).max_turns(5).await;
             let response = collect_stream_final_response(&mut stream)
                 .await
                 .expect("streaming prompt should succeed");

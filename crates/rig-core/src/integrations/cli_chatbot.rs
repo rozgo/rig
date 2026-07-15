@@ -74,7 +74,7 @@ where
             .agent
             .stream_prompt(prompt)
             .history(history.clone())
-            .multi_turn(self.max_turns)
+            .max_turns(self.max_turns)
             .await;
 
         let mut acc = String::new();
@@ -95,7 +95,7 @@ where
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(final_response)) => {
                     self.usage = final_response.usage();
-                    messages = final_response.history().map(|history| history.to_vec());
+                    messages = final_response.messages().map(|history| history.to_vec());
                 }
                 Err(e) => {
                     break Err(PromptError::CompletionError(
@@ -168,6 +168,8 @@ impl<M> ChatBotBuilder<Provided<AgentImpl<M>>>
 where
     M: CompletionModel + 'static,
 {
+    /// Set the total model-call budget for each prompt, including the initial
+    /// call and every retry or continuation. Zero emits no model calls.
     pub fn max_turns(self, max_turns: usize) -> Self {
         ChatBotBuilder(Provided(AgentImpl {
             max_turns,

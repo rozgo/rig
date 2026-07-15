@@ -131,15 +131,15 @@ impl Tool for Adder {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: serde_json::from_str(
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::from_str(
                 r#"{"type":"object","properties":{"x":{"type":"number","description":"The first number to add"},"y":{"type":"number","description":"The second number to add"}},"required":["x","y"]}"#,
             )
-            .expect("adder schema should deserialize"),
-        }
+            .expect("adder schema should deserialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -156,15 +156,15 @@ impl Tool for Subtract {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: serde_json::from_str(
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::from_str(
                 r#"{"type":"object","properties":{"x":{"type":"number","description":"The number to subtract from"},"y":{"type":"number","description":"The number to subtract"}},"required":["x","y"]}"#,
             )
-            .expect("subtract schema should deserialize"),
-        }
+            .expect("subtract schema should deserialize")
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -181,16 +181,16 @@ impl Tool for AlphaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return the alpha signal marker.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return the alpha signal marker.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -207,16 +207,16 @@ impl Tool for BetaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return the beta signal marker.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return the beta signal marker.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -384,7 +384,7 @@ pub(crate) async fn collect_stream_final_response<R>(
 
     while let Some(item) = stream.next().await {
         if let MultiTurnStreamItem::FinalResponse(response) = item? {
-            final_response = Some(response.response().to_owned());
+            final_response = Some(response.output().to_owned());
         }
     }
 
@@ -524,7 +524,7 @@ pub(crate) async fn collect_stream_observation<R>(
                 observation.events.push("tool_result");
             }
             Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                observation.final_response_text = Some(response.response().to_owned());
+                observation.final_response_text = Some(response.output().to_owned());
                 observation.got_final_response = true;
                 observation.events.push("final_response");
             }
@@ -629,7 +629,7 @@ pub(crate) fn assert_two_tool_roundtrip_contract(
     assert_eq!(
         observation.final_response_text.as_deref(),
         Some(observation.final_turn_text.as_str()),
-        "FinalResponse.response() should match the final turn's streamed text"
+        "FinalResponse.output() should match the final turn's streamed text"
     );
     assert!(
         observation.tool_results >= expected_tools.len(),
@@ -713,7 +713,7 @@ pub(crate) fn assert_tool_call_precedes_later_text(
     assert_eq!(
         observation.final_response_text.as_deref(),
         Some(observation.final_turn_text.as_str()),
-        "FinalResponse.response() should match the final turn's streamed text"
+        "FinalResponse.output() should match the final turn's streamed text"
     );
     assert!(
         observation

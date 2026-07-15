@@ -75,6 +75,7 @@ async fn messages_tools_smoke() {
                 .preamble(TOOLS_PREAMBLE)
                 .tool(Adder)
                 .tool(Subtract)
+                .default_max_turns(2)
                 .build();
 
             let response = agent
@@ -98,6 +99,7 @@ async fn messages_streaming_tools_smoke() {
                 .preamble(STREAMING_TOOLS_PREAMBLE)
                 .tool(Adder)
                 .tool(Subtract)
+                .default_max_turns(2)
                 .build();
 
             let mut stream = agent.stream_prompt(STREAMING_TOOLS_PROMPT).await;
@@ -237,6 +239,7 @@ async fn messages_adaptive_thinking_tool_roundtrip_smoke() {
                 .max_tokens(16384)
                 .tool(WeatherTool::new(call_count.clone()))
                 .additional_params(opus_4_7_thinking_params())
+                .default_max_turns(2)
                 .build();
 
             let result = agent
@@ -266,7 +269,7 @@ async fn messages_adaptive_thinking_streaming_tool_roundtrip_smoke() {
 
             let stream = agent
                 .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
-                .multi_turn(3)
+                .max_turns(3)
                 .await;
 
             let stats = reasoning::collect_stream_stats(stream, "anthropic").await;

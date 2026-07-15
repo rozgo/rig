@@ -481,7 +481,7 @@ async fn builtin_streaming_max_turns_error_carries_pending_message() {
 
             let mut stream = agent
                 .stream_prompt("What is 21 + 21? Use the add tool.")
-                .multi_turn(0)
+                .max_turns(2)
                 .await;
 
             let mut prompt_error = None;
@@ -504,7 +504,7 @@ async fn builtin_streaming_max_turns_error_carries_pending_message() {
             else {
                 panic!("expected MaxTurnsError");
             };
-            assert_eq!(max_turns, 0);
+            assert_eq!(max_turns, 2);
             // Pins the divergence resolved by #1899: the streaming error
             // carries the actual pending tool-results message, not a rag-text
             // reconstruction of it.
@@ -554,7 +554,7 @@ async fn builtin_streaming_cancellation_history_includes_assistant_turn() {
             let mut stream = agent
                 .stream_prompt("What is 21 + 21? Use the add tool.")
                 .add_hook(CancelOnToolCall)
-                .multi_turn(2)
+                .max_turns(2)
                 .await;
 
             let mut prompt_error = None;

@@ -37,7 +37,7 @@ use serde_json::json;
 
 use crate::{
     agent::{Agent, AgentBuilder, WithBuilderTools},
-    completion::{Completion, CompletionError, CompletionModel, ToolDefinition, Usage},
+    completion::{Completion, CompletionError, CompletionModel, Usage},
     message::{AssistantContent, Message, ToolCall, ToolChoice, ToolFunction},
     tool::Tool,
     vector_store::VectorStoreIndexDyn,
@@ -296,14 +296,6 @@ where
         let data = serde_json::from_value(raw_data)?;
         Ok((data, usage))
     }
-
-    pub async fn get_inner(&self) -> &Agent<M> {
-        &self.agent
-    }
-
-    pub async fn into_inner(self) -> Agent<M> {
-        self.agent
-    }
 }
 
 /// Builder for the Extractor
@@ -422,13 +414,12 @@ where
     type Args = T;
     type Output = T;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Submit the structured data you extracted from the provided text."
-                .to_string(),
-            parameters: json!(schema_for!(T)),
-        }
+    fn description(&self) -> String {
+        "Submit the structured data you extracted from the provided text.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!(schema_for!(T))
     }
 
     async fn call(&self, data: Self::Args) -> Result<Self::Output, Self::Error> {

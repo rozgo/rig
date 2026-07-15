@@ -13,7 +13,6 @@ use syn::{
 };
 
 mod basic;
-mod client;
 mod custom;
 mod embed;
 
@@ -35,11 +34,6 @@ pub(crate) fn rig_core_path() -> proc_macro2::TokenStream {
             Err(_) => quote!(::rig_core),
         },
     }
-}
-
-#[proc_macro_derive(ProviderClient, attributes(client))]
-pub fn derive_provider_client(input: TokenStream) -> TokenStream {
-    client::provider_client(input)
 }
 
 //References:
@@ -543,17 +537,16 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                 #tool_name.to_string()
             }
 
-            async fn definition(&self, _prompt: String) -> #rig_core::completion::ToolDefinition {
+            fn description(&self) -> String {
+                #tool_description.to_string()
+            }
+
+            fn parameters(&self) -> serde_json::Value {
                 let mut schema = serde_json::to_value(
                     #rig_core::schemars::schema_for!(#params_struct_name)
                 ).expect("schema serialization");
                 schema["required"] = serde_json::json!([#(#required_args),*]);
-
-                #rig_core::completion::ToolDefinition {
-                    name: #tool_name.to_string(),
-                    description: #tool_description.to_string(),
-                    parameters: schema,
-                }
+                schema
             }
 
             #call_impl

@@ -153,7 +153,7 @@ async fn sequential_tool_calls_ordering_streaming() {
 
             let mut stream = agent
                 .stream_chat(SEQUENTIAL_TOOLS_PROMPT, Vec::<Message>::new())
-                .multi_turn(6)
+                .max_turns(6)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -225,7 +225,7 @@ async fn long_history_replay_nonstreaming() {
                 })
                 .message(Message::tool_result(AlphaSignal::NAME, ALPHA_SIGNAL_OUTPUT))
                 .message(Message::assistant("The harbor label is crimson-harbor."))
-                .tool(AlphaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
                 .build();
 
             let response = model

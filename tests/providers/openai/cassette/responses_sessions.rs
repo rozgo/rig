@@ -180,7 +180,7 @@ async fn sequential_tool_calls_streaming() {
 
             let mut stream = agent
                 .stream_chat(SEQUENTIAL_TOOLS_PROMPT, Vec::<Message>::new())
-                .multi_turn(6)
+                .max_turns(6)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -287,7 +287,7 @@ async fn parallel_tool_calls_single_turn_streaming() {
 
             let mut stream = agent
                 .stream_prompt(TWO_TOOL_STREAM_PROMPT)
-                .multi_turn(5)
+                .max_turns(5)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -314,7 +314,7 @@ async fn long_history_replay_nonstreaming() {
             let first_request = model
                 .completion_request("Look up the harbor label with the tool.")
                 .preamble(preamble.to_string())
-                .tool(AlphaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
                 .build();
             let first_response = model
                 .completion(first_request)
@@ -363,7 +363,7 @@ async fn long_history_replay_nonstreaming() {
                     ALPHA_SIGNAL_OUTPUT,
                 ))
                 .message(Message::assistant("The harbor label is crimson-harbor."))
-                .tool(AlphaSignal.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&AlphaSignal))
                 .build();
 
             let response = model
@@ -421,7 +421,7 @@ async fn reasoning_session_two_tool_calls_streaming() {
                      that mentions both city names.",
                     Vec::<Message>::new(),
                 )
-                .multi_turn(5)
+                .max_turns(5)
                 .await;
 
             let stats = reasoning::collect_stream_stats(stream, "openai").await;
@@ -483,7 +483,7 @@ async fn usage_accumulates_across_streaming_multi_turn() {
 
             let mut stream = agent
                 .stream_prompt(ORDERED_TOOL_STREAM_PROMPT)
-                .multi_turn(5)
+                .max_turns(5)
                 .await;
 
             let mut saw_tool_result = false;

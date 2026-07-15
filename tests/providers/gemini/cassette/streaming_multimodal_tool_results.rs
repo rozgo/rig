@@ -3,7 +3,6 @@
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::CompletionClient;
-use rig::completion::ToolDefinition;
 use rig::message::{
     AssistantContent, DocumentSourceKind, ImageMediaType, Message, ToolResultContent, UserContent,
 };
@@ -38,17 +37,16 @@ impl Tool for HybridImageTool {
     type Args = serde_json::Value;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return a reference image the assistant must inspect before answering."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return a reference image the assistant must inspect before answering.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -88,7 +86,7 @@ async fn streaming_history_preserves_hybrid_tool_result_image_parts() {
             "Use the tool once, then answer with the dominant color in the returned image.",
         )
         .history(empty_history)
-        .multi_turn(4)
+        .max_turns(4)
         .await;
 
     let mut final_response = None;
@@ -97,8 +95,8 @@ async fn streaming_history_preserves_hybrid_tool_result_image_parts() {
     while let Some(item) = stream.next().await {
         match item.expect("streaming prompt should succeed") {
             MultiTurnStreamItem::FinalResponse(response) => {
-                final_response = Some(response.response().to_owned());
-                final_history = response.history().map(|history| history.to_vec());
+                final_response = Some(response.output().to_owned());
+                final_history = response.messages().map(|history| history.to_vec());
                 break;
             }
             MultiTurnStreamItem::StreamAssistantItem(_)

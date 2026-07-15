@@ -28,7 +28,7 @@ async fn streaming() {
 
         let stream = agent
             .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
-            .multi_turn(3)
+            .max_turns(3)
             .await;
 
         let stats = reasoning::collect_stream_stats(stream, "openrouter").await;
@@ -52,6 +52,7 @@ async fn nonstreaming() {
                     "reasoning": { "effort": "high" },
                     "include_reasoning": true
                 }))
+                .default_max_turns(2)
                 .build();
 
             let result = agent
