@@ -11,7 +11,11 @@ use rig::{
     completion::Prompt,
     prelude::*,
     providers::openai,
-    tool::{rmcp::McpClientHandler, server::ToolServer},
+    tool::{
+        DeferredToolResolverRegistry,
+        rmcp::{McpClientConfig, McpClientHandler},
+        server::ToolServer,
+    },
 };
 use rmcp::{
     RoleServer, ServerHandler,
@@ -122,9 +126,19 @@ impl ServerHandler for Counter {
                 .enable_tools()
                 .build(),
         )
-        .with_protocol_version(ProtocolVersion::LATEST)
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_server_info(Implementation::from_build_env())
         .with_instructions("This server provides a counter tool that can increment and decrement values. The counter starts at 0 and can be modified using the 'increment' and 'decrement' tools. Use 'get_value' to check the current count.")
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn list_resources(
@@ -137,8 +151,7 @@ impl ServerHandler for Counter {
                 self._create_resource_text("str:////Users/to/some/path/", "cwd"),
                 self._create_resource_text("memo://insights", "memo-name"),
             ],
-            next_cursor: None,
-            meta: None,
+            ..Default::default()
         })
     }
 
@@ -146,19 +159,15 @@ impl ServerHandler for Counter {
         &self,
         ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         match uri.as_str() {
             "str:////Users/to/some/path/" => {
                 let cwd = "/Users/to/some/path/";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    cwd, uri,
-                )]))
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(cwd, uri)]).into())
             }
             "memo://insights" => {
                 let memo = "Business Intelligence Memo\n\nAnalysis has revealed 5 key insights ...";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    memo, uri,
-                )]))
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(memo, uri)]).into())
             }
             _ => Err(ErrorData::resource_not_found(
                 "resource_not_found",
@@ -175,23 +184,9 @@ impl ServerHandler for Counter {
         _: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
         Ok(ListResourceTemplatesResult {
-            next_cursor: None,
             resource_templates: Vec::new(),
-            meta: None,
+            ..Default::default()
         })
-    }
-
-    async fn initialize(
-        &self,
-        _request: InitializeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<InitializeResult, ErrorData> {
-        if let Some(http_request_part) = context.extensions.get::<axum::http::request::Parts>() {
-            let initialize_headers = &http_request_part.headers;
-            let initialize_uri = &http_request_part.uri;
-            tracing::info!(?initialize_headers, %initialize_uri, "initialize from http server");
-        }
-        Ok(self.get_info())
     }
 }
 
@@ -240,27 +235,26 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let client_info = ClientInfo::new(
-        ClientCapabilities::default(),
-        Implementation::new("rig-core", env!("CARGO_PKG_VERSION")),
-    );
+    let config = McpClientConfig::new(Implementation::new("rig", env!("CARGO_PKG_VERSION")));
 
     // Create a shared ToolServer so the MCP handler can update tools at runtime.
     let tool_server_handle = ToolServer::new().run();
 
     // McpClientHandler connects to the MCP server and auto-refreshes tools
     // whenever the server sends `notifications/tools/list_changed`.
-    let handler = McpClientHandler::new(client_info, tool_server_handle.clone());
+    let handler = McpClientHandler::new(config, tool_server_handle.clone());
 
     let transport =
         rmcp::transport::StreamableHttpClientTransport::from_uri("http://localhost:8080");
 
-    let mcp_service = handler.connect(transport).await.inspect_err(|e| {
+    let mcp_guard = handler.connect(transport).await.inspect_err(|e| {
         tracing::error!("MCP client error: {:?}", e);
     })?;
 
-    let server_info = mcp_service.peer_info();
+    let server_info = mcp_guard.discovery().server_info();
     tracing::info!("Connected to server: {server_info:#?}");
+    let deferred_resolvers = DeferredToolResolverRegistry::new();
+    mcp_guard.register_deferred_resolver(&deferred_resolvers)?;
 
     let openai_client = openai::Client::from_env()?;
     let agent = openai_client
@@ -269,7 +263,11 @@ async fn main() -> anyhow::Result<()> {
         .tool_server_handle(tool_server_handle)
         .build();
 
-    let res = agent.prompt("What is 2+5?").max_turns(2).await?;
+    let res = agent
+        .prompt("What is 2+5?")
+        .deferred_tool_resolvers(deferred_resolvers)
+        .max_turns(2)
+        .await?;
 
     println!("GPT-4o: {res}");
 

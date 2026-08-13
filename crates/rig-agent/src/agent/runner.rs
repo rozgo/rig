@@ -36,7 +36,7 @@ use super::{
     completion::{Agent, PreparedCompletionRequest},
     hook::{
         AgentHook, CompletionCall, CompletionCallAction,
-        CompletionResponse as CompletionResponseEvent, HookContext, HookStack,
+        CompletionResponse as CompletionResponseEvent, DeferredToolEvent, HookContext, HookStack,
         InvalidToolCallAction, ModelTurnAction, ModelTurnFinished, ObservationAction, RequestPatch,
         ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
     },
@@ -62,7 +62,10 @@ use crate::{
     completion::{CompletionError, CompletionModel, Document, Message, PromptError, Usage},
     json_utils,
     tool::{
-        ToolContext, ToolDispatch, ToolResult,
+        DeferredExecutionPolicy, DeferredInputHandler, DeferredToolDescriptor,
+        DeferredToolLifecycleEvent, DeferredToolResolverRegistry, DeferredToolState,
+        InputResponses, ToolContext, ToolDispatch, ToolExecution as RuntimeToolExecution,
+        ToolExecutionError, ToolResult,
         server::{ToolRegistrySnapshot, ToolServerHandle},
     },
 };
@@ -179,6 +182,9 @@ pub struct AgentRunner {
     pub(crate) conversation_id: Option<String>,
     pub(crate) hooks: HookStack,
     pub(crate) error_usage: Option<Arc<Mutex<Usage>>>,
+    pub(crate) deferred_resolvers: DeferredToolResolverRegistry,
+    pub(crate) deferred_input_handler: Option<Arc<dyn DeferredInputHandler>>,
+    pub(crate) deferred_policy: DeferredExecutionPolicy,
 }
 
 /// The `(history_override, memory_handle)` pair resolved for one run by
@@ -219,6 +225,9 @@ impl AgentRunner {
             conversation_id: agent.default_conversation_id.clone(),
             hooks: agent.hooks.clone(),
             error_usage: None,
+            deferred_resolvers: DeferredToolResolverRegistry::new(),
+            deferred_input_handler: None,
+            deferred_policy: DeferredExecutionPolicy::default(),
         }
     }
 
@@ -440,6 +449,26 @@ impl AgentRunner {
         self
     }
 
+    /// Set the process-local registry used to reconstruct deferred tool
+    /// descriptors encountered by this run.
+    pub fn deferred_tool_resolvers(mut self, registry: DeferredToolResolverRegistry) -> Self {
+        self.deferred_resolvers = registry;
+        self
+    }
+
+    /// Set the application callback that fulfils deferred tool input requests.
+    pub fn deferred_input_handler(mut self, handler: impl DeferredInputHandler + 'static) -> Self {
+        self.deferred_input_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Set the wall-clock, polling, and state-transition bounds for deferred
+    /// tools executed by this run.
+    pub fn deferred_execution_policy(mut self, policy: DeferredExecutionPolicy) -> Self {
+        self.deferred_policy = policy;
+        self
+    }
+
     /// Set the conversation id used to load and persist memory for this run.
     pub fn conversation(mut self, id: impl Into<String>) -> Self {
         self.conversation_id = Some(id.into());
@@ -600,7 +629,7 @@ pub(crate) async fn append_run_messages(
 }
 
 /// Whether (and how) a tool call executed, for [`run_single_tool`].
-pub(crate) enum ToolExecution {
+pub(crate) enum ToolCallExecution {
     /// The tool's body ran. Carries the **effective** tool call — the model's
     /// call with any [`ToolCallAction::Rewrite`] hook
     /// rewrite applied — so the driver can surface it in the
@@ -621,7 +650,364 @@ pub(crate) struct ToolCallOutcome {
     /// replacement, or a hook skip reason).
     pub content: UserContent,
     /// How the call resolved: executed (with the effective tool call) or skipped.
-    pub execution: ToolExecution,
+    pub execution: ToolCallExecution,
+    /// Deferred lifecycle transitions collected for stream surfacing after the
+    /// tool batch commits atomically.
+    pub deferred_events: Option<DeferredCallEvents>,
+}
+
+pub(crate) struct DeferredCallEvents {
+    pub descriptor: DeferredToolDescriptor,
+    pub lifecycle: Vec<DeferredToolLifecycleEvent>,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredCallIdentity<'a> {
+    hook_context: &'a HookContext,
+    tool_name: &'a str,
+    tool_call_id: Option<&'a str>,
+    internal_call_id: &'a str,
+}
+
+async fn cancel_deferred_after_failure(
+    runner: &AgentRunner,
+    identity: &DeferredCallIdentity<'_>,
+    handle: &crate::tool::DeferredToolHandle,
+    descriptor: &DeferredToolDescriptor,
+    lifecycle_events: &mut Vec<DeferredToolLifecycleEvent>,
+) {
+    lifecycle_events.push(DeferredToolLifecycleEvent::CancellationRequested);
+    let _ = observe_deferred_tool(
+        runner,
+        identity.hook_context,
+        identity.tool_name,
+        identity.tool_call_id,
+        identity.internal_call_id,
+        descriptor,
+        &DeferredToolLifecycleEvent::CancellationRequested,
+    )
+    .await;
+    if let Err(error) = handle.cancel().await {
+        tracing::warn!(
+            backend = descriptor.backend_type(),
+            execution_id = descriptor.execution_id(),
+            error = %error,
+            "failed to cooperatively cancel deferred tool execution"
+        );
+    }
+}
+
+async fn observe_deferred_tool(
+    runner: &AgentRunner,
+    hook_context: &HookContext,
+    tool_name: &str,
+    tool_call_id: Option<&str>,
+    internal_call_id: &str,
+    descriptor: &DeferredToolDescriptor,
+    lifecycle: &DeferredToolLifecycleEvent,
+) -> Result<(), ToolExecutionError> {
+    match runner
+        .hooks
+        .on_deferred_tool_event(
+            hook_context,
+            DeferredToolEvent {
+                tool_name,
+                tool_call_id,
+                internal_call_id,
+                descriptor,
+                lifecycle,
+            },
+        )
+        .await
+    {
+        ObservationAction::Continue => Ok(()),
+        ObservationAction::Stop(reason) => Err(ToolExecutionError::cancelled(reason)),
+    }
+}
+
+fn validate_deferred_input_responses(
+    requests: &crate::tool::InputRequests,
+    responses: &InputResponses,
+) -> Result<(), ToolExecutionError> {
+    let expected = requests
+        .0
+        .iter()
+        .map(|request| request.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != requests.0.len() {
+        return Err(ToolExecutionError::invalid_args(
+            "deferred backend returned duplicate input request identifiers",
+        ));
+    }
+
+    let actual = responses
+        .0
+        .iter()
+        .map(|response| response.request_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual.len() != responses.0.len() || actual != expected {
+        return Err(ToolExecutionError::invalid_args(
+            "deferred input handler must return exactly one response for every request identifier",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_deferred_tool(
+    runner: &AgentRunner,
+    identity: DeferredCallIdentity<'_>,
+    descriptor: DeferredToolDescriptor,
+    context: &mut ToolContext,
+    lifecycle_events: &mut Vec<DeferredToolLifecycleEvent>,
+) -> ToolResult {
+    let DeferredCallIdentity {
+        hook_context,
+        tool_name,
+        tool_call_id,
+        internal_call_id,
+    } = identity;
+    lifecycle_events.push(DeferredToolLifecycleEvent::Started);
+    if let Err(error) = observe_deferred_tool(
+        runner,
+        hook_context,
+        tool_name,
+        tool_call_id,
+        internal_call_id,
+        &descriptor,
+        &DeferredToolLifecycleEvent::Started,
+    )
+    .await
+    {
+        return ToolResult::failed(error);
+    }
+    let policy = runner.deferred_policy;
+    let handle = match tokio::time::timeout(
+        policy.timeout,
+        runner.deferred_resolvers.resolve(&descriptor),
+    )
+    .await
+    {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => return ToolResult::failed(error),
+        Err(_) => {
+            return ToolResult::failed(ToolExecutionError::timeout(format!(
+                "timed out reconstructing deferred execution '{}'",
+                descriptor.execution_id()
+            )));
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + policy.timeout;
+    let mut reads = 0usize;
+    let mut next_state = None;
+    macro_rules! cancel_after_failure {
+        () => {
+            cancel_deferred_after_failure(runner, &identity, &handle, &descriptor, lifecycle_events)
+                .await
+        };
+    }
+    loop {
+        if reads >= policy.max_state_reads {
+            cancel_after_failure!();
+            return ToolResult::failed(ToolExecutionError::timeout(format!(
+                "deferred execution '{}' exceeded its state-read limit",
+                descriptor.execution_id()
+            )));
+        }
+        reads += 1;
+
+        let state = match next_state.take() {
+            Some(state) => state,
+            None => match tokio::time::timeout_at(deadline, handle.state()).await {
+                Ok(Ok(state)) => state,
+                Ok(Err(error)) => return ToolResult::failed(error),
+                Err(_) => {
+                    cancel_after_failure!();
+                    return ToolResult::failed(ToolExecutionError::timeout(format!(
+                        "deferred execution '{}' exceeded {:?}",
+                        descriptor.execution_id(),
+                        policy.timeout
+                    )));
+                }
+            },
+        };
+
+        match state {
+            DeferredToolState::Working => {
+                lifecycle_events.push(DeferredToolLifecycleEvent::Working);
+                if let Err(error) = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::Working,
+                )
+                .await
+                {
+                    cancel_after_failure!();
+                    return ToolResult::failed(error);
+                }
+                if tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::sleep(policy.working_poll_interval),
+                )
+                .await
+                .is_err()
+                {
+                    cancel_after_failure!();
+                    return ToolResult::failed(ToolExecutionError::timeout(format!(
+                        "deferred execution '{}' exceeded {:?}",
+                        descriptor.execution_id(),
+                        policy.timeout
+                    )));
+                }
+            }
+            DeferredToolState::InputRequired(requests) => {
+                lifecycle_events.push(DeferredToolLifecycleEvent::InputRequired {
+                    requests: requests.clone(),
+                });
+                if let Err(error) = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::InputRequired {
+                        requests: requests.clone(),
+                    },
+                )
+                .await
+                {
+                    cancel_after_failure!();
+                    return ToolResult::failed(error);
+                }
+                let Some(handler) = runner.deferred_input_handler.as_ref() else {
+                    cancel_after_failure!();
+                    return ToolResult::failed(ToolExecutionError::other(format!(
+                        "deferred execution '{}' requires application input, but no handler is configured",
+                        descriptor.execution_id()
+                    )));
+                };
+                let responses = match tokio::time::timeout_at(
+                    deadline,
+                    handler.respond(&descriptor, &requests),
+                )
+                .await
+                {
+                    Ok(Ok(responses)) => responses,
+                    Ok(Err(error)) => {
+                        cancel_after_failure!();
+                        return ToolResult::failed(error);
+                    }
+                    Err(_) => {
+                        cancel_after_failure!();
+                        return ToolResult::failed(ToolExecutionError::timeout(format!(
+                            "input handling for deferred execution '{}' exceeded {:?}",
+                            descriptor.execution_id(),
+                            policy.timeout
+                        )));
+                    }
+                };
+                if let Err(error) = validate_deferred_input_responses(&requests, &responses) {
+                    cancel_after_failure!();
+                    return ToolResult::failed(error);
+                }
+                let request_ids: Vec<String> = responses
+                    .0
+                    .iter()
+                    .map(|response| response.request_id.clone())
+                    .collect();
+                next_state =
+                    match tokio::time::timeout_at(deadline, handle.submit_input(responses)).await {
+                        Ok(Ok(state)) => Some(state),
+                        Ok(Err(error)) => return ToolResult::failed(error),
+                        Err(_) => {
+                            cancel_after_failure!();
+                            return ToolResult::failed(ToolExecutionError::timeout(format!(
+                                "input submission for deferred execution '{}' exceeded {:?}",
+                                descriptor.execution_id(),
+                                policy.timeout
+                            )));
+                        }
+                    };
+                if let Err(error) = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::InputSubmitted {
+                        request_ids: request_ids.clone(),
+                    },
+                )
+                .await
+                {
+                    cancel_after_failure!();
+                    return ToolResult::failed(error);
+                }
+                lifecycle_events.push(DeferredToolLifecycleEvent::InputSubmitted { request_ids });
+            }
+            DeferredToolState::Completed(result) => {
+                handle.publish_result_context(context);
+                lifecycle_events.push(DeferredToolLifecycleEvent::Completed);
+                if let Err(error) = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::Completed,
+                )
+                .await
+                {
+                    return ToolResult::failed(error);
+                }
+                return result;
+            }
+            DeferredToolState::Failed(error) => {
+                handle.publish_result_context(context);
+                lifecycle_events.push(DeferredToolLifecycleEvent::Failed {
+                    message: error.message().to_owned(),
+                });
+                let _ = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::Failed {
+                        message: error.message().to_owned(),
+                    },
+                )
+                .await;
+                return ToolResult::failed(error);
+            }
+            DeferredToolState::Cancelled => {
+                handle.publish_result_context(context);
+                lifecycle_events.push(DeferredToolLifecycleEvent::Cancelled);
+                let _ = observe_deferred_tool(
+                    runner,
+                    hook_context,
+                    tool_name,
+                    tool_call_id,
+                    internal_call_id,
+                    &descriptor,
+                    &DeferredToolLifecycleEvent::Cancelled,
+                )
+                .await;
+                return ToolResult::failed(ToolExecutionError::cancelled(format!(
+                    "deferred execution '{}' was cancelled",
+                    descriptor.execution_id()
+                )));
+            }
+        }
+    }
 }
 
 /// Execute a single tool call, firing the `ToolCall` and `ToolResult` hooks and
@@ -729,19 +1115,51 @@ pub(crate) async fn run_single_tool(
     // Resolve the structured execution result and how the call surfaced. A skip
     // produces no execution-commit event; a real execution carries the effective
     // tool call (the model's call with any `ToolCallAction::Rewrite` applied).
-    let (exec, execution, dispatch_context) = match skipped {
-        Some(exec) => (exec, ToolExecution::Skipped, tool_context.for_dispatch()),
+    let (exec, execution, dispatch_context, deferred_events) = match skipped {
+        Some(exec) => (
+            exec,
+            ToolCallExecution::Skipped,
+            tool_context.for_dispatch(),
+            None,
+        ),
         None => {
             let mut effective_tool_call = tool_call.clone();
             effective_tool_call.function.arguments = effective_args;
             let ToolDispatch {
-                result: exec,
-                context: dispatch_context,
+                execution,
+                context: mut dispatch_context,
             } = tool_snapshot.dispatch(tool_name, &args, tool_context).await;
+            let (exec, deferred_events) = match execution {
+                RuntimeToolExecution::Complete(result) => (result, None),
+                RuntimeToolExecution::Deferred(descriptor) => {
+                    let mut lifecycle = Vec::new();
+                    let result = resolve_deferred_tool(
+                        runner,
+                        DeferredCallIdentity {
+                            hook_context: ctx,
+                            tool_name,
+                            tool_call_id: Some(tool_call.id.as_str()),
+                            internal_call_id,
+                        },
+                        descriptor.clone(),
+                        &mut dispatch_context,
+                        &mut lifecycle,
+                    )
+                    .await;
+                    (
+                        result,
+                        Some(DeferredCallEvents {
+                            descriptor,
+                            lifecycle,
+                        }),
+                    )
+                }
+            };
             (
                 exec,
-                ToolExecution::Executed(Box::new(effective_tool_call)),
+                ToolCallExecution::Executed(Box::new(effective_tool_call)),
                 dispatch_context,
+                deferred_events,
             )
         }
     };
@@ -783,6 +1201,7 @@ pub(crate) async fn run_single_tool(
                     replacement,
                 ),
                 execution,
+                deferred_events,
             })
         }
         ToolResultAction::Keep => {
@@ -795,7 +1214,11 @@ pub(crate) async fn run_single_tool(
                 tool_call.function.name.clone(),
                 exec.output().clone(),
             );
-            Ok(ToolCallOutcome { content, execution })
+            Ok(ToolCallOutcome {
+                content,
+                execution,
+                deferred_events,
+            })
         }
     }
 }
@@ -1162,12 +1585,21 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        agent::{AgentBuilder, AgentHook, HookContext, ToolResultAction, ToolResultEvent},
+        agent::{
+            AgentBuilder, AgentHook, DeferredToolEvent, HookContext, MultiTurnStreamItem,
+            ObservationAction, ToolResultAction, ToolResultEvent,
+        },
         completion::{CompletionModel, Document},
         test_utils::{MockCompletionModel, MockStreamEvent, MockTurn},
-        tool::{Tool, ToolContext, ToolErrorKind, ToolExecutionError},
+        tool::{
+            DeferredToolDescriptor, DeferredToolDriver, DeferredToolHandle,
+            DeferredToolLifecycleEvent, DeferredToolResolver, DeferredToolResolverRegistry,
+            DeferredToolState, ErasedTool, InputResponses, Tool, ToolContext, ToolErrorKind,
+            ToolExecution, ToolExecutionError, ToolOutput, ToolResult, server::ToolServer,
+        },
     };
     use rig_core::message::ToolChoice;
+    use rig_core::wasm_compat::WasmBoxedFuture;
 
     struct MetadataFailingTool;
 
@@ -1581,6 +2013,196 @@ mod tests {
             clones.load(Ordering::SeqCst),
             2,
             "each of the two agent dispatches should clone inbound context once"
+        );
+    }
+
+    struct DeferredFixtureTool;
+
+    impl ErasedTool for DeferredFixtureTool {
+        fn name(&self) -> String {
+            "deferred_fixture".to_owned()
+        }
+
+        fn description(&self) -> String {
+            "A reconstructable deferred fixture".to_owned()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _args: String,
+            _context: &'a mut ToolContext,
+        ) -> WasmBoxedFuture<'a, ToolExecution> {
+            Box::pin(async {
+                ToolExecution::Deferred(DeferredToolDescriptor::new(
+                    "runner-fixture",
+                    "execution-1",
+                    json!({}),
+                ))
+            })
+        }
+    }
+
+    struct DeferredFixtureDriver {
+        reads: AtomicUsize,
+    }
+
+    impl DeferredToolDriver for DeferredFixtureDriver {
+        fn state(&self) -> WasmBoxedFuture<'_, Result<DeferredToolState, ToolExecutionError>> {
+            Box::pin(async move {
+                if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(DeferredToolState::Working)
+                } else {
+                    Ok(DeferredToolState::Completed(ToolResult::success(
+                        ToolOutput::text("deferred done"),
+                    )))
+                }
+            })
+        }
+
+        fn submit_input(
+            &self,
+            _responses: InputResponses,
+        ) -> WasmBoxedFuture<'_, Result<DeferredToolState, ToolExecutionError>> {
+            self.state()
+        }
+
+        fn cancel(&self) -> WasmBoxedFuture<'_, Result<DeferredToolState, ToolExecutionError>> {
+            Box::pin(async { Ok(DeferredToolState::Cancelled) })
+        }
+    }
+
+    struct DeferredFixtureResolver;
+
+    impl DeferredToolResolver for DeferredFixtureResolver {
+        fn backend_type(&self) -> &str {
+            "runner-fixture"
+        }
+
+        fn resolve<'a>(
+            &'a self,
+            descriptor: &'a DeferredToolDescriptor,
+        ) -> WasmBoxedFuture<'a, Result<DeferredToolHandle, ToolExecutionError>> {
+            Box::pin(async move {
+                Ok(DeferredToolHandle::new(
+                    descriptor.clone(),
+                    DeferredFixtureDriver {
+                        reads: AtomicUsize::new(0),
+                    },
+                ))
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DeferredLifecycleRecorder(Arc<Mutex<Vec<DeferredToolLifecycleEvent>>>);
+
+    impl AgentHook for DeferredLifecycleRecorder {
+        async fn on_deferred_tool_event(
+            &self,
+            _ctx: &HookContext,
+            event: DeferredToolEvent<'_>,
+        ) -> ObservationAction {
+            self.0
+                .lock()
+                .expect("deferred lifecycle")
+                .push(event.lifecycle.clone());
+            ObservationAction::Continue
+        }
+    }
+
+    async fn deferred_runner_fixture() -> (
+        crate::tool::server::ToolServerHandle,
+        DeferredToolResolverRegistry,
+    ) {
+        let tool_server = ToolServer::new().run();
+        tool_server
+            .add_erased_tool(Arc::new(DeferredFixtureTool))
+            .await;
+        let registry = DeferredToolResolverRegistry::new();
+        registry
+            .register(DeferredFixtureResolver)
+            .expect("register deferred resolver");
+        (tool_server, registry)
+    }
+
+    #[tokio::test]
+    async fn deferred_terminal_behavior_matches_blocking_and_streaming_runners() {
+        let (blocking_tools, blocking_registry) = deferred_runner_fixture().await;
+        let blocking_hook = DeferredLifecycleRecorder::default();
+        let blocking_model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("tc1", "deferred_fixture", json!({})),
+            MockTurn::text("done"),
+        ]);
+        let blocking = AgentBuilder::new(blocking_model.clone())
+            .tool_server_handle(blocking_tools)
+            .add_hook(blocking_hook.clone())
+            .build()
+            .runner("go")
+            .deferred_tool_resolvers(blocking_registry)
+            .max_turns(3)
+            .run()
+            .await
+            .expect("blocking deferred run");
+
+        let (streaming_tools, streaming_registry) = deferred_runner_fixture().await;
+        let streaming_hook = DeferredLifecycleRecorder::default();
+        let streaming_model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call_name_delta("tc1", "deferred_fixture"),
+                MockStreamEvent::tool_call_arguments_delta("tc1", "{}"),
+                MockStreamEvent::tool_call("tc1", "deferred_fixture", json!({})),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_total_tokens(0),
+            ],
+        ]);
+        let mut stream = AgentBuilder::new(streaming_model.clone())
+            .tool_server_handle(streaming_tools)
+            .add_hook(streaming_hook.clone())
+            .build()
+            .runner("go")
+            .deferred_tool_resolvers(streaming_registry)
+            .max_turns(3)
+            .stream()
+            .await;
+        let mut streamed_lifecycle = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let MultiTurnStreamItem::DeferredToolEvent { lifecycle, .. } =
+                item.expect("stream item")
+            {
+                streamed_lifecycle.push(lifecycle);
+            }
+        }
+
+        let blocking_events = blocking_hook.0.lock().expect("blocking events").clone();
+        let streaming_events = streaming_hook.0.lock().expect("streaming events").clone();
+        assert_eq!(blocking.output, "done");
+        assert_eq!(blocking_events, streaming_events);
+        assert_eq!(streamed_lifecycle, streaming_events);
+        assert_eq!(
+            streaming_events,
+            vec![
+                DeferredToolLifecycleEvent::Started,
+                DeferredToolLifecycleEvent::Working,
+                DeferredToolLifecycleEvent::Completed,
+            ]
+        );
+        assert!(
+            serde_json::to_string(&blocking_model.requests()[1].chat_history)
+                .expect("serialize blocking history")
+                .contains("deferred done")
+        );
+        assert_eq!(
+            serde_json::to_value(&blocking_model.requests()[1].chat_history)
+                .expect("blocking history"),
+            serde_json::to_value(&streaming_model.requests()[1].chat_history)
+                .expect("streaming history")
         );
     }
 }

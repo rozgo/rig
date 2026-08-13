@@ -116,11 +116,12 @@ pub use builder::{AgentBuilder, NoToolConfig, WithBuilderTools, WithToolServerHa
 pub use completion::Agent;
 pub use hook::CompletionCall as CompletionCallEvent;
 pub use hook::{
-    AgentHook, CompletionCallAction, CompletionResponse as CompletionResponseEvent, HookContext,
-    HookStack, InvalidToolCallAction, InvalidToolCallContext, ModelSelection, ModelSelectionAction,
-    ModelTurnAction, ModelTurnFinished, ObservationAction, ReasoningDelta, RequestPatch,
-    RetryRequest, RunId, Scratchpad, StepEventKind, StreamResponseFinish, TextDelta, ToolCall,
-    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent,
+    AgentHook, CompletionCallAction, CompletionResponse as CompletionResponseEvent,
+    DeferredToolEvent, HookContext, HookStack, InvalidToolCallAction, InvalidToolCallContext,
+    ModelSelection, ModelSelectionAction, ModelTurnAction, ModelTurnFinished, ObservationAction,
+    ReasoningDelta, RequestPatch, RetryRequest, RunId, Scratchpad, StepEventKind,
+    StreamResponseFinish, TextDelta, ToolCall, ToolCallAction, ToolCallDelta, ToolResultAction,
+    ToolResultEvent,
 };
 pub use model::ModelHandle;
 pub use prompt_request::streaming::{

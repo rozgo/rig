@@ -520,6 +520,47 @@ non-success response moves from `Instance(..)` to
 
 ## 0.41 → next
 
+### rmcp 3.1.2 uses Discover, split metadata, and guard ownership
+
+The `rmcp` feature now resolves the exact Rig fork revision based on rmcp
+3.1.2. The adapter implements only the final MCP 2026-07-28 lifecycle: it sends
+`server/discover`, verifies that exact version, and does not initialize or own a
+protocol session. Replace the old `ClientInfo` constructor and separately held
+`RunningService` with an explicit config and long-lived guard:
+
+```rust,ignore
+let config = McpClientConfig::new(Implementation::new("my-client", "1.0.0"));
+let handler = McpClientHandler::new(config, tool_server_handle.clone());
+let guard = handler.connect(transport).await?;
+
+let deferred = DeferredToolResolverRegistry::new();
+guard.register_deferred_resolver(&deferred)?;
+let response = agent
+    .prompt("run the remote tool")
+    .deferred_tool_resolvers(deferred)
+    .await?;
+```
+
+Keep the guard alive for as long as its tools or deferred executions may be
+used. Dropping it closes the client, cancels listeners, removes only its managed
+registrations, and makes cloned request handles unavailable.
+
+rmcp 3 splits the old shared `Meta` type: use `RequestMetaObject` for request
+`_meta` placed in `ToolContext`, and `MetaObject` for response/result metadata.
+`CallToolResult` is now the complete-result payload inside `CallToolResponse`;
+the other outcomes are `CreateTaskResult` and `InputRequiredResult`. Task
+support fields formerly carried on ordinary request/result structures are gone
+in favor of the Tasks extension's `tasks/get`, `tasks/update`, and
+`tasks/cancel` types. Complete list results use the rmcp 3 list-result
+constructors (for example, `ListToolsResult::with_all_items`) rather than the
+removed legacy constructor shape.
+
+MCP Tasks and direct MRTR results are represented by protocol-neutral,
+serializable `DeferredToolDescriptor` values. Applications that advertise
+elicitation, sampling, or roots support must configure the matching
+`McpInputCapabilities` and install a `DeferredInputHandler`; Rig advertises none
+of those input categories by default.
+
 ### `OneOrMany<T>` is gone; lists are `Vec<T>`
 
 `rig_core::OneOrMany` and `rig_core::EmptyListError` are removed, along with the

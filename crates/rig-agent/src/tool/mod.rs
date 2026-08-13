@@ -111,6 +111,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 pub mod builtin;
+pub mod deferred;
 
 use futures::Future;
 use indexmap::IndexMap;
@@ -148,6 +149,12 @@ compile_error!(
 pub mod rmcp;
 pub mod server;
 
+pub use deferred::{
+    DEFERRED_TOOL_DESCRIPTOR_VERSION, DeferredExecutionPolicy, DeferredInputHandler,
+    DeferredResolverError, DeferredToolDescriptor, DeferredToolDriver, DeferredToolHandle,
+    DeferredToolLifecycleEvent, DeferredToolResolver, DeferredToolResolverRegistry,
+    DeferredToolState, InputRequest, InputRequests, InputResponse, InputResponses, ToolExecution,
+};
 pub use extensions::{MissingToolContext, ToolContext};
 pub use rig_core::tool::{
     IntoToolOutput, PortableDynamicTool, ToolErrorKind, ToolExecutionError, ToolOutput, ToolResult,
@@ -305,7 +312,7 @@ pub(crate) trait ErasedTool: WasmCompatSend + WasmCompatSync {
         &'a self,
         args: String,
         context: &'a mut ToolContext,
-    ) -> WasmBoxedFuture<'a, ToolResult>;
+    ) -> WasmBoxedFuture<'a, ToolExecution>;
 }
 
 impl<T> ErasedTool for T
@@ -328,19 +335,20 @@ where
         &'a self,
         args: String,
         context: &'a mut ToolContext,
-    ) -> WasmBoxedFuture<'a, ToolResult> {
+    ) -> WasmBoxedFuture<'a, ToolExecution> {
         Box::pin(async move {
             let args = match parse_tool_args::<T::Args>(&args) {
                 Ok(args) => args,
-                Err(error) => return ToolResult::failed(error),
+                Err(error) => return ToolExecution::complete(ToolResult::failed(error)),
             };
-            match Tool::call(self, context, args).await {
+            let result = match Tool::call(self, context, args).await {
                 Ok(output) => match output.into_tool_output() {
                     Ok(output) => ToolResult::success(output),
                     Err(error) => ToolResult::failed(error),
                 },
                 Err(error) => ToolResult::failed(Tool::map_error(self, error)),
-            }
+            };
+            ToolExecution::complete(result)
         })
     }
 }
@@ -457,26 +465,27 @@ impl ErasedTool for DynamicTool {
         &'a self,
         args: String,
         context: &'a mut ToolContext,
-    ) -> WasmBoxedFuture<'a, ToolResult> {
+    ) -> WasmBoxedFuture<'a, ToolExecution> {
         Box::pin(async move {
             let args = match serde_json::from_str(&args) {
                 Ok(args) => args,
                 Err(error) => {
-                    return ToolResult::failed(
+                    return ToolExecution::complete(ToolResult::failed(
                         ToolExecutionError::invalid_args(format!(
                             "failed to parse tool arguments: {error}"
                         ))
                         .with_source(error),
-                    );
+                    ));
                 }
             };
-            match (self.callback)(context, args).await {
+            let result = match (self.callback)(context, args).await {
                 Ok(output) => match output.into_tool_output() {
                     Ok(output) => ToolResult::success(output),
                     Err(error) => ToolResult::failed(error),
                 },
                 Err(error) => ToolResult::failed(error),
-            }
+            };
+            ToolExecution::complete(result)
         })
     }
 }
@@ -543,7 +552,7 @@ impl RegisteredTool {
         self.erased().is_live()
     }
 
-    pub(crate) async fn execute(&self, args: String, context: &mut ToolContext) -> ToolResult {
+    pub(crate) async fn execute(&self, args: String, context: &mut ToolContext) -> ToolExecution {
         self.erased().execute(args, context).await
     }
 }
@@ -566,7 +575,7 @@ impl ToolRegistration {
 
 /// The outcome of one isolated tool dispatch.
 pub(crate) struct ToolDispatch {
-    pub(crate) result: ToolResult,
+    pub(crate) execution: ToolExecution,
     pub(crate) context: ToolContext,
 }
 
@@ -574,9 +583,9 @@ impl ToolDispatch {
     /// Publish the dispatch's result metadata back to the caller's context and
     /// surface the result. Mutations to the tool's inbound snapshot are
     /// discarded.
-    pub(crate) fn publish_to(self, context: &mut ToolContext) -> ToolResult {
+    pub(crate) fn publish_to(self, context: &mut ToolContext) -> ToolExecution {
         context.accept_dispatch_result(self.context);
-        self.result
+        self.execution
     }
 }
 
@@ -593,18 +602,18 @@ pub(crate) async fn dispatch_tool(
     context: &ToolContext,
 ) -> ToolDispatch {
     let mut dispatch_context = context.for_dispatch();
-    let result = match tool {
+    let execution = match tool {
         Some(tool) => {
             tracing::debug!(target: "rig", tool_name = name, "calling tool with args:\n{args}");
             tool.execute(args, &mut dispatch_context).await
         }
-        None => ToolResult::failed(
+        None => ToolExecution::complete(ToolResult::failed(
             ToolExecutionError::not_found(format!("no tool named `{name}` is registered"))
                 .with_model_feedback(format!("tool `{name}` not found")),
-        ),
+        )),
     };
     ToolDispatch {
-        result,
+        execution,
         context: dispatch_context,
     }
 }
@@ -665,7 +674,7 @@ impl ToolSet {
         self.add_dynamic_tool(DynamicTool::from_portable(tool))
     }
 
-    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    #[cfg(any(test, all(feature = "rmcp", not(target_family = "wasm"))))]
     pub(crate) fn add_erased(&mut self, tool: Arc<dyn ErasedTool>) -> String {
         self.insert(RegisteredTool::Static(tool))
     }
@@ -734,6 +743,25 @@ impl ToolSet {
         args: impl Into<String>,
         context: &mut ToolContext,
     ) -> ToolResult {
+        match self.execute_with_outcome(name, args, context).await {
+            ToolExecution::Complete(result) => result,
+            ToolExecution::Deferred(descriptor) => {
+                ToolResult::failed(ToolExecutionError::other(format!(
+                    "tool execution was deferred as `{}`; use `execute_with_outcome` to retain its descriptor",
+                    descriptor.execution_id()
+                )))
+            }
+        }
+    }
+
+    /// Execute one registered tool and retain a deferred backend descriptor
+    /// when the tool does not complete immediately.
+    pub async fn execute_with_outcome(
+        &self,
+        name: &str,
+        args: impl Into<String>,
+        context: &mut ToolContext,
+    ) -> ToolExecution {
         context.clear_dispatch_result();
         let tool = self.get(name).cloned();
         let dispatch = dispatch_tool(name, args.into(), tool, context).await;

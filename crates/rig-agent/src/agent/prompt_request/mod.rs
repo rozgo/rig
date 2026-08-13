@@ -36,6 +36,33 @@ macro_rules! forward_prompt_setters {
             self
         }
 
+        /// Set the process-local registry used to reconstruct deferred tools.
+        pub fn deferred_tool_resolvers(
+            mut self,
+            registry: $crate::tool::DeferredToolResolverRegistry,
+        ) -> Self {
+            self.$recv = self.$recv.deferred_tool_resolvers(registry);
+            self
+        }
+
+        /// Set the application callback for deferred input requests.
+        pub fn deferred_input_handler<H>(mut self, handler: H) -> Self
+        where
+            H: $crate::tool::DeferredInputHandler + 'static,
+        {
+            self.$recv = self.$recv.deferred_input_handler(handler);
+            self
+        }
+
+        /// Set timeout, polling, and state-read bounds for deferred tools.
+        pub fn deferred_execution_policy(
+            mut self,
+            policy: $crate::tool::DeferredExecutionPolicy,
+        ) -> Self {
+            self.$recv = self.$recv.deferred_execution_policy(policy);
+            self
+        }
+
         /// Add chat history to the prompt request.
         pub fn history<H, Item>(mut self, history: H) -> Self
         where

@@ -130,7 +130,9 @@ use crate::{
     agent::model::ModelHandle,
     completion::{Document, Usage},
     json_utils,
-    tool::{ToolContext, ToolOutput, ToolResult},
+    tool::{
+        DeferredToolDescriptor, DeferredToolLifecycleEvent, ToolContext, ToolOutput, ToolResult,
+    },
 };
 
 /// Opaque process-scoped identifier for one agent run.
@@ -597,6 +599,21 @@ pub struct ToolResultEvent<'a> {
     pub tool_context: &'a ToolContext,
 }
 
+/// Deferred tool lifecycle observation.
+#[derive(Clone, Copy)]
+pub struct DeferredToolEvent<'a> {
+    /// Tool name selected by the model.
+    pub tool_name: &'a str,
+    /// Provider-issued tool-call identifier.
+    pub tool_call_id: Option<&'a str>,
+    /// Rig's run-local correlation identifier.
+    pub internal_call_id: &'a str,
+    /// Serializable reconstruction descriptor.
+    pub descriptor: &'a DeferredToolDescriptor,
+    /// Current lifecycle transition.
+    pub lifecycle: &'a DeferredToolLifecycleEvent,
+}
+
 /// Streaming text delta.
 #[derive(Clone, Copy)]
 pub struct TextDelta<'a> {
@@ -658,6 +675,7 @@ pub enum StepEventKind {
     InvalidToolCall,
     ToolCall,
     ToolResult,
+    DeferredTool,
     TextDelta,
     ReasoningDelta,
     ToolCallDelta,
@@ -1146,6 +1164,16 @@ pub trait AgentHook: WasmCompatSend + WasmCompatSync {
         async { ToolResultAction::Keep }
     }
 
+    /// Observes reconstruction, input, cancellation, and terminal transitions
+    /// for a deferred tool. A stop terminates the run on both surfaces.
+    fn on_deferred_tool_event(
+        &self,
+        _ctx: &HookContext,
+        _event: DeferredToolEvent<'_>,
+    ) -> impl Future<Output = ObservationAction> + WasmCompatSend {
+        async { ObservationAction::Continue }
+    }
+
     /// Observes a text delta from a streaming response.
     ///
     /// The default action continues the run.
@@ -1234,6 +1262,12 @@ macro_rules! for_each_boxed_hook_event {
             ToolResultAction
         );
         $m!(text_delta, on_text_delta, TextDelta, ObservationAction);
+        $m!(
+            deferred_tool_event,
+            on_deferred_tool_event,
+            DeferredToolEvent,
+            ObservationAction
+        );
         $m!(
             reasoning_delta,
             on_reasoning_delta,
@@ -1508,6 +1542,7 @@ impl AgentHook for HookStack {
     stack_first_non_continue! {
         on_completion_response, completion_response, CompletionResponse, ObservationAction;
         on_model_turn_finished, model_turn_finished, ModelTurnFinished, ModelTurnAction;
+        on_deferred_tool_event, deferred_tool_event, DeferredToolEvent, ObservationAction;
         on_text_delta, text_delta, TextDelta, ObservationAction;
         on_reasoning_delta, reasoning_delta, ReasoningDelta, ObservationAction;
         on_tool_call_delta, tool_call_delta, ToolCallDelta, ObservationAction;
@@ -2404,6 +2439,7 @@ mod migrated_tests {
             StepEventKind::InvalidToolCall,
             StepEventKind::ToolCall,
             StepEventKind::ToolResult,
+            StepEventKind::DeferredTool,
             StepEventKind::TextDelta,
             StepEventKind::ReasoningDelta,
             StepEventKind::ToolCallDelta,

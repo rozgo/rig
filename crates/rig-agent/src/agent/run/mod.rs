@@ -82,6 +82,7 @@ use crate::{
     },
     completion::{Message, PromptError, Usage},
     json_utils,
+    tool::DeferredToolDescriptor,
 };
 
 pub use streamed::{
@@ -373,6 +374,10 @@ pub struct AgentRun {
     /// [`AgentRunStep::CallModel`] is emitted.
     #[serde(default)]
     streamed_completion_call_recorded: bool,
+    /// Data-only deferred executions recorded by an external driver. The map
+    /// key is the driver's durable correlation identifier.
+    #[serde(default)]
+    deferred_tools: BTreeMap<String, DeferredToolDescriptor>,
     state: RunState,
 }
 
@@ -397,8 +402,35 @@ impl AgentRun {
             invalid_tool_call_retries: 0,
             rollback_pending: false,
             streamed_completion_call_recorded: false,
+            deferred_tools: BTreeMap::new(),
             state: RunState::PreparingRequest,
         }
+    }
+
+    /// Persist a reconstructable deferred execution under a durable driver
+    /// correlation identifier.
+    ///
+    /// This is intended for custom sans-IO drivers handling a
+    /// [`AgentRunStep::CallTools`] step. The descriptor contains no live
+    /// transport or credentials and is included when the run is serialized.
+    pub fn record_deferred_tool(
+        &mut self,
+        correlation_id: impl Into<String>,
+        descriptor: DeferredToolDescriptor,
+    ) -> Option<DeferredToolDescriptor> {
+        self.deferred_tools
+            .insert(correlation_id.into(), descriptor)
+    }
+
+    /// Deferred executions currently persisted with this run.
+    pub fn deferred_tools(&self) -> &BTreeMap<String, DeferredToolDescriptor> {
+        &self.deferred_tools
+    }
+
+    /// Remove a deferred execution after the driver has committed its terminal
+    /// tool result or intentionally abandoned it.
+    pub fn remove_deferred_tool(&mut self, correlation_id: &str) -> Option<DeferredToolDescriptor> {
+        self.deferred_tools.remove(correlation_id)
     }
 
     /// Set the input chat history preceding the prompt.
@@ -2794,5 +2826,32 @@ mod tests {
         );
         let response = expect_done(&mut resumed);
         assert_eq!(response.output, "done");
+    }
+
+    #[test]
+    fn deferred_tool_descriptors_survive_agent_run_serialization() {
+        let mut run = AgentRun::new("resume a remote tool");
+        let descriptor = crate::tool::DeferredToolDescriptor::new(
+            "fixture-backend",
+            "opaque-execution",
+            serde_json::json!({"safe": "reconstruction data"}),
+        );
+        assert!(
+            run.record_deferred_tool("internal-call-1", descriptor.clone())
+                .is_none()
+        );
+
+        let checkpoint = serde_json::to_string(&run).expect("serialize run");
+        assert!(!checkpoint.contains("authorization"));
+        let mut restored: AgentRun = serde_json::from_str(&checkpoint).expect("restore run");
+        assert_eq!(
+            restored.deferred_tools().get("internal-call-1"),
+            Some(&descriptor)
+        );
+        assert_eq!(
+            restored.remove_deferred_tool("internal-call-1"),
+            Some(descriptor)
+        );
+        assert!(restored.deferred_tools().is_empty());
     }
 }

@@ -29,12 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(rmcp)* add exact MCP 2026-07-28 Discover lifecycle, guard-owned registration/cache/subscription lifetime, cache-aware paginated tool discovery, protocol-neutral deferred execution, Tasks polling/input/cancellation/TTL/notification wake-ups, direct MRTR, durable reconstruction, lifecycle hooks, and blocking/streaming parity
+
 - *(agent)* add `AgentHook::on_reasoning_delta` with the Rig stream correlator, optional provider reasoning id, current fragment, and per-part aggregate; reasoning hooks share the existing observation-interest and stop-before-yield semantics used by other streaming deltas
 
 - *(agent)* add opaque, cloneable `ModelHandle` values with by-value `ProviderCapabilities` snapshots, plus default replacement, per-run default override (`using_model`), and hook-driven per-call selection via `AgentHook::on_model_select`
 - *(agent)* add run-local extractor default-model overrides used across retries
 
 ### Changed
+
+- *(rmcp)* [**breaking**] migrate from rmcp 2.x to the exact 3.1.2 Rig fork revision; `McpClientHandler::new` now accepts `McpClientConfig`, `connect` returns `McpClientGuard`, direct MCP tool registration accepts `McpRequestHandle`, request metadata uses `RequestMetaObject`, and response metadata uses `MetaObject` — see MIGRATING
 
 - *(agent)* [**breaking**] remove concrete model parameters from long-lived classic runtime types (`Agent`, `AgentBuilder` after `new()`, `AgentRunner`, prompt/stream requests, `Extractor`) — the typed model is erased once at construction; direct provider-model completion and streaming APIs remain typed
 - *(agent)* completion-call hooks now resolve before model selection: the merged `RequestPatch` is exposed on `ModelSelection::request_patch`, request preparation runs against the selected model's captured capabilities, and `ModelSelection::previous_model` reflects issued attempts only

@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use tokio::sync::RwLock;
 
-#[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+#[cfg(any(test, all(feature = "rmcp", not(target_family = "wasm"))))]
 use crate::tool::ErasedTool;
 
 use crate::{
     completion::{CompletionError, ToolDefinition},
     tool::{
         DynamicTool, PortableDynamicTool, RegisteredTool, Tool, ToolContext, ToolDispatch,
-        ToolResult, ToolSet, dispatch_tool,
+        ToolExecution, ToolExecutionError, ToolResult, ToolSet, dispatch_tool,
     },
 };
 use rig_core::vector_store::{
@@ -183,7 +183,11 @@ impl ToolServer {
     /// to change or disable it.
     #[cfg_attr(docsrs, doc(cfg(feature = "rmcp")))]
     #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
-    pub fn rmcp_tool(self, tool: rmcp::model::Tool, client: rmcp::service::ServerSink) -> Self {
+    pub fn rmcp_tool(
+        self,
+        tool: rmcp::model::Tool,
+        client: crate::tool::rmcp::McpRequestHandle,
+    ) -> Self {
         self.rmcp_tool_with_timeout(tool, client, crate::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT)
     }
 
@@ -196,7 +200,7 @@ impl ToolServer {
     pub fn rmcp_tool_with_timeout(
         mut self,
         tool: rmcp::model::Tool,
-        client: rmcp::service::ServerSink,
+        client: crate::tool::rmcp::McpRequestHandle,
         timeout: impl Into<Option<std::time::Duration>>,
     ) -> Self {
         use crate::tool::rmcp::McpTool;
@@ -268,7 +272,7 @@ impl ToolServerHandle {
             .await
     }
 
-    #[cfg(all(feature = "rmcp", test))]
+    #[cfg(test)]
     pub(crate) async fn add_erased_tool(&self, tool: Arc<dyn ErasedTool>) {
         self.register(|toolset| toolset.add_erased(tool)).await
     }
@@ -392,6 +396,23 @@ impl ToolServerHandle {
         refreshed
     }
 
+    /// Remove only registrations whose managed-generation tokens still match
+    /// the supplied owner. Newer local or peer-client replacements are left
+    /// untouched.
+    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    pub(crate) async fn remove_managed_erased_tools(
+        &self,
+        registrations: HashMap<String, ManagedToolToken>,
+    ) {
+        let mut state = self.0.write().await;
+        for (name, token) in registrations {
+            if state.managed_generations.get(&name) == Some(&token) {
+                state.toolset.delete_tool(&name);
+                state.managed_generations.remove(&name);
+            }
+        }
+    }
+
     /// Merge an entire toolset into the server in registration order.
     /// Existing names are replaced (last wins) and keep their position.
     pub async fn append_toolset(&self, toolset: ToolSet) {
@@ -426,6 +447,24 @@ impl ToolServerHandle {
         args: &str,
         context: &mut ToolContext,
     ) -> ToolResult {
+        match self.execute_with_outcome(tool_name, args, context).await {
+            ToolExecution::Complete(result) => result,
+            ToolExecution::Deferred(descriptor) => {
+                ToolResult::failed(ToolExecutionError::other(format!(
+                    "tool execution was deferred as `{}`; use `execute_with_outcome` to retain its descriptor",
+                    descriptor.execution_id()
+                )))
+            }
+        }
+    }
+
+    /// Look up and execute a tool while retaining deferred descriptors.
+    pub async fn execute_with_outcome(
+        &self,
+        tool_name: &str,
+        args: &str,
+        context: &mut ToolContext,
+    ) -> ToolExecution {
         context.clear_dispatch_result();
         let dispatch = self.dispatch(tool_name, args, context).await;
         dispatch.publish_to(context)
@@ -590,7 +629,7 @@ mod tests {
             MockSubtractTool, MockToolIndex,
         },
         tool::{
-            Tool, ToolContext, ToolEmbedding, ToolExecutionError, ToolSet,
+            Tool, ToolContext, ToolEmbedding, ToolExecution, ToolExecutionError, ToolSet,
             server::{ToolServer, ToolServerHandle},
         },
     };
@@ -740,19 +779,28 @@ mod tests {
         let dispatch = snapshot
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(dispatch.result.output().render(), "first implementation");
+        let ToolExecution::Complete(result) = dispatch.execution else {
+            panic!("expected immediate tool result");
+        };
+        assert_eq!(result.output().render(), "first implementation");
 
         let live = handle
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(live.result.output().render(), "second implementation");
+        let ToolExecution::Complete(result) = live.execution else {
+            panic!("expected immediate tool result");
+        };
+        assert_eq!(result.output().render(), "second implementation");
 
         let next_snapshot = handle.snapshot_tool_defs(None).await.unwrap();
         assert_eq!(next_snapshot.definitions()[0].description, "second schema");
         let dispatch = next_snapshot
             .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
             .await;
-        assert_eq!(dispatch.result.output().render(), "second implementation");
+        let ToolExecution::Complete(result) = dispatch.execution else {
+            panic!("expected immediate tool result");
+        };
+        assert_eq!(result.output().render(), "second implementation");
     }
 
     #[tokio::test]

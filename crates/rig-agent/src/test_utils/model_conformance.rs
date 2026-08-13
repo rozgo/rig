@@ -1844,6 +1844,7 @@ where
             }
             MultiTurnStreamItem::StreamAssistantItem(_)
             | MultiTurnStreamItem::ToolExecutionCommitted { .. }
+            | MultiTurnStreamItem::DeferredToolEvent { .. }
             | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
         }
     }

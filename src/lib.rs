@@ -161,8 +161,12 @@ pub mod tool {
     #[cfg(feature = "agent")]
     #[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
     pub use rig_agent::tool::{
-        DynamicTool, MissingToolContext, Tool, ToolContext, ToolEmbedding, ToolSet, ToolSetBuilder,
-        server, tool_definition,
+        DEFERRED_TOOL_DESCRIPTOR_VERSION, DeferredExecutionPolicy, DeferredInputHandler,
+        DeferredResolverError, DeferredToolDescriptor, DeferredToolDriver, DeferredToolHandle,
+        DeferredToolLifecycleEvent, DeferredToolResolver, DeferredToolResolverRegistry,
+        DeferredToolState, DynamicTool, InputRequest, InputRequests, InputResponse, InputResponses,
+        MissingToolContext, Tool, ToolContext, ToolEmbedding, ToolExecution, ToolSet,
+        ToolSetBuilder, server, tool_definition,
     };
 
     /// The complete portable `rig-core` tool surface, under one explicit path.

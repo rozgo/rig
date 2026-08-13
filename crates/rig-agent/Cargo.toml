@@ -32,7 +32,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serenity = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 tracing-futures = { workspace = true, features = ["futures-03"] }
 
@@ -43,6 +43,7 @@ tracing-futures = { workspace = true, features = ["futures-03"] }
 # graph keeps the wasm dependency tree honest; `tool/mod.rs` raises a targeted
 # `compile_error!` if the feature is requested there anyway.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+chrono = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true, features = ["client"] }
 
 [dev-dependencies]
@@ -61,4 +62,4 @@ image = ["rig-core/image"]
 derive = ["dep:rig-derive", "rig-core/derive"]
 test-utils = ["rig-core/test-utils"]
 discord-bot = ["dep:serenity"]
-rmcp = ["dep:rmcp"]
+rmcp = ["dep:chrono", "dep:rmcp"]

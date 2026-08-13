@@ -129,3 +129,11 @@ the future bounds but not the handler itself — while this crate's handler owns
 tool registry whose `Arc<dyn ErasedTool>` is deliberately neither `Send` nor
 `Sync` on wasm. Enabling `rmcp` on a wasm target fails with a single explanatory
 `compile_error!` rather than a wall of trait errors.
+
+With the `rmcp` feature, Rig uses the final stateless MCP 2026-07-28 Discover
+lifecycle. `McpClientGuard` owns the client transport, cache, subscriptions, and
+managed registrations; tools hold non-owning request handles. MCP Tasks and
+multi round-trip input are exposed through the protocol-neutral deferred-tool
+runtime and can be serialized and reconstructed with a registered resolver.
+No elicitation, sampling, or roots capability is advertised unless the
+application explicitly configures it and provides an input handler.

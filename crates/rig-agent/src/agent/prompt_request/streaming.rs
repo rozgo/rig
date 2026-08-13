@@ -16,12 +16,15 @@ use crate::{
         streamed::{StreamedResolution, StreamedTurnAssembler, StreamedTurnEvent},
     },
     agent::runner::{
-        AgentRunner, CompletionCallOutcome, ModelTurnDecision, ToolExecution, append_run_messages,
-        build_chat_span, new_execute_tool_span, observe_action, resolve_completion_call,
-        resolve_model_turn_action, run_single_tool,
+        AgentRunner, CompletionCallOutcome, DeferredCallEvents, ModelTurnDecision,
+        ToolCallExecution, append_run_messages, build_chat_span, new_execute_tool_span,
+        observe_action, resolve_completion_call, resolve_model_turn_action, run_single_tool,
     },
     streaming::{StreamedAssistantContent, StreamedUserContent, ToolCallDeltaContent},
-    tool::{ToolContext, server::ToolRegistrySnapshot},
+    tool::{
+        DeferredToolDescriptor, DeferredToolLifecycleEvent, ToolContext,
+        server::ToolRegistrySnapshot,
+    },
 };
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -86,6 +89,22 @@ pub enum MultiTurnStreamItem {
         /// ([`StreamedAssistantContent::ToolCall::internal_call_id`]) and the
         /// resulting [`StreamedUserContent::ToolResult`].
         internal_call_id: String,
+    },
+    /// One deferred execution lifecycle transition. These events are emitted
+    /// by custom drivers that surface live lifecycle telemetry; the standard
+    /// agent runner also exposes the same transitions through
+    /// [`AgentHook::on_deferred_tool_event`](crate::agent::AgentHook::on_deferred_tool_event).
+    DeferredToolEvent {
+        /// Model-selected tool name.
+        tool_name: String,
+        /// Provider-issued tool-call identifier.
+        tool_call_id: Option<String>,
+        /// Rig correlation identifier.
+        internal_call_id: String,
+        /// Serializable reconstruction descriptor.
+        descriptor: DeferredToolDescriptor,
+        /// Lifecycle transition.
+        lifecycle: DeferredToolLifecycleEvent,
     },
     /// A streamed user content item: the **result** of an executed (or
     /// hook-skipped) tool call. The tool batch commits and surfaces atomically at
@@ -729,6 +748,7 @@ where
         content: UserContent,
         internal_call_id: String,
         surface: ToolSurface,
+        deferred_events: Option<DeferredCallEvents>,
     }
 
     Box::pin(async_stream::stream! {
@@ -786,6 +806,7 @@ where
                             content: result,
                             internal_call_id,
                             surface: ToolSurface::Preresolved,
+                            deferred_events: None,
                         });
                     }
                     continue;
@@ -803,14 +824,17 @@ where
                 match outcome {
                     Ok(outcome) => {
                         let surface = match outcome.execution {
-                            ToolExecution::Executed(effective) => ToolSurface::Executed(effective),
-                            ToolExecution::Skipped => ToolSurface::Skipped,
+                            ToolCallExecution::Executed(effective) => {
+                                ToolSurface::Executed(effective)
+                            }
+                            ToolCallExecution::Skipped => ToolSurface::Skipped,
                         };
                         if let Some(slot) = collected.get_mut(index) {
                             *slot = Some(CollectedToolResult {
                                 content: outcome.content,
                                 internal_call_id,
                                 surface,
+                                deferred_events: outcome.deferred_events,
                             });
                         }
                     }
@@ -841,6 +865,7 @@ where
                                     content: result,
                                     internal_call_id,
                                     surface: ToolSurface::Preresolved,
+                                    deferred_events: None,
                                 })),
                             );
                         }
@@ -859,15 +884,16 @@ where
                         .await;
                         let mapped = outcome.map(|o| {
                             let surface = match o.execution {
-                                ToolExecution::Executed(effective) => {
+                                ToolCallExecution::Executed(effective) => {
                                     ToolSurface::Executed(effective)
                                 }
-                                ToolExecution::Skipped => ToolSurface::Skipped,
+                                ToolCallExecution::Skipped => ToolSurface::Skipped,
                             };
                             CollectedToolResult {
                                 content: o.content,
                                 internal_call_id,
                                 surface,
+                                deferred_events: o.deferred_events,
                             }
                         });
                         (index, Some(mapped))
@@ -920,7 +946,12 @@ where
         let mut surface_items: Vec<MultiTurnStreamItem> =
             Vec::with_capacity(call_count.saturating_mul(2));
         for slot in collected {
-            let CollectedToolResult { content, internal_call_id, surface } = match slot {
+            let CollectedToolResult {
+                content,
+                internal_call_id,
+                surface,
+                deferred_events,
+            } = match slot {
                 Some(collected_result) => collected_result,
                 None => {
                     yield Err(StreamingError::Prompt(Box::new(PromptError::CompletionError(
@@ -937,6 +968,17 @@ where
                 // nothing here.
                 let surface_result = match surface {
                     ToolSurface::Executed(tool_call) => {
+                        if let Some(deferred_events) = deferred_events {
+                            for lifecycle in deferred_events.lifecycle {
+                                surface_items.push(MultiTurnStreamItem::DeferredToolEvent {
+                                    tool_name: tool_call.function.name.clone(),
+                                    tool_call_id: Some(tool_call.id.as_str().to_owned()),
+                                    internal_call_id: internal_call_id.clone(),
+                                    descriptor: deferred_events.descriptor.clone(),
+                                    lifecycle,
+                                });
+                            }
+                        }
                         surface_items.push(MultiTurnStreamItem::ToolExecutionCommitted {
                             tool_call: *tool_call,
                             internal_call_id: internal_call_id.clone(),
