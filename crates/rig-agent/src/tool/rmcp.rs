@@ -72,8 +72,9 @@ use rmcp::model::{
     CallToolRequest, CallToolResponse, CallToolResult, CancelTaskParams, ClientCapabilities,
     ClientInfo, ClientRequest, ContentBlock, DiscoverResult, ExtensionCapabilities, GetTaskParams,
     GetTaskResult, Implementation, InputRequiredResult, PaginatedRequestParams, ProtocolVersion,
-    ResourceContents, ServerNotification, ServerResult, SubscriptionFilter, TaskPayload,
-    UpdateTaskParams,
+    ReadResourceRequestParams, ReadResourceResponse, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerNotification, ServerResult, SubscriptionFilter,
+    TaskPayload, UpdateTaskParams,
 };
 use rmcp::service::PeerRequestOptions;
 use rmcp::{ClientCacheConfig, ClientLifecycleMode, ClientServiceExt};
@@ -89,7 +90,7 @@ use crate::tool::{
     ToolOutput, ToolResult,
 };
 use rig_core::message::{ImageMediaType, MimeType, ToolResultContent};
-use rig_core::wasm_compat::WasmBoxedFuture;
+use rig_core::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
 
 /// General result metadata returned by an MCP server.
 pub use rmcp::model::MetaObject;
@@ -155,6 +156,38 @@ impl Default for McpSubscriptionPolicy {
             channel_capacity: NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN),
         }
     }
+}
+
+/// Application handler for updates from an exact MCP resource subscription.
+///
+/// Rig owns the request-scoped `subscriptions/listen` lifecycle and invokes
+/// this handler only for resource URIs acknowledged by the server. The
+/// application retains responsibility for interpreting and durably recording
+/// the domain event.
+pub trait McpResourceNotificationHandler: WasmCompatSend + WasmCompatSync {
+    /// Handle one `notifications/resources/updated` value from the active
+    /// subscription stream.
+    fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+    ) -> WasmBoxedFuture<'_, ()>;
+}
+
+/// Application hook run immediately before an application-facing MCP request.
+///
+/// The hook may return the same request handle or a handle owned by a freshly
+/// established replacement guard. This lets applications rotate expiring
+/// transport credentials without replaying a request that may already have
+/// reached domain execution.
+pub trait McpRequestPreflight: WasmCompatSend + WasmCompatSync {
+    /// Select the guard-owned client that must receive the next request.
+    fn prepare(&self) -> WasmBoxedFuture<'_, Result<McpRequestHandle, McpClientError>>;
+}
+
+#[derive(Clone)]
+struct ResourceSubscriptions {
+    uris: Vec<String>,
+    handler: Arc<dyn McpResourceNotificationHandler>,
 }
 
 /// MCP server-to-client input categories backed by an application handler.
@@ -454,6 +487,7 @@ pub(crate) struct McpClientState {
 #[derive(Clone)]
 pub struct McpRequestHandle {
     state: Weak<McpClientState>,
+    preflight: Option<Arc<dyn McpRequestPreflight>>,
 }
 
 impl std::fmt::Debug for McpRequestHandle {
@@ -466,13 +500,24 @@ impl std::fmt::Debug for McpRequestHandle {
 }
 
 impl McpRequestHandle {
-    fn from_state(state: &Arc<McpClientState>) -> Self {
+    fn from_state(
+        state: &Arc<McpClientState>,
+        preflight: Option<Arc<dyn McpRequestPreflight>>,
+    ) -> Self {
         Self {
             state: Arc::downgrade(state),
+            preflight,
         }
     }
 
-    fn peer(&self) -> Result<rmcp::service::ServerSink, McpClientError> {
+    async fn prepared(&self) -> Result<Self, McpClientError> {
+        match &self.preflight {
+            Some(preflight) => preflight.prepare().await,
+            None => Ok(self.clone()),
+        }
+    }
+
+    fn peer_unprepared(&self) -> Result<rmcp::service::ServerSink, McpClientError> {
         let state = self.state.upgrade().ok_or(McpClientError::Unavailable)?;
         if !state.available.load(Ordering::Acquire) || state.peer.is_transport_closed() {
             return Err(McpClientError::Unavailable);
@@ -499,6 +544,22 @@ impl McpRequestHandle {
         })
     }
 
+    /// Read one MCP resource through the guard-owned client connection.
+    ///
+    /// This sends exactly one `resources/read` request. The application owns
+    /// URI admission, content limits, MRTR handling, and safe error mapping.
+    pub async fn read_resource(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResponse, McpClientError> {
+        self.prepared()
+            .await?
+            .peer_unprepared()?
+            .read_resource_once(params)
+            .await
+            .map_err(McpClientError::ResourceRead)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(peer: rmcp::service::ServerSink) -> (Self, Arc<McpClientState>) {
         let state = Arc::new(McpClientState {
@@ -508,7 +569,7 @@ impl McpRequestHandle {
             mrtr_max_rounds: rmcp::model::DEFAULT_MRTR_MAX_ROUNDS,
             task_notifications: Arc::new(TaskNotificationState::default()),
         });
-        (Self::from_state(&state), state)
+        (Self::from_state(&state, None), state)
     }
 }
 
@@ -1123,11 +1184,21 @@ impl McpTaskDriver {
 
         // Notifications only shorten the wait. The authoritative state always
         // comes from tasks/get so lost notifications cannot affect correctness.
-        let peer = self.client.peer().map_err(|error| {
-            ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
-                .with_source(error)
-                .with_retryable(false)
-        })?;
+        let peer = self
+            .client
+            .prepared()
+            .await
+            .map_err(|error| {
+                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                    .with_source(error)
+                    .with_retryable(false)
+            })?
+            .peer_unprepared()
+            .map_err(|error| {
+                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                    .with_source(error)
+                    .with_retryable(false)
+            })?;
         let result = get_mcp_task(
             &peer,
             &self.task_id,
@@ -1230,11 +1301,21 @@ impl DeferredToolDriver for McpTaskDriver {
             if let Some(terminal) = self.runtime.lock().await.terminal.clone() {
                 return Ok(terminal);
             }
-            let peer = self.client.peer().map_err(|error| {
-                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
-                    .with_source(error)
-                    .with_retryable(false)
-            })?;
+            let peer = self
+                .client
+                .prepared()
+                .await
+                .map_err(|error| {
+                    ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                        .with_source(error)
+                        .with_retryable(false)
+                })?
+                .peer_unprepared()
+                .map_err(|error| {
+                    ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                        .with_source(error)
+                        .with_retryable(false)
+                })?;
             update_mcp_task(
                 &peer,
                 &self.task_id,
@@ -1253,11 +1334,21 @@ impl DeferredToolDriver for McpTaskDriver {
             if let Some(terminal) = self.runtime.lock().await.terminal.clone() {
                 return Ok(terminal);
             }
-            let peer = self.client.peer().map_err(|error| {
-                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
-                    .with_source(error)
-                    .with_retryable(false)
-            })?;
+            let peer = self
+                .client
+                .prepared()
+                .await
+                .map_err(|error| {
+                    ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                        .with_source(error)
+                        .with_retryable(false)
+                })?
+                .peer_unprepared()
+                .map_err(|error| {
+                    ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                        .with_source(error)
+                        .with_retryable(false)
+                })?;
             cancel_mcp_task(
                 &peer,
                 &self.task_id,
@@ -1324,11 +1415,21 @@ impl McpMrtrDriver {
         params.input_responses = Some(responses);
         params.request_state = request_state;
         params.meta = request_meta_from_trace(&self.trace_meta);
-        let peer = self.client.peer().map_err(|error| {
-            ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
-                .with_source(error)
-                .with_retryable(false)
-        })?;
+        let peer = self
+            .client
+            .prepared()
+            .await
+            .map_err(|error| {
+                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                    .with_source(error)
+                    .with_retryable(false)
+            })?
+            .peer_unprepared()
+            .map_err(|error| {
+                ToolExecutionError::network(format!("MCP client is unavailable: {error}"))
+                    .with_source(error)
+                    .with_retryable(false)
+            })?;
         let response = call_mcp_tool(&peer, params, self.request_timeout)
             .await
             .map_err(|error| mcp_service_error("tools/call MRTR retry", error))?;
@@ -1581,7 +1682,14 @@ impl McpTool {
         meta: Option<RequestMetaObject>,
     ) -> WasmBoxedFuture<
         '_,
-        Result<(CallToolResponse, rmcp::model::CallToolRequestParams), ToolExecutionError>,
+        Result<
+            (
+                CallToolResponse,
+                rmcp::model::CallToolRequestParams,
+                McpRequestHandle,
+            ),
+            ToolExecutionError,
+        >,
     > {
         let name = self.definition.name.clone();
 
@@ -1605,15 +1713,22 @@ impl McpTool {
             // those client-owned values.
             request.meta = without_reserved_client_meta(meta);
 
-            let client = self.client.peer().map_err(|error| {
+            let client = self.client.prepared().await.map_err(|error| {
                 ToolExecutionError::provider(format!(
                     "MCP tool '{}' is unavailable: {error}",
                     self.definition.name
                 ))
                 .with_source(error)
             })?;
-            match call_mcp_tool(&client, request.clone(), self.timeout).await {
-                Ok(result) => Ok((result, request)),
+            let peer = client.peer_unprepared().map_err(|error| {
+                ToolExecutionError::provider(format!(
+                    "MCP tool '{}' is unavailable: {error}",
+                    self.definition.name
+                ))
+                .with_source(error)
+            })?;
+            match call_mcp_tool(&peer, request.clone(), self.timeout).await {
+                Ok(result) => Ok((result, request, client)),
                 Err(
                     error @ rmcp::ServiceError::Timeout {
                         timeout: elapsed_timeout,
@@ -1790,7 +1905,7 @@ impl ErasedTool for McpTool {
         let meta = context.get::<RequestMetaObject>().cloned();
         Box::pin(async move {
             match self.execute_mcp(args, meta).await {
-                Ok((CallToolResponse::Complete(result), _request)) => {
+                Ok((CallToolResponse::Complete(result), _request, _client)) => {
                     preserve_mcp_result(context, &result);
                     ToolExecution::complete(
                         match mcp_call_result(&result, Some(self.definition.name.as_ref())) {
@@ -1799,13 +1914,13 @@ impl ErasedTool for McpTool {
                         },
                     )
                 }
-                Ok((CallToolResponse::Task(result), request)) => {
+                Ok((CallToolResponse::Task(result), request, client)) => {
                     if let Some(meta) = result.meta.clone() {
                         context.insert_result(meta);
                     }
                     context.insert_result(result.clone());
                     match task_descriptor(
-                        &self.client,
+                        &client,
                         &result.task,
                         self.timeout,
                         request.meta.as_ref(),
@@ -1814,23 +1929,25 @@ impl ErasedTool for McpTool {
                         Err(error) => ToolExecution::complete(ToolResult::failed(error)),
                     }
                 }
-                Ok((CallToolResponse::InputRequired(result), request)) => {
+                Ok((CallToolResponse::InputRequired(result), request, client)) => {
                     if let Some(meta) = result.meta.clone() {
                         context.insert_result(meta);
                     }
                     context.insert_result(result.clone());
-                    match mrtr_descriptor(&self.client, &request, &result, 1, self.timeout) {
+                    match mrtr_descriptor(&client, &request, &result, 1, self.timeout) {
                         Ok(descriptor) => ToolExecution::Deferred(descriptor),
                         Err(error) => ToolExecution::complete(ToolResult::failed(error)),
                     }
                 }
                 Err(error) => ToolExecution::complete(ToolResult::failed(error)),
-                Ok((_unsupported, _request)) => ToolExecution::complete(ToolResult::failed(
-                    ToolExecutionError::provider(
-                        "MCP tools/call returned an unsupported result type",
-                    )
-                    .with_retryable(false),
-                )),
+                Ok((_unsupported, _request, _client)) => {
+                    ToolExecution::complete(ToolResult::failed(
+                        ToolExecutionError::provider(
+                            "MCP tools/call returned an unsupported result type",
+                        )
+                        .with_retryable(false),
+                    ))
+                }
             }
         })
     }
@@ -1871,6 +1988,33 @@ pub enum McpClientError {
     #[error("MCP server Discover response does not advertise tool support")]
     ToolsNotSupported,
 
+    /// Static resource subscriptions were configured but Discover did not
+    /// advertise request-scoped resource updates.
+    #[error("MCP server Discover response does not advertise resource subscriptions")]
+    ResourceSubscriptionsNotSupported,
+
+    /// Static resources were configured while the listener policy was
+    /// explicitly disabled.
+    #[error("MCP resource subscriptions require an enabled subscription policy")]
+    ResourceSubscriptionsDisabled,
+
+    /// The first request-scoped notification listener could not be opened.
+    #[error("Failed to establish MCP subscription listener: {0}")]
+    SubscriptionListen(#[source] rmcp::ServiceError),
+
+    /// The server acknowledged only part of the required static resource set.
+    #[error(
+        "MCP server did not acknowledge the complete resource subscription set (requested {requested:?}, accepted {accepted:?})"
+    )]
+    ResourceSubscriptionsRejected {
+        requested: Vec<String>,
+        accepted: Vec<String>,
+    },
+
+    /// A direct application resource read failed after dispatch.
+    #[error("MCP resource read failed: {0}")]
+    ResourceRead(#[source] rmcp::ServiceError),
+
     /// The guard that owned this request handle has closed or been dropped.
     #[error("MCP client is unavailable")]
     Unavailable,
@@ -1907,23 +2051,41 @@ impl ManagedRegistrations {
 /// Owns one active `subscriptions/listen` worker.
 pub struct SubscriptionGuard {
     task: Option<tokio::task::JoinHandle<()>>,
+    acknowledged: Option<SubscriptionFilter>,
+    cancel: watch::Sender<bool>,
 }
 
 impl SubscriptionGuard {
-    fn new(task: tokio::task::JoinHandle<()>) -> Self {
-        Self { task: Some(task) }
+    fn new(
+        task: tokio::task::JoinHandle<()>,
+        acknowledged: Option<SubscriptionFilter>,
+        cancel: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            acknowledged,
+            cancel,
+        }
     }
 
-    async fn cancel(&mut self) {
-        if let Some(task) = self.task.take() {
+    async fn cancel(&mut self, timeout: Duration) {
+        self.cancel.send_replace(true);
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(timeout, &mut task).await.is_err()
+        {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    fn acknowledged(&self) -> Option<&SubscriptionFilter> {
+        self.acknowledged.as_ref()
     }
 }
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
+        self.cancel.send_replace(true);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -1956,6 +2118,16 @@ impl McpClientGuard {
         &self.discovery
     }
 
+    /// The filter acknowledged before connection establishment returned.
+    ///
+    /// This is `None` when the client had no static or immediately active
+    /// notification interest. Dynamic task subscriptions may open later.
+    pub fn acknowledged_subscription_filter(&self) -> Option<&SubscriptionFilter> {
+        self.listener
+            .as_ref()
+            .and_then(SubscriptionGuard::acknowledged)
+    }
+
     /// Build the resolver that reconstructs this client's serialized MCP Task
     /// and MRTR descriptors while the guard remains alive.
     pub fn deferred_resolver(&self) -> McpDeferredResolver {
@@ -1978,7 +2150,7 @@ impl McpClientGuard {
     pub async fn close(mut self) -> Result<(), McpClientError> {
         self.state.available.store(false, Ordering::Release);
         if let Some(mut listener) = self.listener.take() {
-            listener.cancel().await;
+            listener.cancel(self.shutdown_timeout).await;
         }
         self.registrations.remove_owned().await;
         if let Some(mut running) = self.running.take() {
@@ -2044,6 +2216,8 @@ const MAX_CONCURRENT_REFRESHES: usize = 2;
 pub struct McpClientHandler {
     config: McpClientConfig,
     tool_server_handle: ToolServerHandle,
+    resource_subscriptions: Option<ResourceSubscriptions>,
+    request_preflight: Option<Arc<dyn McpRequestPreflight>>,
     /// Tracks the exact registry generation installed for each tool. Refreshes
     /// only mutate a name while this generation remains current, so a newer
     /// local or peer-handler registration cannot be deleted or overwritten.
@@ -2065,6 +2239,8 @@ impl McpClientHandler {
         Self {
             config,
             tool_server_handle,
+            resource_subscriptions: None,
+            request_preflight: None,
             managed_tools: Arc::new(RwLock::new(ManagedToolsState::default())),
             refresh_activity: Arc::new(Mutex::new(RefreshActivity::default())),
             next_refresh: Arc::new(AtomicU64::new(0)),
@@ -2083,6 +2259,43 @@ impl McpClientHandler {
     /// Set the deadline for initial and list-changed tool-list fetches.
     pub fn with_refresh_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeouts.catalog = timeout;
+        self
+    }
+
+    /// Restore an exact static resource filter on every subscription worker
+    /// owned by this client.
+    ///
+    /// Connection establishment waits for the server to acknowledge every
+    /// supplied URI. The handler receives updates only while the returned
+    /// [`McpClientGuard`] remains alive. Empty input disables resource
+    /// subscriptions.
+    pub fn with_resource_subscriptions<I, S, H>(mut self, uris: I, handler: H) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        H: McpResourceNotificationHandler + 'static,
+    {
+        let mut uris = uris.into_iter().map(Into::into).collect::<Vec<_>>();
+        uris.sort();
+        uris.dedup();
+        self.resource_subscriptions = (!uris.is_empty()).then(|| ResourceSubscriptions {
+            uris,
+            handler: Arc::new(handler),
+        });
+        self
+    }
+
+    /// Run an application hook before each tool, resource, Task, and MRTR
+    /// request dispatched through handles owned by this client.
+    ///
+    /// The hook can atomically choose a replacement guard's handle. Rig does
+    /// not replay requests after dispatch; credential rotation therefore
+    /// remains make-before-break and safe for mutating tools.
+    pub fn with_request_preflight<H>(mut self, preflight: H) -> Self
+    where
+        H: McpRequestPreflight + 'static,
+    {
+        self.request_preflight = Some(Arc::new(preflight));
         self
     }
 
@@ -2251,7 +2464,7 @@ impl McpClientHandler {
         E: std::error::Error + Send + Sync + 'static,
     {
         let client_info = self.config.client_info();
-        let service = self
+        let mut service = self
             .serve_with_lifecycle(
                 transport,
                 ClientLifecycleMode::Discover {
@@ -2300,22 +2513,33 @@ impl McpClientHandler {
             mrtr_max_rounds: handler.config.mrtr_max_rounds,
             task_notifications: Arc::new(TaskNotificationState::default()),
         });
-        let request_handle = McpRequestHandle::from_state(&state);
+        let request_handle =
+            McpRequestHandle::from_state(&state, handler.request_preflight.clone());
         let refresh = handler.begin_refresh();
         let tools = handler.fetch_tools(service.peer(), &request_handle).await?;
         handler.commit_initial(refresh, tools).await;
 
-        let listener = spawn_subscription_listener(
-            service.peer().clone(),
-            handler.clone(),
-            request_handle.clone(),
-            &discovery,
-        );
         let registrations = ManagedRegistrations {
             state: handler.managed_tools.clone(),
             tool_server: handler.tool_server_handle.clone(),
         };
         let shutdown_timeout = handler.config.request_timeouts.shutdown;
+        let listener = match start_subscription_listener(
+            service.peer().clone(),
+            handler.clone(),
+            request_handle.clone(),
+            &discovery,
+        )
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                state.available.store(false, Ordering::Release);
+                registrations.remove_owned().await;
+                let _ = service.close_with_timeout(shutdown_timeout).await;
+                return Err(error);
+            }
+        };
 
         Ok(McpClientGuard {
             request_handle,
@@ -2329,12 +2553,12 @@ impl McpClientHandler {
     }
 }
 
-fn spawn_subscription_listener(
+async fn start_subscription_listener(
     peer: rmcp::service::ServerSink,
     handler: McpClientHandler,
     request_handle: McpRequestHandle,
     discovery: &DiscoverResult,
-) -> Option<SubscriptionGuard> {
+) -> Result<Option<SubscriptionGuard>, McpClientError> {
     let policy = handler.config.subscription.clone();
     let supports_tool_changes = discovery
         .capabilities
@@ -2342,59 +2566,131 @@ fn spawn_subscription_listener(
         .as_ref()
         .is_some_and(|tools| tools.list_changed == Some(true));
     let supports_tasks = discovery.capabilities.supports_tasks();
-    if !policy.enabled || (!supports_tool_changes && !supports_tasks) {
-        return None;
+    let supports_resource_updates = discovery
+        .capabilities
+        .resources
+        .as_ref()
+        .is_some_and(|resources| resources.subscribe == Some(true));
+    let required_resources = handler
+        .resource_subscriptions
+        .as_ref()
+        .map(|subscriptions| subscriptions.uris.clone())
+        .unwrap_or_default();
+    if !required_resources.is_empty() && !policy.enabled {
+        return Err(McpClientError::ResourceSubscriptionsDisabled);
+    }
+    if !required_resources.is_empty() && !supports_resource_updates {
+        return Err(McpClientError::ResourceSubscriptionsNotSupported);
+    }
+    if !policy.enabled
+        || (!supports_tool_changes && !supports_tasks && required_resources.is_empty())
+    {
+        return Ok(None);
     }
     let task_notifications = request_handle
         .state()
-        .ok()
         .map(|state| state.task_notifications.clone())?;
 
+    let initial_filter = subscription_filter(
+        supports_tool_changes,
+        supports_tasks,
+        &task_notifications,
+        &required_resources,
+    );
+    let (initial_subscription, acknowledged) = if subscription_filter_is_empty(&initial_filter) {
+        (None, None)
+    } else {
+        let mut subscription = peer
+            .listen_with_capacity(initial_filter, policy.channel_capacity)
+            .await
+            .map_err(McpClientError::SubscriptionListen)?;
+        if !acknowledges_resources(subscription.acknowledged(), &required_resources) {
+            let accepted = acknowledged_resources(subscription.acknowledged());
+            let _ = subscription
+                .cancel_with_reason(Some(
+                    "required resource subscription was not acknowledged".to_owned(),
+                ))
+                .await;
+            return Err(McpClientError::ResourceSubscriptionsRejected {
+                requested: required_resources,
+                accepted,
+            });
+        }
+        let acknowledged = subscription.acknowledged().clone();
+        (Some(subscription), Some(acknowledged))
+    };
+
+    let (cancel, mut cancelled) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut interest_changes = task_notifications.subscribe();
-        loop {
+        let mut next_subscription = initial_subscription;
+        'listener: loop {
             if peer.is_transport_closed() || !request_handle.is_available() {
                 break;
             }
 
-            let task_ids = if supports_tasks {
-                task_notifications.task_ids()
+            let mut subscription = if let Some(subscription) = next_subscription.take() {
+                subscription
             } else {
-                Vec::new()
-            };
-            let mut filter = SubscriptionFilter::new();
-            if supports_tool_changes {
-                filter.tools_list_changed = Some(true);
-            }
-            if !task_ids.is_empty() {
-                filter.task_ids = Some(task_ids);
-            }
-            if filter.tools_list_changed != Some(true) && filter.task_ids.is_none() {
-                if interest_changes.changed().await.is_err() {
-                    break;
-                }
-                continue;
-            }
-
-            let mut subscription = match peer
-                .listen_with_capacity(filter, policy.channel_capacity)
-                .await
-            {
-                Ok(subscription) => subscription,
-                Err(error) => {
-                    if peer.is_transport_closed() {
-                        tracing::debug!(%error, "MCP subscription transport closed");
-                        break;
+                let filter = subscription_filter(
+                    supports_tool_changes,
+                    supports_tasks,
+                    &task_notifications,
+                    &required_resources,
+                );
+                if subscription_filter_is_empty(&filter) {
+                    tokio::select! {
+                        changed = interest_changes.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        changed = cancelled.changed() => {
+                            if changed.is_err() || *cancelled.borrow() {
+                                break;
+                            }
+                        }
                     }
-                    tracing::warn!(%error, "MCP subscription listen failed; opening a new request");
-                    tokio::time::sleep(policy.reconnect_delay).await;
                     continue;
                 }
+
+                match peer
+                    .listen_with_capacity(filter, policy.channel_capacity)
+                    .await
+                {
+                    Ok(mut subscription) => {
+                        if !acknowledges_resources(subscription.acknowledged(), &required_resources)
+                        {
+                            let accepted = acknowledged_resources(subscription.acknowledged());
+                            let _ = subscription
+                                .cancel_with_reason(Some(
+                                    "required resource subscription was not acknowledged"
+                                        .to_owned(),
+                                ))
+                                .await;
+                            tracing::warn!(
+                                requested = ?required_resources,
+                                ?accepted,
+                                "MCP server did not restore the complete resource subscription set"
+                            );
+                            tokio::time::sleep(policy.reconnect_delay).await;
+                            continue;
+                        }
+                        subscription
+                    }
+                    Err(error) => {
+                        if peer.is_transport_closed() {
+                            tracing::debug!(%error, "MCP subscription transport closed");
+                            break;
+                        }
+                        tracing::warn!(%error, "MCP subscription listen failed; opening a new request");
+                        tokio::time::sleep(policy.reconnect_delay).await;
+                        continue;
+                    }
+                }
             };
 
-            if subscription.acknowledged().tools_list_changed != Some(true)
-                && subscription.acknowledged().task_ids.is_none()
-            {
+            if subscription_filter_is_empty(subscription.acknowledged()) {
                 tracing::info!(
                     "MCP server accepted none of Rig's notification filters; correctness remains polling and TTL-on-use"
                 );
@@ -2407,6 +2703,15 @@ fn spawn_subscription_listener(
             let mut filter_changed = false;
             loop {
                 let next = tokio::select! {
+                    changed = cancelled.changed() => {
+                        if changed.is_err() || *cancelled.borrow() {
+                            let _ = subscription
+                                .cancel_with_reason(Some("client connection replaced".to_owned()))
+                                .await;
+                            break 'listener;
+                        }
+                        continue;
+                    }
                     changed = interest_changes.changed() => {
                         if changed.is_err() {
                             break;
@@ -2439,9 +2744,17 @@ fn spawn_subscription_listener(
                         // performs tasks/get before exposing any new state.
                         task_notifications.wake(&notification.params.task.task.task_id);
                     }
+                    Ok(Some(ServerNotification::ResourceUpdatedNotification(notification))) => {
+                        if let Some(subscriptions) = handler.resource_subscriptions.as_ref() {
+                            subscriptions
+                                .handler
+                                .on_resource_updated(notification.params)
+                                .await;
+                        }
+                    }
                     Ok(Some(_)) => {
-                        // rmcp already verifies the accepted subset and request
-                        // ID; no other category was requested by this worker.
+                        // rmcp verifies the accepted subset and request ID. No
+                        // other category was requested by this worker.
                     }
                     Ok(None) => break,
                     Err(error) => {
@@ -2477,7 +2790,44 @@ fn spawn_subscription_listener(
             }
         }
     });
-    Some(SubscriptionGuard::new(task))
+    Ok(Some(SubscriptionGuard::new(task, acknowledged, cancel)))
+}
+
+fn subscription_filter(
+    supports_tool_changes: bool,
+    supports_tasks: bool,
+    task_notifications: &TaskNotificationState,
+    required_resources: &[String],
+) -> SubscriptionFilter {
+    let mut filter = SubscriptionFilter::new();
+    if supports_tool_changes {
+        filter.tools_list_changed = Some(true);
+    }
+    if !required_resources.is_empty() {
+        filter.resource_subscriptions = Some(required_resources.to_vec());
+    }
+    if supports_tasks {
+        let task_ids = task_notifications.task_ids();
+        if !task_ids.is_empty() {
+            filter.task_ids = Some(task_ids);
+        }
+    }
+    filter
+}
+
+fn subscription_filter_is_empty(filter: &SubscriptionFilter) -> bool {
+    filter == &SubscriptionFilter::new()
+}
+
+fn acknowledged_resources(filter: &SubscriptionFilter) -> Vec<String> {
+    let mut accepted = filter.resource_subscriptions.clone().unwrap_or_default();
+    accepted.sort();
+    accepted.dedup();
+    accepted
+}
+
+fn acknowledges_resources(filter: &SubscriptionFilter, required: &[String]) -> bool {
+    required.is_empty() || acknowledged_resources(filter) == required
 }
 
 impl rmcp::handler::client::ClientHandler for McpClientHandler {
@@ -2917,6 +3267,76 @@ mod tests {
             .expect("register resolver");
         let handle = registry.resolve(&restored).await.expect("resolve deferred");
         (restored, handle, context)
+    }
+
+    #[derive(Clone)]
+    struct InvalidatingReplacementPreflight {
+        replacement: McpRequestHandle,
+        original: Arc<StdMutex<Option<std::sync::Weak<McpClientState>>>>,
+    }
+
+    impl McpRequestPreflight for InvalidatingReplacementPreflight {
+        fn prepare(&self) -> WasmBoxedFuture<'_, Result<McpRequestHandle, McpClientError>> {
+            if let Some(state) = self
+                .original
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                state.available.store(false, Ordering::Release);
+            }
+            Box::pin(std::future::ready(Ok(self.replacement.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_descriptor_uses_the_preflight_selected_client() {
+        let (_replacement_server, tool_server, replacement_guard, replacement_server_task) =
+            deferred_fixture(DeferredScenario::Task).await;
+
+        let original_server = DeferredScenarioServer::new(DeferredScenario::Task);
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let original_server_task = tokio::spawn(async move {
+            let running = original_server
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("original server start");
+            let _ = running.waiting().await;
+        });
+        let original = Arc::new(StdMutex::new(None));
+        let original_guard = McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0"))
+                .with_deferred_backend_id("mcp:test-deferred"),
+            tool_server.clone(),
+        )
+        .with_request_preflight(InvalidatingReplacementPreflight {
+            replacement: replacement_guard.request_handle(),
+            original: original.clone(),
+        })
+        .connect((client_from_server, client_to_server))
+        .await
+        .expect("original client connect");
+        *original.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(original_guard.request_handle().state.clone());
+
+        let mut context = ToolContext::new();
+        let outcome = tool_server
+            .execute_with_outcome("fixture_tool", "{}", &mut context)
+            .await;
+        assert!(
+            matches!(outcome, ToolExecution::Deferred(_)),
+            "a task response dispatched through the replacement client must stay deferred"
+        );
+
+        original_guard.close().await.expect("close original guard");
+        replacement_guard
+            .close()
+            .await
+            .expect("close replacement guard");
+        original_server_task.abort();
+        replacement_server_task.abort();
     }
 
     #[tokio::test]
@@ -3476,9 +3896,10 @@ mod tests {
 mod migrated_tests {
     use super::{
         MAX_CONCURRENT_REFRESHES, McpClientConfig, McpClientError, McpClientGuard,
-        McpClientHandler, McpRequestHandle,
+        McpClientHandler, McpRequestHandle, McpRequestPreflight, McpResourceNotificationHandler,
     };
     use crate::tool::{DynamicTool, ToolOutput, server::ToolServer};
+    use rig_core::wasm_compat::WasmBoxedFuture;
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt,
         handler::client::ClientHandler,
@@ -3487,7 +3908,7 @@ mod migrated_tests {
     };
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -4417,5 +4838,453 @@ mod migrated_tests {
             crate::tool::ToolErrorKind::NotFound
         );
         task.abort();
+    }
+
+    #[derive(Clone)]
+    struct ResourceSubscriptionServer;
+
+    impl ServerHandler for ResourceSubscriptionServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .enable_resources_subscribe()
+                    .build(),
+            )
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_server_info(Implementation::new("resource-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new())
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private))
+        }
+
+        async fn read_resource(
+            &self,
+            request: ReadResourceRequestParams,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResponse, ErrorData> {
+            if request.uri != "memo://insights" {
+                return Err(ErrorData::resource_not_found("unknown resource", None));
+            }
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                r#"{"status":"ready"}"#,
+                request.uri,
+            )])
+            .into())
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            requested: &SubscriptionFilter,
+        ) -> Option<SubscriptionFilter> {
+            Some(requested.supported_by(&self.get_info().capabilities))
+        }
+
+        async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+            assert_eq!(
+                context
+                    .accepted()
+                    .resource_subscriptions
+                    .as_ref()
+                    .expect("resource subscription accepted"),
+                &["memo://insights".to_owned()]
+            );
+            context
+                .sink()
+                .notify_resource_updated("memo://insights")
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            context.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingResourceHandler {
+        uris: Arc<StdMutex<Vec<String>>>,
+        notified: Arc<Notify>,
+    }
+
+    impl McpResourceNotificationHandler for RecordingResourceHandler {
+        fn on_resource_updated(
+            &self,
+            params: ResourceUpdatedNotificationParam,
+        ) -> WasmBoxedFuture<'_, ()> {
+            self.uris
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(params.uri);
+            self.notified.notify_one();
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReplacementRequestPreflight {
+        replacement: McpRequestHandle,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl McpRequestPreflight for ReplacementRequestPreflight {
+        fn prepare(&self) -> WasmBoxedFuture<'_, Result<McpRequestHandle, McpClientError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(self.replacement.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_preflight_routes_read_through_replacement_client() {
+        let (replacement_client_to_server, replacement_server_from_client) =
+            tokio::io::duplex(8192);
+        let (replacement_server_to_client, replacement_client_from_server) =
+            tokio::io::duplex(8192);
+        let replacement_server_task = tokio::spawn(async move {
+            let running = ResourceSubscriptionServer
+                .serve((replacement_server_from_client, replacement_server_to_client))
+                .await
+                .expect("replacement server start");
+            let _ = running.waiting().await;
+        });
+        let replacement_tool_server = ToolServer::new().run();
+        let replacement_guard = McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            replacement_tool_server,
+        )
+        .connect((replacement_client_from_server, replacement_client_to_server))
+        .await
+        .expect("replacement client connect");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (original_client_to_server, original_server_from_client) = tokio::io::duplex(8192);
+        let (original_server_to_client, original_client_from_server) = tokio::io::duplex(8192);
+        let original_server_task = tokio::spawn(async move {
+            let running = ResourceSubscriptionUnsupportedServer
+                .serve((original_server_from_client, original_server_to_client))
+                .await
+                .expect("original server start");
+            let _ = running.waiting().await;
+        });
+        let original_tool_server = ToolServer::new().run();
+        let original_guard = McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            original_tool_server,
+        )
+        .with_request_preflight(ReplacementRequestPreflight {
+            replacement: replacement_guard.request_handle(),
+            calls: calls.clone(),
+        })
+        .connect((original_client_from_server, original_client_to_server))
+        .await
+        .expect("original client connect");
+
+        let response = original_guard
+            .request_handle()
+            .read_resource(ReadResourceRequestParams::new("memo://insights"))
+            .await
+            .expect("request must use replacement client");
+        assert!(matches!(response, ReadResourceResponse::Complete(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        original_guard
+            .cancel()
+            .await
+            .expect("original client close");
+        replacement_guard
+            .cancel()
+            .await
+            .expect("replacement client close");
+        original_server_task.await.expect("original server task");
+        replacement_server_task
+            .await
+            .expect("replacement server task");
+    }
+
+    #[tokio::test]
+    async fn connect_acknowledges_resource_filter_before_delivering_updates() {
+        let server = ResourceSubscriptionServer;
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let running = server
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server start");
+            let _ = running.waiting().await;
+        });
+        let recorder = RecordingResourceHandler::default();
+        let observed = recorder.clone();
+        let tool_server = ToolServer::new().run();
+        let guard = McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            tool_server,
+        )
+        .with_resource_subscriptions(["memo://insights"], recorder)
+        .connect((client_from_server, client_to_server))
+        .await
+        .expect("client connect");
+
+        assert_eq!(
+            guard
+                .acknowledged_subscription_filter()
+                .and_then(|filter| filter.resource_subscriptions.as_ref()),
+            Some(&vec!["memo://insights".to_owned()])
+        );
+        tokio::time::timeout(Duration::from_secs(1), observed.notified.notified())
+            .await
+            .expect("resource update delivered");
+        assert_eq!(
+            observed
+                .uris
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            ["memo://insights"]
+        );
+        let read = guard
+            .request_handle()
+            .read_resource(ReadResourceRequestParams::new("memo://insights"))
+            .await
+            .expect("resource read");
+        let ReadResourceResponse::Complete(read) = read else {
+            panic!("resource read unexpectedly required input");
+        };
+        assert_eq!(
+            read.contents,
+            [ResourceContents::text(
+                r#"{"status":"ready"}"#,
+                "memo://insights"
+            )]
+        );
+
+        guard.cancel().await.expect("client close");
+        server_task.await.expect("server task");
+    }
+
+    #[derive(Clone)]
+    struct CancellationObservingServer {
+        cancelled: Arc<Notify>,
+    }
+
+    impl ServerHandler for CancellationObservingServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .enable_resources_subscribe()
+                    .build(),
+            )
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_server_info(Implementation::new("cancellation-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new())
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private))
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            requested: &SubscriptionFilter,
+        ) -> Option<SubscriptionFilter> {
+            Some(requested.supported_by(&self.get_info().capabilities))
+        }
+
+        async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+            context.cancelled().await;
+            self.cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_cancel_waits_for_protocol_cancellation_before_transport_shutdown() {
+        let cancelled = Arc::new(Notify::new());
+        let server = CancellationObservingServer {
+            cancelled: cancelled.clone(),
+        };
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let running = server
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server start");
+            let _ = running.waiting().await;
+        });
+        let mut guard = McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            ToolServer::new().run(),
+        )
+        .with_resource_subscriptions(["memo://insights"], RecordingResourceHandler::default())
+        .connect((client_from_server, client_to_server))
+        .await
+        .expect("client connect");
+
+        guard
+            .listener
+            .as_mut()
+            .expect("resource listener")
+            .cancel(Duration::from_secs(1))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+            .await
+            .expect("server observed listener cancellation");
+        assert!(guard.request_handle().is_available());
+
+        guard.cancel().await.expect("client close");
+        server_task.await.expect("server task");
+    }
+
+    #[derive(Clone)]
+    struct ResourceSubscriptionUnsupportedServer;
+
+    impl ServerHandler for ResourceSubscriptionUnsupportedServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::V_2026_07_28)
+                .with_server_info(Implementation::new("resource-unsupported", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new())
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_required_resources_when_server_does_not_support_them() {
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let running = ResourceSubscriptionUnsupportedServer
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server start");
+            let _ = running.waiting().await;
+        });
+        let tool_server = ToolServer::new().run();
+        let error = match McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            tool_server,
+        )
+        .with_resource_subscriptions(["memo://insights"], RecordingResourceHandler::default())
+        .connect((client_from_server, client_to_server))
+        .await
+        {
+            Ok(guard) => {
+                guard.cancel().await.expect("client close");
+                panic!("resource subscriptions unexpectedly succeeded");
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            McpClientError::ResourceSubscriptionsNotSupported
+        ));
+        server_task.await.expect("server task");
+    }
+
+    #[derive(Clone)]
+    struct PartialResourceSubscriptionServer;
+
+    impl ServerHandler for PartialResourceSubscriptionServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .enable_resources_subscribe()
+                    .build(),
+            )
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_server_info(Implementation::new("partial-resource-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(Vec::new())
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private))
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            _: &SubscriptionFilter,
+        ) -> Option<SubscriptionFilter> {
+            let mut accepted = SubscriptionFilter::new();
+            accepted.resource_subscriptions = Some(vec!["memo://insights".to_owned()]);
+            Some(accepted)
+        }
+
+        async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+            context.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_partial_resource_acknowledgment() {
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let running = PartialResourceSubscriptionServer
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server start");
+            let _ = running.waiting().await;
+        });
+        let tool_server = ToolServer::new().run();
+        let error = match McpClientHandler::new(
+            McpClientConfig::new(Implementation::new("rig-test", "0.1.0")),
+            tool_server,
+        )
+        .with_resource_subscriptions(
+            ["memo://insights", "memo://knowledge"],
+            RecordingResourceHandler::default(),
+        )
+        .connect((client_from_server, client_to_server))
+        .await
+        {
+            Ok(guard) => {
+                guard.cancel().await.expect("client close");
+                panic!("partial resource acknowledgment unexpectedly succeeded");
+            }
+            Err(error) => error,
+        };
+
+        match error {
+            McpClientError::ResourceSubscriptionsRejected {
+                requested,
+                accepted,
+            } => {
+                assert_eq!(requested, ["memo://insights", "memo://knowledge"]);
+                assert_eq!(accepted, ["memo://insights"]);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        server_task.await.expect("server task");
     }
 }
