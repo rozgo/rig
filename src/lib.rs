@@ -165,8 +165,8 @@ pub mod tool {
         DeferredResolverError, DeferredToolDescriptor, DeferredToolDriver, DeferredToolHandle,
         DeferredToolLifecycleEvent, DeferredToolResolver, DeferredToolResolverRegistry,
         DeferredToolState, DynamicTool, InputRequest, InputRequests, InputResponse, InputResponses,
-        MissingToolContext, Tool, ToolContext, ToolEmbedding, ToolExecution, ToolSet,
-        ToolSetBuilder, server, tool_definition,
+        MissingToolContext, Tool, ToolContext, ToolEmbedding, ToolExecution, ToolSet, server,
+        tool_definition,
     };
 
     /// The complete portable `rig-core` tool surface, under one explicit path.
