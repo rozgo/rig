@@ -12,7 +12,6 @@ pub use rig_core::completion::*;
 
 /// Errors from classic agent prompting.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum PromptError {
     /// A provider completion failed.
     #[error("CompletionError: {0}")]
@@ -81,10 +80,26 @@ macro_rules! forward_provider_response_helpers {
                 }
             }
 
+            #[doc = concat!("Returns the provider transport request id exposed by a wrapped ", $inner, " (rig#2314).")]
+            pub fn provider_request_id(&self) -> Option<&str> {
+                match self {
+                    Self::$variant(error) => error.provider_request_id(),
+                    _ => None,
+                }
+            }
+
             #[doc = concat!("Returns the HTTP status exposed by a wrapped ", $inner, ".")]
             pub fn provider_response_status(&self) -> Option<http::StatusCode> {
                 match self {
                     Self::$variant(error) => error.provider_response_status(),
+                    _ => None,
+                }
+            }
+
+            #[doc = concat!("Returns the response headers exposed by a wrapped ", $inner, " — e.g. `Retry-After` on a 429 (rig#2210).")]
+            pub fn provider_response_headers(&self) -> Option<&http::HeaderMap> {
+                match self {
+                    Self::$variant(error) => error.provider_response_headers(),
                     _ => None,
                 }
             }
@@ -109,7 +124,6 @@ impl PromptError {
 
 /// Errors returned by typed structured prompting.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum StructuredOutputError {
     /// The underlying classic run failed.
     #[error("PromptError: {0}")]
@@ -208,14 +222,13 @@ mod provider_response_tests {
     fn prompt_error_provider_response_helpers_forward_wrapped_completion_error() {
         let body = r#"{"error":{"code":"invalid_request","message":"bad input"}}"#;
         let error = PromptError::CompletionError(CompletionError::ProviderResponse(
-            ProviderResponseError {
-                status: None,
-                body: body.to_string(),
-            },
+            ProviderResponseError::without_status(body),
         ));
 
         assert_eq!(error.provider_response_body(), Some(body));
         assert_eq!(error.provider_response_status(), None);
+        // rig#2314: the transport request id forwards through the wrapper too.
+        assert_eq!(error.provider_request_id(), None);
         assert_eq!(
             error.provider_response_json().expect("valid JSON body"),
             Some(serde_json::json!({
@@ -225,6 +238,79 @@ mod provider_response_tests {
                 }
             }))
         );
+    }
+
+    /// rig#2210: the response headers forward through both wrappers, so an
+    /// agent-level caller can back off on `Retry-After` without unwrapping to
+    /// the transport error by hand. Covered on both classifications, since
+    /// the two store the headers in different places.
+    #[test]
+    fn prompt_error_forwards_captured_response_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("20"),
+        );
+        let body = r#"{"error":{"message":"rate limited"}}"#;
+
+        for completion_error in [
+            // Contract provider: headers live on the ProviderResponse.
+            CompletionError::from_http_response_with_request_id(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                body,
+                Some("req_abc".to_string()),
+            )
+            .with_response_headers(Some(Box::new(headers.clone()))),
+            // Contract-less provider: headers live on the transport error.
+            CompletionError::from_http_response(http::StatusCode::TOO_MANY_REQUESTS, body)
+                .with_response_headers(Some(Box::new(headers.clone()))),
+        ] {
+            let prompt_error = PromptError::CompletionError(completion_error);
+            assert_eq!(
+                prompt_error
+                    .provider_response_headers()
+                    .and_then(|headers| headers.get(http::header::RETRY_AFTER))
+                    .and_then(|value| value.to_str().ok()),
+                Some("20"),
+                "PromptError dropped the captured headers",
+            );
+
+            let structured = StructuredOutputError::PromptError(Box::new(prompt_error));
+            assert_eq!(
+                structured
+                    .provider_response_headers()
+                    .and_then(|headers| headers.get(http::header::RETRY_AFTER))
+                    .and_then(|value| value.to_str().ok()),
+                Some("20"),
+                "StructuredOutputError dropped the captured headers",
+            );
+        }
+    }
+
+    /// Variants that wrap no provider response report no headers.
+    #[test]
+    fn prompt_error_reports_no_headers_for_unrelated_variants() {
+        let error = PromptError::PromptCancelled {
+            chat_history: vec![Message::user("hi")],
+            reason: "cancelled".to_string(),
+        };
+        assert!(error.provider_response_headers().is_none());
+        assert!(
+            StructuredOutputError::EmptyResponse
+                .provider_response_headers()
+                .is_none()
+        );
+    }
+
+    /// rig#2314: a wrapped completion error's transport request id forwards
+    /// through `PromptError` (and, transitively, `StructuredOutputError`).
+    #[test]
+    fn prompt_error_forwards_the_provider_request_id() {
+        let error = PromptError::CompletionError(CompletionError::ProviderResponse(
+            ProviderResponseError::new(http::StatusCode::NOT_FOUND, "{}")
+                .with_provider_request_id(Some("req_failed_call".to_string())),
+        ));
+        assert_eq!(error.provider_request_id(), Some("req_failed_call"));
     }
 
     #[test]
@@ -248,10 +334,10 @@ mod provider_response_tests {
     fn structured_output_error_provider_response_helpers_forward_prompt_error() {
         let body = r#"{"error":{"message":"bad input"}}"#;
         let error = StructuredOutputError::PromptError(Box::new(PromptError::CompletionError(
-            CompletionError::ProviderResponse(ProviderResponseError {
-                status: Some(http::StatusCode::BAD_REQUEST),
-                body: body.to_string(),
-            }),
+            CompletionError::ProviderResponse(ProviderResponseError::new(
+                http::StatusCode::BAD_REQUEST,
+                body,
+            )),
         )));
 
         assert_eq!(error.provider_response_body(), Some(body));

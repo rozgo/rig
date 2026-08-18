@@ -55,7 +55,6 @@ use crate::{
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use async_stream::stream;
-use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -330,7 +329,6 @@ impl From<&CompletionResponse> for Usage {
 }
 
 impl crate::telemetry::ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Message;
     type Usage = Usage;
 
     /// Ollama's chat API carries no response ID.
@@ -340,10 +338,6 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
 
     fn get_response_model_name(&self) -> Option<String> {
         Some(self.model.clone())
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        vec![self.message.clone()]
     }
 
     fn get_text_response(&self) -> Option<String> {
@@ -718,12 +712,11 @@ where
                 .system_instructions(system_instructions.as_deref(), record_telemetry_content)
                 .build();
 
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(target: "rig::completions",
-                "Ollama completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Ollama completion request",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
 
@@ -733,34 +726,26 @@ where
             .body(body)
             .map_err(http_client::Error::from)?;
 
-        let async_block = async move {
-            let response = self.client.send::<_, Bytes>(req).await?;
-            let status = response.status();
-            let response_body = response.into_body().into_future().await?.to_vec();
+        let async_block = internal::completion_send::send_completion::<
+            _,
+            internal::envelope::DirectPayload<CompletionResponse>,
+            _,
+        >(
+            &self.client,
+            req,
+            "Ollama completion",
+            // A local Ollama server reports no request-id response header.
+            None,
+            |response| {
+                let span = tracing::Span::current();
+                span.record_response_metadata(response);
+                span.record_token_usage(&Usage::from(response));
+            },
+        );
 
-            if !status.is_success() {
-                return Err(CompletionError::from_http_response(
-                    status,
-                    String::from_utf8_lossy(&response_body),
-                ));
-            }
-
-            let response: CompletionResponse = serde_json::from_slice(&response_body)?;
-            let span = tracing::Span::current();
-            span.record_response_metadata(&response);
-            span.record_token_usage(&Usage::from(&response));
-
-            if tracing::enabled!(tracing::Level::TRACE) {
-                tracing::trace!(target: "rig::completions",
-                    "Ollama completion response: {}",
-                    serde_json::to_string_pretty(&response)?
-                );
-            }
-
-            Ok(response)
-        };
-
-        tracing::Instrument::instrument(async_block, span).await
+        tracing::Instrument::instrument(async_block, span)
+            .await
+            .map(|(payload, _)| payload)
     }
 
     /// Open a stream whose terminal record stays Ollama-native.
@@ -786,12 +771,11 @@ where
         .build();
         request.stream = true;
 
-        if tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(target: "rig::completions",
-                "Ollama streaming completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Ollama streaming completion request",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
 
@@ -991,7 +975,11 @@ where
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        self.raw_completion(completion_request).await?.try_into()
+        // Capture before `try_into` consumes the raw value.
+        let raw = self.raw_completion(completion_request).await?;
+        let captured = serde_json::to_value(&raw)?;
+        let response: completion::CompletionResponse = raw.try_into()?;
+        Ok(response.with_raw(captured))
     }
 
     async fn stream(
@@ -999,7 +987,10 @@ where
         request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse, CompletionError> {
         let stream = self.raw_stream(request).await?;
-        let normalized = streaming::normalize_stream(stream, |response| Ok(response.into()));
+        let normalized =
+            streaming::normalize_stream(stream, |response: StreamingCompletionResponse| {
+                Ok(response.into())
+            });
 
         Ok(streaming::StreamingCompletionResponse::stream(
             PROVIDER_NAME,
@@ -1126,7 +1117,7 @@ pub enum Message {
         images: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        #[serde(default, deserialize_with = "json_utils::null_or_vec")]
+        #[serde(default, deserialize_with = "json_utils::null_or_default")]
         tool_calls: Vec<ToolCall>,
     },
     System {
@@ -2958,5 +2949,86 @@ mod tests {
             Some(http::StatusCode::SERVICE_UNAVAILABLE)
         );
         assert_eq!(error.provider_response_body(), Some(body));
+    }
+
+    /// Raw-capture tests: the `TryFrom` shape, driven end to end through
+    /// `CompletionModel::completion` over the recording mock transport. Ollama
+    /// has no request-id contract, so there is nothing transport-side to
+    /// reattach; the capture is the `/api/chat` body exactly as `raw_completion`
+    /// parses it. The body carries the timing fields (`total_duration`,
+    /// `eval_duration`, ...) rig never normalizes, so the capture can be shown
+    /// to answer more than the normalized response does.
+    mod raw_capture {
+        use super::*;
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::test_utils::RecordingHttpClient;
+
+        const BODY: &str = r#"{
+            "model": "llama3.2",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {"role": "assistant", "content": "hello"},
+            "done": true,
+            "done_reason": "stop",
+            "total_duration": 5043500667,
+            "load_duration": 5025959,
+            "prompt_eval_count": 26,
+            "prompt_eval_duration": 325953000,
+            "eval_count": 5,
+            "eval_duration": 4709213000
+        }"#;
+
+        fn model() -> CompletionModel<RecordingHttpClient> {
+            let client = Client::builder()
+                .api_key("test-key")
+                .http_client(RecordingHttpClient::new(BODY))
+                .build()
+                .expect("build client");
+            client.completion_model(LLAMA3_2)
+        }
+
+        /// The load-bearing capture property: `raw` is Ollama's
+        /// `CompletionResponse` as rig parsed it — it deserializes back into
+        /// that type and re-serializes to the identical value — and
+        /// re-normalizing that capture through the same `TryFrom` reproduces
+        /// every normalized field. Also reads `total_duration` and
+        /// `eval_duration` off the capture, which the normalized response
+        /// provably lacks.
+        #[tokio::test]
+        async fn completion_captures_raw_that_round_trips_into_the_wire_type() {
+            let model = model();
+
+            let response = model
+                .completion(model.completion_request("hello").build())
+                .await
+                .expect("completion");
+
+            let raw = &response.raw;
+            let typed: CompletionResponse =
+                serde_json::from_value(raw.clone()).expect("raw must deserialize");
+            assert_eq!(
+                serde_json::to_value(&typed).expect("re-serialize"),
+                *raw,
+                "the capture must be exactly what the wire type serializes to"
+            );
+            assert_eq!(typed.total_duration, Some(5_043_500_667));
+            assert_eq!(typed.eval_duration, Some(4_709_213_000));
+            assert_eq!(raw["total_duration"], 5_043_500_667_u64);
+            assert_eq!(typed.done_reason.as_deref(), Some("stop"));
+
+            let renormalized: completion::CompletionResponse =
+                typed.try_into().expect("re-normalize the capture");
+            assert_eq!(response.identity(), renormalized.identity());
+            assert_eq!(response.finish_reason(), renormalized.finish_reason());
+            assert_eq!(response.model, renormalized.model);
+            assert_eq!(response.usage, renormalized.usage);
+            assert_eq!(response.choice, renormalized.choice);
+            assert_eq!(
+                response.finish_reason(),
+                Some(completion::FinishReason::Stop)
+            );
+            assert_eq!(response.model.as_deref(), Some("llama3.2"));
+            assert_eq!(response.usage.total_tokens, 31);
+        }
     }
 }

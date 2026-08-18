@@ -1,6 +1,6 @@
-use crate::types::assistant_content::{PROVIDER_NAME, map_stop_reason};
+use crate::types::assistant_content::{PROVIDER_NAME, map_stop_reason, normalize_usage};
 use crate::types::completion_request::AwsCompletionRequest;
-use crate::types::converse_output::StopReason;
+use crate::types::converse_output::{StopReason, TokenUsage};
 use crate::{
     completion::{CompletionModel, resolve_request_model},
     types::errors::{AwsSdkConverseStreamError, converse_stream_output_completion_error},
@@ -24,22 +24,17 @@ use tracing_futures::Instrument;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct BedrockStreamingResponse {
-    pub usage: Option<BedrockUsage>,
+    pub usage: Option<TokenUsage>,
     /// Bedrock's own `stopReason` from the terminal `MessageStop` event, when
     /// the stream reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct BedrockUsage {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_input_tokens: Option<i32>,
+    /// The AWS request id from the converse-stream response's metadata
+    /// (`x-amzn-RequestId`) — not part of any stream event; stamped by
+    /// `raw_stream` from the SDK operation output, matching the unary
+    /// surface's semantics. `None` when the SDK reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
 }
 
 impl From<&BedrockStreamingResponse> for rig_core::completion::Usage {
@@ -47,22 +42,17 @@ impl From<&BedrockStreamingResponse> for rig_core::completion::Usage {
         response
             .usage
             .as_ref()
-            .map(|u| rig_core::completion::Usage {
-                input_tokens: u.input_tokens as u64,
-                output_tokens: u.output_tokens as u64,
-                total_tokens: u.total_tokens as u64,
-                cached_input_tokens: u.cache_read_input_tokens.unwrap_or_default() as u64,
-                cache_creation_input_tokens: u.cache_write_input_tokens.unwrap_or_default() as u64,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
+            .map(normalize_usage)
             .unwrap_or_default()
     }
 }
 
 #[derive(Default)]
 struct ReasoningState {
-    content: String,
+    /// Signature carried by this block's `signature` delta — the only
+    /// adapter-side state, because the wire delivers it out of band from the
+    /// thinking text. Thinking TEXT accumulates in the shared accumulator via
+    /// `ReasoningDelta`s; no restatement buffer exists.
     signature: Option<String>,
 }
 
@@ -78,33 +68,31 @@ fn block_id(content_block_index: i32) -> rig_core::streaming::StreamPartId {
     rig_core::streaming::MintKind::Block.for_wire_index(index)
 }
 
-/// Convert an accumulated [`ReasoningState`] into a streaming reasoning chunk.
+/// Close the open thinking block for `content_block_index`.
 ///
-/// Adaptive-thinking blocks from Bedrock can arrive as signature-only — i.e. a
-/// `Signature` delta with no preceding non-empty `Text` delta. Dropping such
-/// blocks loses the signature on the way back to the consumer, which then
-/// fails on the next turn with `messages.N.content.0.thinking.signature:
-/// Field required` when the conversation is replayed to Bedrock. We must emit
-/// whenever either the content or the signature is present; both-empty is
-/// still skipped.
-fn finalize_reasoning(
+/// The end carries no restatement — the shared accumulator already holds every
+/// `ReasoningDelta` this block streamed, so restating the text would supersede
+/// the accumulation with a second copy of itself — only the signature, which
+/// the wire never restates. Adaptive-thinking blocks can even be
+/// signature-only (a `Signature` delta with no non-empty `Text` delta), and
+/// dropping that signature makes the next turn fail with
+/// `messages.N.content.0.thinking.signature: Field required` on replay. A
+/// wholly empty block still lands nowhere: a payload-less end creates no part.
+fn reasoning_end(
     state: ReasoningState,
     content_block_index: i32,
-) -> Option<RawStreamingChoice<BedrockStreamingResponse>> {
-    if state.content.is_empty() && state.signature.is_none() {
-        return None;
-    }
-    Some(RawStreamingChoice::Reasoning {
+) -> RawStreamingChoice<BedrockStreamingResponse> {
+    RawStreamingChoice::ReasoningEnd {
         // Bedrock has no reasoning item id; the block's `contentBlockIndex`
-        // is stable across its deltas and stop, so the full block supersedes
-        // the accumulated deltas.
+        // is stable across its deltas and its close.
         id: block_id(content_block_index),
-        provider_id: None,
-        content: ReasoningContent::Text {
-            text: state.content,
-            signature: state.signature,
-        },
-    })
+        reasoning: None,
+        signature: state.signature,
+        // Both call sites close on a frame the wire actually sent — its own
+        // `contentBlockStop`, or the redacted sibling delta that ends the
+        // plaintext block — so the completed block reaches the consumer.
+        wire_sent: true,
+    }
 }
 
 /// Accumulated per-stream state for [`process_event`].
@@ -170,11 +158,11 @@ fn process_event(
                 }
                 aws_bedrock::ContentBlockDelta::ReasoningContent(reasoning) => match reasoning {
                     aws_bedrock::ReasoningContentBlockDelta::Text(text) => {
+                        // Marks the block open so its stop emits an end; the
+                        // text itself belongs to the shared accumulator.
                         state
                             .current_reasoning
-                            .get_or_insert_with(ReasoningState::default)
-                            .content
-                            .push_str(text.as_str());
+                            .get_or_insert_with(ReasoningState::default);
 
                         if !text.is_empty() {
                             items.push(Ok(RawStreamingChoice::ReasoningDelta {
@@ -199,11 +187,8 @@ fn process_event(
                         // block index would otherwise make the redacted block
                         // *replace* the delta-built thinking part instead of
                         // landing beside it as a sibling.
-                        if let Some(open) = state.current_reasoning.take()
-                            && let Some(choice) =
-                                finalize_reasoning(open, event.content_block_index)
-                        {
-                            items.push(Ok(choice));
+                        if let Some(open) = state.current_reasoning.take() {
+                            items.push(Ok(reasoning_end(open, event.content_block_index)));
                         }
 
                         items.push(Ok(RawStreamingChoice::Reasoning {
@@ -269,13 +254,14 @@ fn process_event(
             }
         }
         aws_bedrock::ConverseStreamOutput::ContentBlockStop(event) => {
-            if let Some(reasoning_state) = state.current_reasoning.take()
-                && let Some(choice) = finalize_reasoning(reasoning_state, event.content_block_index)
-            {
-                items.push(Ok(choice));
+            if let Some(reasoning_state) = state.current_reasoning.take() {
+                items.push(Ok(reasoning_end(
+                    reasoning_state,
+                    event.content_block_index,
+                )));
             }
             // A closed tool-use block is complete: finalize and emit it here,
-            // mirroring the reasoning finalize above, so every call in a
+            // mirroring the reasoning close above, so every call in a
             // multi-tool-call message reaches the consumer. The shared
             // accumulator finalizes the assembled input: an empty accumulated
             // input means a tool with no parameters, and malformed JSON
@@ -335,14 +321,14 @@ fn process_event(
             // Extract usage information from metadata; a missing usage still
             // yields a terminal record so the stream ends with a FinalResponse.
             let final_response = BedrockStreamingResponse {
-                usage: metadata_event.usage.map(|usage| BedrockUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    total_tokens: usage.total_tokens,
-                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                    cache_write_input_tokens: usage.cache_write_input_tokens,
-                }),
+                // The mirror conversion is infallible for `TokenUsage`.
+                usage: metadata_event
+                    .usage
+                    .and_then(|usage| TokenUsage::try_from(usage).ok()),
                 stop_reason: state.final_stop_reason.clone(),
+                // Stamped by `raw_stream`; the adapter never sees the SDK
+                // operation output's metadata.
+                provider_request_id: None,
             };
             items.push(Ok(RawStreamingChoice::FinalResponse(final_response)));
         }
@@ -409,6 +395,7 @@ fn normalize_bedrock_stream(
         let usage = (&response).into();
         let finish_reason = response.stop_reason.as_ref().map(map_stop_reason);
         Ok(rig_core::streaming::StreamFinal::new(PROVIDER_NAME, usage)
+            .with_optional_provider_request_id(response.provider_request_id.clone())
             .with_optional_finish_reason(finish_reason))
     })
 }
@@ -461,6 +448,12 @@ impl CompletionModel {
                 Into::<CompletionError>::into(AwsSdkConverseStreamError(sdk_error))
             })?;
 
+        // Read the AWS request id off the operation output *before* the event
+        // stream is moved — `ConverseStreamOutput` implements the SDK
+        // `RequestId` trait on the whole output, not on stream events.
+        let provider_request_id =
+            aws_sdk_bedrockruntime::operation::RequestId::request_id(&response).map(str::to_string);
+
         // Transport layer: SDK event-stream frames only — an event-stream
         // decode/receive failure is a transport error; classification and
         // policy live in the shared driver.
@@ -478,9 +471,19 @@ impl CompletionModel {
             }
         };
 
-        Ok(Box::pin(
-            run_wire_stream(transport, StreamState::default()).instrument(span),
-        ))
+        // Stamp the terminal record with the id captured above, mirroring the
+        // unary surface (`InternalConverseOutput::request_id`).
+        use futures::StreamExt as _;
+        let stream = run_wire_stream(transport, StreamState::default()).instrument(span);
+        Ok(Box::pin(stream.map(move |item| {
+            item.map(|choice| match choice {
+                RawStreamingChoice::FinalResponse(mut response) => {
+                    response.provider_request_id = provider_request_id.clone();
+                    RawStreamingChoice::FinalResponse(response)
+                }
+                other => other,
+            })
+        })))
     }
 
     /// Open a stream normalized to rig's terminal record. Delegates to
@@ -614,6 +617,19 @@ mod tests {
         .await;
         assert!(drained.errors.is_empty(), "{:?}", drained.errors);
         assert_eq!(drained.reasoning.len(), 1);
+        assert_eq!(
+            drained
+                .reasoning
+                .iter()
+                .flat_map(|reasoning| reasoning.content.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![ReasoningContent::Text {
+                text: "let me think".to_string(),
+                signature: None,
+            }],
+            "an unsigned block closes carrying just its accumulated text"
+        );
     }
 
     const REDACTED_BLOB: &[u8] = b"\x00opaque-stream-ciphertext\xff";
@@ -714,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_bedrock_usage_creation() {
-        let usage = BedrockUsage {
+        let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
@@ -730,7 +746,7 @@ mod tests {
     #[test]
     fn test_bedrock_streaming_response_with_usage() {
         let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
+            usage: Some(TokenUsage {
                 input_tokens: 200,
                 output_tokens: 75,
                 total_tokens: 275,
@@ -738,6 +754,7 @@ mod tests {
                 cache_write_input_tokens: Some(10),
             }),
             stop_reason: None,
+            provider_request_id: None,
         };
 
         assert_eq!(
@@ -759,6 +776,7 @@ mod tests {
         let response = BedrockStreamingResponse {
             usage: None,
             stop_reason: None,
+            provider_request_id: None,
         };
 
         // Zero-valued usage is rig's documented sentinel for "the provider
@@ -773,7 +791,7 @@ mod tests {
     #[test]
     fn test_streaming_response_normalizes_usage() {
         let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
+            usage: Some(TokenUsage {
                 input_tokens: 448,
                 output_tokens: 68,
                 total_tokens: 516,
@@ -781,6 +799,7 @@ mod tests {
                 cache_write_input_tokens: Some(20),
             }),
             stop_reason: None,
+            provider_request_id: None,
         };
 
         // The streaming response normalizes into rig's usage record.
@@ -800,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_bedrock_usage_serde() {
-        let usage = BedrockUsage {
+        let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
@@ -815,7 +834,7 @@ mod tests {
         assert!(json.contains("\"total_tokens\":150"));
 
         // Test deserialization
-        let deserialized: BedrockUsage = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: TokenUsage = serde_json::from_str(&json).expect("Should deserialize");
         assert_eq!(deserialized.input_tokens, usage.input_tokens);
         assert_eq!(deserialized.output_tokens, usage.output_tokens);
         assert_eq!(deserialized.total_tokens, usage.total_tokens);
@@ -832,7 +851,7 @@ mod tests {
     #[test]
     fn test_bedrock_streaming_response_serde() {
         let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
+            usage: Some(TokenUsage {
                 input_tokens: 200,
                 output_tokens: 75,
                 total_tokens: 275,
@@ -840,6 +859,7 @@ mod tests {
                 cache_write_input_tokens: Some(15),
             }),
             stop_reason: None,
+            provider_request_id: None,
         };
 
         // Test serialization
@@ -858,153 +878,76 @@ mod tests {
         assert_eq!(usage.cache_write_input_tokens, Some(15));
     }
 
-    #[test]
-    fn test_reasoning_state_default() {
-        // Test that ReasoningState defaults are correct
-        let state = ReasoningState::default();
-        assert_eq!(state.content, "");
-        assert_eq!(state.signature, None);
+    /// A signed thinking block closes with its signature attached to the
+    /// text the shared accumulator assembled from the deltas — the exact
+    /// shape the next turn must replay to Bedrock.
+    #[tokio::test]
+    async fn signed_thinking_block_closes_with_its_signature() {
+        let mut events = vec![
+            reasoning_text_delta(0, "I am "),
+            reasoning_text_delta(0, "thinking"),
+            reasoning_signature_delta(0, "sig-abc"),
+            block_stop(0),
+        ];
+        events.extend(terminal());
+
+        let drained = drain(events).await;
+
+        assert!(drained.errors.is_empty(), "errors: {:?}", drained.errors);
+        assert_eq!(
+            drained
+                .reasoning
+                .iter()
+                .flat_map(|reasoning| reasoning.content.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![ReasoningContent::Text {
+                text: "I am thinking".to_string(),
+                signature: Some("sig-abc".to_string()),
+            }]
+        );
     }
 
-    #[test]
-    fn test_reasoning_state_accumulate_content() {
-        // Test accumulating content in ReasoningState
-        let mut state = ReasoningState::default();
-        state.content.push_str("First chunk");
-        state.content.push_str(" Second chunk");
-        state.content.push_str(" Third chunk");
+    /// Adaptive thinking on Bedrock can produce a `Signature` delta with no
+    /// non-empty `Text` delta. The signature is replay-required provider
+    /// state, so a signature-only block must still reach the consumer —
+    /// dropping it fails the next turn with
+    /// `messages.N.content.0.thinking.signature: Field required`.
+    #[tokio::test]
+    async fn signature_only_thinking_block_still_reaches_the_consumer() {
+        let mut events = vec![reasoning_signature_delta(0, "sig-only"), block_stop(0)];
+        events.extend(terminal());
 
-        assert_eq!(state.content, "First chunk Second chunk Third chunk");
-        assert_eq!(state.signature, None);
+        let drained = drain(events).await;
+
+        assert!(drained.errors.is_empty(), "errors: {:?}", drained.errors);
+        assert_eq!(
+            drained
+                .reasoning
+                .iter()
+                .flat_map(|reasoning| reasoning.content.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![ReasoningContent::Text {
+                text: String::new(),
+                signature: Some("sig-only".to_string()),
+            }]
+        );
     }
 
-    #[test]
-    fn test_reasoning_state_with_signature() {
-        // Test ReasoningState with signature
-        let mut state = ReasoningState::default();
-        state.content.push_str("Reasoning content");
-        state.signature = Some("test_signature_456".to_string());
+    /// A block that streamed nothing at all — an empty `Text` delta and no
+    /// signature — says nothing at its stop: the payload-less end must not
+    /// conjure an empty reasoning part.
+    #[tokio::test]
+    async fn wholly_empty_thinking_block_emits_nothing() {
+        let mut events = vec![reasoning_text_delta(0, ""), block_stop(0)];
+        events.extend(terminal());
 
-        assert_eq!(state.content, "Reasoning content");
-        assert_eq!(state.signature, Some("test_signature_456".to_string()));
-    }
+        let drained = drain(events).await;
 
-    #[test]
-    fn test_reasoning_state_empty_content() {
-        // Test that ReasoningState can have empty content
-        let state = ReasoningState {
-            signature: Some("signature_only".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(state.content, "");
-        assert!(state.signature.is_some());
-    }
-
-    #[test]
-    fn test_reasoning_state_accumulation() {
-        let mut state = ReasoningState::default();
-
-        state.content.push_str("First, ");
-        state.content.push_str("I need to ");
-        state.content.push_str("analyze the problem.");
-
-        assert_eq!(state.content, "First, I need to analyze the problem.");
-        assert!(state.signature.is_none());
-    }
-
-    #[test]
-    fn test_reasoning_state_with_signature_accumulation() {
-        let mut state = ReasoningState::default();
-
-        state.content.push_str("Reasoning content here");
-        state.signature = Some("sig_part1".to_string());
-
-        // Simulate signature being built up (in practice it comes in one chunk)
-        if let Some(ref mut sig) = state.signature {
-            sig.push_str("_part2");
-        }
-
-        assert_eq!(state.content, "Reasoning content here");
-        assert_eq!(state.signature, Some("sig_part1_part2".to_string()));
-    }
-
-    #[test]
-    fn finalize_reasoning_with_content_and_signature_emits_text_block() {
-        let state = ReasoningState {
-            content: "I am thinking".to_string(),
-            signature: Some("sig-abc".to_string()),
-        };
-
-        let choice = finalize_reasoning(state, 0).expect("should emit reasoning");
-        match choice {
-            RawStreamingChoice::Reasoning {
-                id,
-                provider_id: _,
-                content,
-            } => {
-                assert_eq!(id, block_id(0));
-                match content {
-                    ReasoningContent::Text { text, signature } => {
-                        assert_eq!(text, "I am thinking");
-                        assert_eq!(signature.as_deref(), Some("sig-abc"));
-                    }
-                    other => panic!("expected ReasoningContent::Text, got {:?}", other),
-                }
-            }
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_signature_only_still_emits_block() {
-        // Adaptive-thinking on Bedrock can produce a Signature delta with no
-        // accompanying non-empty Text delta. Previously this was silently
-        // dropped, losing the signature and breaking next-turn replay.
-        let state = ReasoningState {
-            content: String::new(),
-            signature: Some("sig-only".to_string()),
-        };
-
-        let choice =
-            finalize_reasoning(state, 0).expect("should emit reasoning for signature-only state");
-        match choice {
-            RawStreamingChoice::Reasoning { content, .. } => match content {
-                ReasoningContent::Text { text, signature } => {
-                    assert!(text.is_empty());
-                    assert_eq!(signature.as_deref(), Some("sig-only"));
-                }
-                other => panic!("expected ReasoningContent::Text, got {:?}", other),
-            },
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_content_only_still_emits_block() {
-        let state = ReasoningState {
-            content: "thoughts without sig".to_string(),
-            signature: None,
-        };
-
-        let choice =
-            finalize_reasoning(state, 0).expect("should emit reasoning for content-only state");
-        match choice {
-            RawStreamingChoice::Reasoning { content, .. } => match content {
-                ReasoningContent::Text { text, signature } => {
-                    assert_eq!(text, "thoughts without sig");
-                    assert!(signature.is_none());
-                }
-                other => panic!("expected ReasoningContent::Text, got {:?}", other),
-            },
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_both_empty_emits_nothing() {
-        let state = ReasoningState::default();
-        assert!(finalize_reasoning(state, 0).is_none());
+        assert!(drained.errors.is_empty(), "errors: {:?}", drained.errors);
+        assert!(drained.reasoning.is_empty());
+        assert!(drained.reached_terminal);
     }
 
     fn tool_start_event(index: i32, id: &str, name: &str) -> aws_bedrock::ConverseStreamOutput {
@@ -1296,5 +1239,145 @@ mod tests {
             calls.first().expect("call").function.arguments,
             serde_json::json!({})
         );
+    }
+
+    /// Bedrock's terminal `Metadata` event carrying usage, so the stream ends
+    /// with a fully populated `BedrockStreamingResponse`.
+    fn metadata_event_with_usage(input: i32, output: i32) -> aws_bedrock::ConverseStreamOutput {
+        aws_bedrock::ConverseStreamOutput::Metadata(
+            aws_bedrock::ConverseStreamMetadataEvent::builder()
+                .usage(
+                    aws_bedrock::TokenUsage::builder()
+                        .input_tokens(input)
+                        .output_tokens(output)
+                        .total_tokens(input + output)
+                        .build()
+                        .expect("token usage should build"),
+                )
+                .build(),
+        )
+    }
+
+    /// Drive `items` through the normalized pipeline exactly as the
+    /// `CompletionModel` seam does, returning the terminal.
+    async fn normalized_terminal(
+        items: Vec<Result<RawStreamingChoice<BedrockStreamingResponse>, CompletionError>>,
+    ) -> rig_core::streaming::StreamFinal {
+        let raw: rig_core::streaming::RawStreamingResult<BedrockStreamingResponse> =
+            Box::pin(futures::stream::iter(items));
+        let mut stream =
+            StreamingCompletionResponse::stream(PROVIDER_NAME, normalize_bedrock_stream(raw));
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+        }
+        stream
+            .response
+            .expect("the stream must end with a terminal record")
+    }
+
+    /// The events-first seam captures like the request-driven one: its
+    /// terminal `raw` is the same `BedrockStreamingResponse` the model's
+    /// `stream()` would attach, because both funnel through
+    /// `normalize_bedrock_stream`.
+    #[tokio::test]
+    async fn stream_from_events_terminal_carries_raw() {
+        let mut stream = stream_from_events(futures::stream::iter(
+            vec![
+                text_delta_event(0, "hi"),
+                block_stop(0),
+                message_stop_event(aws_bedrock::StopReason::EndTurn),
+                metadata_event_with_usage(3, 1),
+            ]
+            .into_iter()
+            .map(Ok),
+        ));
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+        }
+        let terminal = stream.response.expect("terminal record");
+
+        let raw = &terminal.raw;
+        let typed: BedrockStreamingResponse =
+            serde_json::from_value(raw.clone()).expect("raw must deserialize");
+        assert_eq!(typed.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(terminal.usage.total_tokens, 4);
+    }
+
+    /// The load-bearing streaming capture property at the seam
+    /// `CompletionModel::stream` routes through: the terminal's `raw` is
+    /// Bedrock's own `BedrockStreamingResponse` — it deserializes back into
+    /// that type and re-serializes identically — and re-normalizing that
+    /// capture reproduces every normalized field. The Bedrock `stopReason`
+    /// spelling is only readable off the capture.
+    #[tokio::test]
+    async fn terminal_raw_round_trips_into_the_terminal_type() {
+        let (items, _) = run_events(vec![
+            text_delta_event(0, "hi"),
+            block_stop(0),
+            message_stop_event(aws_bedrock::StopReason::EndTurn),
+            metadata_event_with_usage(3, 1),
+        ]);
+        let terminal = normalized_terminal(items).await;
+
+        let raw = &terminal.raw;
+        let typed: BedrockStreamingResponse =
+            serde_json::from_value(raw.clone()).expect("raw must deserialize");
+        assert_eq!(
+            serde_json::to_value(&typed).expect("re-serialize"),
+            *raw,
+            "the capture must be exactly what the terminal type serializes to"
+        );
+        assert_eq!(typed.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(
+            typed.usage.as_ref().map(|usage| usage.total_tokens),
+            Some(4)
+        );
+
+        // Feeding the capture back through the same pipeline tells the same
+        // story as the terminal the stream produced.
+        let renormalized =
+            normalized_terminal(vec![Ok(RawStreamingChoice::FinalResponse(typed))]).await;
+        assert_eq!(terminal.identity(), renormalized.identity());
+        assert_eq!(terminal.finish_reason, renormalized.finish_reason);
+        assert_eq!(terminal.model, renormalized.model);
+        assert_eq!(terminal.usage, renormalized.usage);
+        assert_eq!(
+            terminal.finish_reason,
+            Some(rig_core::completion::FinishReason::Stop)
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_identity_tests {
+    use super::*;
+
+    /// Blocking/streaming parity (rig#2265): the streaming terminal's AWS
+    /// request id — stamped from the SDK operation output, the same source
+    /// the unary surface reads — normalizes into
+    /// `StreamFinal.provider_request_id`.
+    #[test]
+    fn streaming_terminal_request_id_normalizes_into_stream_final() {
+        let response = BedrockStreamingResponse {
+            usage: None,
+            stop_reason: Some(StopReason::EndTurn),
+            provider_request_id: Some("aws-req-1".to_string()),
+        };
+
+        let usage = (&response).into();
+        let terminal = rig_core::streaming::StreamFinal::new(PROVIDER_NAME, usage)
+            .with_optional_provider_request_id(response.provider_request_id.clone())
+            .with_optional_finish_reason(response.stop_reason.as_ref().map(map_stop_reason));
+        assert_eq!(terminal.provider_request_id.as_deref(), Some("aws-req-1"));
+
+        // And a response without one stays None — never an error.
+        let without = BedrockStreamingResponse {
+            usage: None,
+            stop_reason: None,
+            provider_request_id: None,
+        };
+        let terminal = rig_core::streaming::StreamFinal::new(PROVIDER_NAME, (&without).into())
+            .with_optional_provider_request_id(without.provider_request_id.clone());
+        assert_eq!(terminal.provider_request_id, None);
     }
 }

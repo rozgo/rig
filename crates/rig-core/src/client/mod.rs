@@ -44,7 +44,6 @@ use crate::{
 };
 
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum ClientBuilderError {
     /// The underlying HTTP backend failed during builder construction.
     #[error("reqwest error: {0}")]
@@ -64,7 +63,6 @@ pub enum ClientBuilderError {
 /// detected before any model request is sent, such as missing API keys, invalid environment
 /// values, or invalid builder configuration.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum ProviderClientError {
     /// A required or optional environment variable could not be read as valid Unicode.
     ///
@@ -678,26 +676,51 @@ where
             .body(http_client::NoBody)
             .map_err(http_client::Error::from)?;
 
-        let response = self.http_client.send(req).await?;
+        // The reqwest transport reports non-success as an error before this
+        // status match can run (found live on rig#2315's error matrix: the
+        // 401/403 arms below were dead and every bogus key surfaced as a raw
+        // HttpError). Recover the status from the transport error so the
+        // documented VerifyError classification actually fires.
+        let response = match self.http_client.send(req).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(match error.non_success_status() {
+                    Some(StatusCode::UNAUTHORIZED) | Some(StatusCode::FORBIDDEN) => {
+                        VerifyError::InvalidAuthentication
+                    }
+                    _ => VerifyError::HttpError(error),
+                });
+            }
+        };
 
         match response.status() {
             StatusCode::OK => Ok(()),
             StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                 Err(VerifyError::InvalidAuthentication)
             }
+            // The failed response's headers are preserved on every branch, so
+            // a caller can read rate-limit metadata such as `Retry-After` off
+            // a rejected verification (rig#2210).
             StatusCode::INTERNAL_SERVER_ERROR => {
-                let text = http_client::text(response).await?;
+                let headers = Box::new(response.headers().clone());
+                let body = http_client::text(response).await?;
                 Err(VerifyError::HttpError(
-                    http_client::Error::InvalidStatusCodeWithMessage(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        text,
-                    ),
+                    http_client::Error::InvalidStatusCodeWithDetails {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        body,
+                        headers,
+                    },
                 ))
             }
             status if status.as_u16() == 529 => {
-                let text = http_client::text(response).await?;
+                let headers = Box::new(response.headers().clone());
+                let body = http_client::text(response).await?;
                 Err(VerifyError::HttpError(
-                    http_client::Error::InvalidStatusCodeWithMessage(status, text),
+                    http_client::Error::InvalidStatusCodeWithDetails {
+                        status,
+                        body,
+                        headers,
+                    },
                 ))
             }
             _ => {
@@ -706,9 +729,14 @@ where
                 if status.is_success() {
                     Ok(())
                 } else {
-                    let text: String = String::from_utf8_lossy(&response.into_body().await?).into();
+                    let headers = Box::new(response.headers().clone());
+                    let body: String = String::from_utf8_lossy(&response.into_body().await?).into();
                     Err(VerifyError::HttpError(
-                        http_client::Error::InvalidStatusCodeWithMessage(status, text),
+                        http_client::Error::InvalidStatusCodeWithDetails {
+                            status,
+                            body,
+                            headers,
+                        },
                     ))
                 }
             }

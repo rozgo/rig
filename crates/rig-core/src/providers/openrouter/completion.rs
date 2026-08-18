@@ -565,17 +565,53 @@ impl ProviderPreferences {
     }
 }
 
+fn deserialize_openrouter_choices_dropping_incomplete_tool_calls<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Choice>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::providers::internal::openai_chat_completions_compatible::deserialize_choices_dropping_incomplete_tool_calls_when(
+        deserializer,
+        |choice| {
+            let normalized = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.is_empty());
+            if let Some(reason) = normalized {
+                return matches!(map_openai_finish_reason(reason), completion::FinishReason::Length);
+            }
+
+            choice
+                .get("native_finish_reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .is_some_and(|reason| {
+                    matches!(map_native_finish_reason(reason), completion::FinishReason::Length)
+                })
+        },
+    )
+}
+
 /// A openrouter completion object.
 ///
-/// For more information, see this link: <https://docs.openrouter.xyz/reference/create_chat_completion_v1_chat_completions_post>
+/// For more information, see the
+/// [OpenRouter Chat Completions reference](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
     pub created: u64,
     pub model: String,
+    #[serde(deserialize_with = "deserialize_openrouter_choices_dropping_incomplete_tool_calls")]
     pub choices: Vec<Choice>,
     pub system_fingerprint: Option<String>,
+    /// Upstream provider selected by OpenRouter for this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Service tier reported by the routed provider, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub usage: Option<Usage>,
 }
 
@@ -617,8 +653,12 @@ pub(crate) fn map_native_finish_reason(reason: &str) -> completion::FinishReason
     match reason.to_ascii_lowercase().as_str() {
         // OpenAI-compatible upstreams, plus Anthropic's `end_turn`/`stop_sequence`
         // and Gemini's `STOP`.
-        "stop" | "end_turn" | "stop_sequence" | "complete" => completion::FinishReason::Stop,
-        "length" | "max_tokens" | "model_length" => completion::FinishReason::Length,
+        "stop" | "end_turn" | "stop_sequence" | "complete" | "completed" => {
+            completion::FinishReason::Stop
+        }
+        "length" | "max_tokens" | "max_output_tokens" | "model_length" => {
+            completion::FinishReason::Length
+        }
         "tool_calls" | "function_call" | "tool_use" => completion::FinishReason::ToolCalls,
         "content_filter" | "safety" | "blocklist" | "prohibited_content" | "spii" => {
             completion::FinishReason::ContentFilter
@@ -643,33 +683,34 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
 
         let content = match &choice.message {
             Message::Assistant {
-                content,
+                content: message_content,
                 tool_calls,
                 reasoning,
                 reasoning_details,
                 images,
+                refusal,
                 ..
             } => {
-                let mut content = content
-                    .iter()
-                    .map(|c| match c {
-                        openai::AssistantContent::Text { text, .. } => {
-                            completion::AssistantContent::text(text)
-                        }
-                        openai::AssistantContent::Refusal { refusal } => {
-                            completion::AssistantContent::text(refusal)
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                // A structured-output refusal arrives as a *sibling* of
+                // `content` (`{"content": null, "refusal": "…"}`), not as the
+                // `refusal` content part below — that spelling belongs to the
+                // Responses API, which this wire never sends. Reading only
+                // `content` dropped the refusal outright and normalized the
+                // turn to nothing, while `get_text_response` already fell back
+                // to the field and the streaming path already delivered it.
+                // The rule is shared with the OpenAI chat path so no two
+                // readers of this wire can disagree about it (#2332).
+                let refusal_fallback = openai::completion::assistant_refusal_fallback(
+                    message_content,
+                    refusal.as_deref(),
+                );
 
-                content.extend(tool_calls.iter().map(|call| {
-                    completion::AssistantContent::tool_call(
-                        &call.id,
-                        &call.function.name,
-                        call.function.arguments.clone(),
-                    )
-                }));
-
+                // Match the shared streaming adapter's canonical turn order:
+                // the model reasons, speaks, then acts. OpenRouter may place
+                // reasoning beside text and tool calls in one blocking
+                // message, so appending it after the calls made blocking and
+                // streaming histories disagree for the same provider turn.
+                let mut normalized_content = Vec::new();
                 let mut grouped_reasoning: HashMap<
                     Option<String>,
                     Vec<(usize, usize, message::ReasoningContent)>,
@@ -723,7 +764,7 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
 
                 if grouped_reasoning.is_empty() {
                     if let Some(reasoning) = reasoning {
-                        content.push(completion::AssistantContent::reasoning(reasoning));
+                        normalized_content.push(completion::AssistantContent::reasoning(reasoning));
                     }
                 } else {
                     for reasoning_id in reasoning_order {
@@ -731,7 +772,7 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
                             continue;
                         };
                         blocks.sort_by_key(|(index, position, _)| (*index, *position));
-                        content.push(completion::AssistantContent::Reasoning(
+                        normalized_content.push(completion::AssistantContent::Reasoning(
                             message::Reasoning {
                                 id: reasoning_id,
                                 content: blocks
@@ -743,16 +784,45 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
                     }
                 }
 
-                content.extend(images.iter().map(response_image_to_assistant_content));
+                normalized_content.extend(message_content.iter().map(|part| match part {
+                    openai::AssistantContent::Text { text, .. } => {
+                        completion::AssistantContent::text(text)
+                    }
+                    openai::AssistantContent::Refusal { refusal } => {
+                        completion::AssistantContent::text(refusal)
+                    }
+                }));
 
-                Ok(content)
+                if let Some(refusal) = refusal_fallback {
+                    normalized_content.push(completion::AssistantContent::text(refusal));
+                }
+
+                normalized_content.extend(tool_calls.iter().map(|call| {
+                    completion::AssistantContent::tool_call(
+                        &call.id,
+                        &call.function.name,
+                        call.function.arguments.clone(),
+                    )
+                }));
+
+                normalized_content.extend(images.iter().map(response_image_to_assistant_content));
+
+                Ok(normalized_content)
             }
             _ => Err(CompletionError::ResponseError(
                 "Response did not contain a valid message or tool call".into(),
             )),
         }?;
 
-        let choice = crate::message::require_non_empty_response(content)?;
+        // A provider-truncated turn can legitimately have no surviving
+        // content (for example, its only tool call was cut off before the
+        // first usable argument token). Preserve the terminal diagnostic and
+        // metadata exactly as the shared OpenAI-compatible normalizer does;
+        // completed empty turns remain errors.
+        let choice = match &finish_reason {
+            Some(reason) if reason.truncated_output() => content,
+            _ => crate::message::require_non_empty_response(content)?,
+        };
 
         let usage = response
             .usage
@@ -773,7 +843,6 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
 }
 
 impl ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Choice;
     type Usage = Usage;
 
     fn get_response_id(&self) -> Option<String> {
@@ -784,15 +853,13 @@ impl ProviderResponseExt for CompletionResponse {
         Some(self.model.clone())
     }
 
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.choices.clone()
-    }
-
     fn get_text_response(&self) -> Option<String> {
         let response = self
             .choices
             .iter()
-            .filter_map(|choice| assistant_message_text_response(&choice.message))
+            .filter_map(|choice| {
+                openai::completion::assistant_message_text_response(&choice.message)
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -802,33 +869,6 @@ impl ProviderResponseExt for CompletionResponse {
     fn get_usage(&self) -> Option<Self::Usage> {
         self.usage.clone()
     }
-}
-
-fn assistant_message_text_response(message: &Message) -> Option<String> {
-    let Message::Assistant {
-        content, refusal, ..
-    } = message
-    else {
-        return None;
-    };
-
-    let mut segments = content
-        .iter()
-        .filter_map(|content| match content {
-            openai::AssistantContent::Text { text, .. } => (!text.is_empty()).then(|| text.clone()),
-            openai::AssistantContent::Refusal { refusal } => {
-                (!refusal.is_empty()).then(|| refusal.clone())
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(refusal) = refusal
-        && !refusal.is_empty()
-    {
-        segments.push(refusal.clone());
-    }
-
-    (!segments.is_empty()).then(|| segments.join("\n"))
 }
 
 // OpenRouter shares OpenAI's Chat Completions message model. The request and
@@ -1112,6 +1152,12 @@ pub struct Choice {
     pub native_finish_reason: Option<String>,
     pub message: Message,
     pub finish_reason: Option<String>,
+    /// Per-token probability metadata returned when `logprobs` is requested.
+    ///
+    /// Normalized completions intentionally omit provider-native
+    /// probabilities; callers of `raw_completion` retain the complete object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
@@ -1494,6 +1540,20 @@ impl openai::completion::OpenAICompatibleProvider for OpenRouterExt {
 
     const STREAM_INCLUDE_USAGE: bool = false;
 
+    fn map_streaming_finish_reason(
+        &self,
+        finish_reason: Option<&str>,
+        native_finish_reason: Option<&str>,
+    ) -> Option<crate::completion::FinishReason> {
+        if let Some(reason) = finish_reason.filter(|reason| !reason.is_empty()) {
+            return Some(map_openai_finish_reason(reason));
+        }
+
+        native_finish_reason
+            .filter(|reason| !reason.is_empty())
+            .map(map_native_finish_reason)
+    }
+
     fn build_completion_request(
         &self,
         model: String,
@@ -1555,6 +1615,22 @@ impl openai::completion::OpenAICompatibleProvider for OpenRouterExt {
                 0,
             ));
         Some((key, provider_id, message::ReasoningContent::Encrypted(data)))
+    }
+
+    /// Anthropic routes stream the plaintext in `delta.reasoning`, then send
+    /// its replay-required signature as a final signature-only
+    /// `reasoning.text` detail immediately before the tool call. Feed that
+    /// authoritative close into the shared lifecycle so the normalized
+    /// reasoning block is signed just like the blocking response.
+    fn streaming_reasoning_signature(&self, detail: &serde_json::Value) -> Option<String> {
+        let Ok(ReasoningDetails::Text {
+            signature: Some(signature),
+            ..
+        }) = serde_json::from_value::<ReasoningDetails>(detail.clone())
+        else {
+            return None;
+        };
+        (!signature.is_empty()).then_some(signature)
     }
 }
 
@@ -1918,6 +1994,43 @@ mod tests {
         assert_eq!(response.model, "google/gemini-2.5-flash");
         assert_eq!(response.choices.len(), 1);
         assert_eq!(response.choices[0].finish_reason, Some("stop".to_string()));
+        assert_eq!(response.choices[0].logprobs, None);
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert!(
+            serialized["choices"][0].get("logprobs").is_none(),
+            "an absent optional native field stays absent when serialized"
+        );
+    }
+
+    #[test]
+    fn raw_completion_choice_retains_logprobs() {
+        let logprobs = json!({
+            "content": [{
+                "token": "cobalt",
+                "logprob": -0.01,
+                "bytes": [99],
+                "top_logprobs": []
+            }],
+            "refusal": null
+        });
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "gen-logprobs",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openai/gpt-4o-mini",
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "native_finish_reason": "stop",
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "cobalt"},
+                "logprobs": logprobs
+            }],
+            "usage": null
+        }))
+        .expect("OpenRouter's documented probability object should decode");
+
+        assert_eq!(response.choices[0].logprobs, Some(logprobs));
     }
 
     #[test]
@@ -2086,6 +2199,7 @@ mod tests {
                 images: vec![],
             },
             finish_reason: finish_reason.map(str::to_string),
+            logprobs: None,
         };
 
         assert_eq!(
@@ -2103,6 +2217,14 @@ mod tests {
         assert_eq!(
             map_finish_reason(&choice(Some("content_filter"), None)),
             Some(FinishReason::ContentFilter)
+        );
+        assert_eq!(
+            map_finish_reason(&choice(None, Some("completed"))),
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            map_finish_reason(&choice(None, Some("max_output_tokens"))),
+            Some(FinishReason::Length)
         );
         // A reason OpenRouter could not translate survives verbatim rather
         // than reading as a natural stop.
@@ -2148,6 +2270,296 @@ mod tests {
 
         assert_eq!(
             converted.finish_reason(),
+            Some(crate::completion::FinishReason::ToolCalls)
+        );
+    }
+
+    /// The shared choice decoder tolerates the truncated JSON a
+    /// `max_tokens`-capped turn emits only under `finish_reason: length`, and
+    /// every normalizer built on it drops the unusable call rather than losing
+    /// the turn. Reproduced live on
+    /// DeepSeek (rig#2354) at 24/32/48/64-token budgets; the same wire type
+    /// backs OpenRouter, so the same turn shape is pinned here.
+    #[test]
+    fn openrouter_truncated_tool_arguments_do_not_destroy_the_response() {
+        let json = json!({
+            "id": "gen-truncated",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek/deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "Acknowledged.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "page", "arguments": "{\"team\":\"platform\"}"}
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "file_report", "arguments": "{\"summary\": "}
+                        }
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 24, "total_tokens": 34}
+        });
+
+        let response: CompletionResponse = serde_json::from_value(json).unwrap();
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+
+        assert_eq!(
+            converted.finish_reason(),
+            Some(crate::completion::FinishReason::Length)
+        );
+        let names = converted
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                completion::AssistantContent::ToolCall(call) => Some(call.function.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["page"], "only the truncated call is dropped");
+        assert!(
+            converted.choice.iter().any(|content| matches!(
+                content,
+                completion::AssistantContent::Text(text) if text.text == "Acknowledged."
+            )),
+            "the turn's text survives: {:?}",
+            converted.choice
+        );
+        assert_eq!(converted.usage.total_tokens, 34);
+    }
+
+    #[test]
+    fn openrouter_native_length_fallback_tolerates_truncated_tool_arguments() {
+        let json = json!({
+            "id": "gen-native-truncated",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "anthropic/claude-haiku-4.5",
+            "choices": [{
+                "index": 0,
+                "finish_reason": null,
+                "native_finish_reason": "max_output_tokens",
+                "message": {
+                    "role": "assistant",
+                    "content": "still useful",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":"}
+                    }]
+                }
+            }]
+        });
+
+        let response: CompletionResponse = serde_json::from_value(json)
+            .expect("the native terminal reason should authorize narrow truncation tolerance");
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+
+        assert_eq!(
+            converted.finish_reason(),
+            Some(crate::completion::FinishReason::Length)
+        );
+        assert!(
+            converted
+                .choice
+                .iter()
+                .all(|content| !matches!(content, completion::AssistantContent::ToolCall(_)))
+        );
+        assert!(matches!(
+            converted.choice.first(),
+            Some(completion::AssistantContent::Text(text)) if text.text == "still useful"
+        ));
+    }
+
+    #[test]
+    fn openrouter_length_preserves_an_empty_turn_after_dropping_its_only_call() {
+        for (finish_reason, native_finish_reason) in
+            [(Some("length"), None), (None, Some("max_output_tokens"))]
+        {
+            let response: CompletionResponse = serde_json::from_value(json!({
+                "id": "gen-empty-truncated",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/gpt-4.1-mini",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                    "native_finish_reason": native_finish_reason,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": ""}
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+            }))
+            .expect("outer length should permit dropping the incomplete call");
+            let converted = response
+                .normalize(PROVIDER_NAME)
+                .expect("an empty truncated turn still carries its diagnostic");
+
+            assert!(converted.choice.is_empty());
+            assert_eq!(
+                converted.finish_reason(),
+                Some(crate::completion::FinishReason::Length)
+            );
+            assert_eq!(converted.usage.total_tokens, 11);
+            assert_eq!(
+                converted.response_id.as_deref(),
+                Some("gen-empty-truncated")
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_content_filter_preserves_an_empty_turn() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "gen-filtered",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openai/gpt-4.1-mini",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "content_filter",
+                "message": {"role": "assistant", "content": null}
+            }]
+        }))
+        .unwrap();
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+
+        assert!(converted.choice.is_empty());
+        assert_eq!(
+            converted.finish_reason(),
+            Some(crate::completion::FinishReason::ContentFilter)
+        );
+    }
+
+    #[test]
+    fn openrouter_malformed_completed_tool_arguments_remain_loud() {
+        let json = json!({
+            "id": "gen-malformed",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek/deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "native_finish_reason": "max_output_tokens",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":"}
+                    }]
+                }
+            }]
+        });
+
+        assert!(
+            serde_json::from_value::<CompletionResponse>(json).is_err(),
+            "only an outer output-length reason authorizes truncation tolerance"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_native_length_fallback_drops_partial_tool_call() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
+        use crate::streaming::StreamedAssistantContent;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let http_client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"id":"gen-native-truncated","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{"role":"assistant","content":"still useful","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null,"native_finish_reason":null}]}"#,
+                r#"{"id":"gen-native-truncated","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{},"finish_reason":null,"native_finish_reason":"max_output_tokens"}]}"#,
+                "[DONE]",
+            ]),
+        };
+        let client = crate::providers::openrouter::Client::builder()
+            .api_key("dummy-key")
+            .http_client(http_client)
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("anthropic/claude-haiku-4.5");
+        let request = model.completion_request("lookup").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let mut terminal = None;
+        let mut saw_tool_call = false;
+        while let Some(item) = stream.next().await {
+            match item.expect("native max_tokens truncation is tolerated") {
+                StreamedAssistantContent::ToolCall { .. } => saw_tool_call = true,
+                StreamedAssistantContent::Final(final_record) => terminal = Some(final_record),
+                _ => {}
+            }
+        }
+
+        assert!(
+            !saw_tool_call,
+            "the partial call must not become executable"
+        );
+        assert_eq!(
+            terminal.and_then(|record| record.finish_reason),
+            Some(crate::completion::FinishReason::Length)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_normalized_reason_wins_over_native_length() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
+        use crate::streaming::StreamedAssistantContent;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let http_client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"id":"gen-normalized-wins","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null,"native_finish_reason":null}]}"#,
+                r#"{"id":"gen-normalized-wins","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls","native_finish_reason":"max_output_tokens"}]}"#,
+                "[DONE]",
+            ]),
+        };
+        let client = crate::providers::openrouter::Client::builder()
+            .api_key("dummy-key")
+            .http_client(http_client)
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("anthropic/claude-haiku-4.5");
+        let request = model.completion_request("lookup").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let mut terminal = None;
+        let mut errors = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Final(final_record)) => terminal = Some(final_record),
+                Ok(_) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        assert_eq!(errors.len(), 1, "the completed malformed call stays loud");
+        assert!(errors[0].contains("malformed JSON input"), "{}", errors[0]);
+        assert_eq!(
+            terminal.and_then(|record| record.finish_reason),
             Some(crate::completion::FinishReason::ToolCalls)
         );
     }
@@ -3022,7 +3434,12 @@ mod tests {
                         {"type":"reasoning.summary","id":"rs_1","summary":"s1"},
                         {"type":"reasoning.text","id":"rs_1","text":"t1","signature":"sig_1"},
                         {"type":"reasoning.encrypted","id":"rs_1","data":"enc_1"}
-                    ]
+                    ],
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
                 }
             }]
         });
@@ -3031,11 +3448,20 @@ mod tests {
         let converted = response.normalize(PROVIDER_NAME).unwrap();
         let items: Vec<completion::AssistantContent> = converted.choice.into_iter().collect();
 
-        assert!(items.iter().any(|item| matches!(
-            item,
+        assert_eq!(items.len(), 3, "reasoning, text, then tool call");
+        assert!(matches!(
+            &items[0],
             completion::AssistantContent::Reasoning(message::Reasoning { id: Some(id), content })
                 if id == "rs_1" && content.len() == 3
-        )));
+        ));
+        assert!(matches!(
+            &items[1],
+            completion::AssistantContent::Text(text) if text.text == "hello"
+        ));
+        assert!(matches!(
+            &items[2],
+            completion::AssistantContent::ToolCall(call) if call.function.name == "lookup"
+        ));
     }
 
     /// Encrypted `reasoning_details` on the streaming wire must reach the
@@ -3139,6 +3565,72 @@ mod tests {
             )),
             "encrypted reasoning must replay as a reasoning_details entry: {reasoning_details:#?}"
         );
+    }
+
+    /// Anthropic-routed OpenRouter streams put the replay-required signature
+    /// in a final `reasoning.text` detail with no text of its own. The shared
+    /// `delta.reasoning` field carries the preceding plaintext, so the detail
+    /// must close and sign that same block before the tool call is emitted.
+    #[tokio::test]
+    async fn streaming_anthropic_reasoning_signature_reaches_choice_and_replays() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let http_client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"id":"chatcmpl-1","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"think first","reasoning_details":[{"type":"reasoning.text","format":"anthropic-claude-v1","index":0,"text":"think first"}]},"finish_reason":null,"native_finish_reason":null}]}"#,
+                r#"{"id":"chatcmpl-1","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_details":[{"type":"reasoning.text","format":"anthropic-claude-v1","index":0,"signature":"sig-live-shape"}]},"finish_reason":null,"native_finish_reason":null}]}"#,
+                r#"{"id":"chatcmpl-1","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"toolu_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null,"native_finish_reason":null}]}"#,
+                r#"{"id":"chatcmpl-1","model":"anthropic/claude-haiku-4.5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls","native_finish_reason":"tool_use"}]}"#,
+                "[DONE]",
+            ]),
+        };
+
+        let client = crate::providers::openrouter::Client::builder()
+            .api_key("dummy-key")
+            .http_client(http_client)
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("anthropic/claude-haiku-4.5");
+        let request = model.completion_request("lookup").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        while let Some(item) = stream.next().await {
+            item.expect("signed reasoning stream item");
+        }
+
+        let choice = stream.choice.clone().into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            choice.first(),
+            Some(message::AssistantContent::Reasoning(message::Reasoning { content, .. }))
+                if matches!(
+                    content.first(),
+                    Some(message::ReasoningContent::Text { text, signature: Some(signature) })
+                        if text == "think first" && signature == "sig-live-shape"
+                )
+        ));
+        assert!(matches!(
+            choice.get(1),
+            Some(message::AssistantContent::ToolCall(call)) if call.function.name == "lookup"
+        ));
+
+        let messages = assistant_contents_to_messages(choice).expect("history conversion");
+        let Message::Assistant {
+            reasoning_details, ..
+        } = messages.first().expect("assistant message")
+        else {
+            panic!("expected assistant history message");
+        };
+        assert!(matches!(
+            reasoning_details.first(),
+            Some(ReasoningDetails::Text {
+                text: Some(text),
+                signature: Some(signature),
+                ..
+            }) if text == "think first" && signature == "sig-live-shape"
+        ));
     }
 
     /// An id-less encrypted detail must not clobber the reasoning text
@@ -4285,5 +4777,250 @@ mod tests {
             serialized.get("images").is_none(),
             "images field must not appear in serialized assistant message"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusal fallback — wire shapes the live gateway will not produce on
+    // demand. The recorded cells live in
+    // `tests/providers/openrouter/cassette/refusal_matrix.rs`.
+    // -----------------------------------------------------------------------
+
+    fn refusal_response(message: serde_json::Value) -> CompletionResponse {
+        serde_json::from_value(json!({
+            "id": "gen-refusal",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openai/gpt-4o",
+            "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn raw_completion_response_retains_routing_metadata() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "gen-routing",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openai/gpt-4o-mini",
+            "provider": "OpenAI",
+            "service_tier": "default",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("live OpenRouter routing metadata should deserialize");
+
+        assert_eq!(response.provider.as_deref(), Some("OpenAI"));
+        assert_eq!(response.service_tier.as_deref(), Some("default"));
+    }
+
+    fn text_parts(response: &completion::CompletionResponse) -> Vec<String> {
+        response
+            .choice
+            .iter()
+            .filter_map(|part| match part {
+                completion::AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The recorded shape: `content` held at `null` with the refusal beside
+    /// it. Before the fix this normalized to nothing and errored.
+    #[test]
+    fn refusal_fallback_surfaces_a_null_content_refusal() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm very sorry, but I can't assist with that request.",
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert_eq!(
+            text_parts(&converted),
+            vec!["I'm very sorry, but I can't assist with that request."]
+        );
+    }
+
+    /// An absent `content` key reads the same as an explicit `null`.
+    #[test]
+    fn refusal_fallback_surfaces_a_missing_content_refusal() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "refusal": "No.",
+        }));
+
+        assert_eq!(
+            text_parts(&response.normalize(PROVIDER_NAME).unwrap()),
+            vec!["No."]
+        );
+    }
+
+    /// An empty-string `content` decodes as one empty text part, which carries
+    /// no text — so the refusal is still the turn's only *visible* content.
+    ///
+    /// This path keeps the empty part alongside it: unlike the shared OpenAI
+    /// normalizer, OpenRouter's does not filter empty content parts. That is
+    /// pre-existing behavior for any `"content": ""` turn and the fallback
+    /// neither causes nor changes it; the assertion records both halves rather
+    /// than claiming a filter this code does not have.
+    #[test]
+    fn refusal_fallback_surfaces_a_refusal_beside_empty_content() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": "",
+            "refusal": "No.",
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert_eq!(
+            text_parts(&converted),
+            vec!["".to_owned(), "No.".to_owned()]
+        );
+    }
+
+    /// The whole-message rule: real content wins, and the fallback stays out
+    /// of the way. This is the shape the streaming path would deliver *both*
+    /// halves of, so pinning it records the difference rather than assuming it
+    /// away (see `assistant_refusal_fallback`).
+    #[test]
+    fn refusal_fallback_defers_to_non_empty_content() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": "Here is the answer.",
+            "refusal": "I'm sorry.",
+        }));
+
+        assert_eq!(
+            text_parts(&response.normalize(PROVIDER_NAME).unwrap()),
+            vec!["Here is the answer."]
+        );
+    }
+
+    /// An empty refusal string is not a refusal.
+    #[test]
+    fn refusal_fallback_ignores_an_empty_refusal() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "ping", "arguments": "{}" }
+            }],
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert!(text_parts(&converted).is_empty(), "{:?}", converted.choice);
+        assert_eq!(converted.choice.len(), 1);
+    }
+
+    /// A tool-calls-only turn holds `content` at `null` with no refusal: the
+    /// shape the fallback must leave exactly as it was.
+    #[test]
+    fn refusal_fallback_leaves_a_tool_call_turn_alone() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "ping", "arguments": "{}" }
+            }],
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert_eq!(converted.choice.len(), 1);
+        assert!(matches!(
+            converted.choice.first(),
+            Some(completion::AssistantContent::ToolCall(_))
+        ));
+    }
+
+    /// A refusal can arrive on a turn that also carries tool calls; the
+    /// refusal is the turn's text and the calls survive beside it.
+    #[test]
+    fn refusal_fallback_coexists_with_tool_calls() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I can't help with that.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "ping", "arguments": "{}" }
+            }],
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert_eq!(text_parts(&converted), vec!["I can't help with that."]);
+        assert!(
+            converted
+                .choice
+                .iter()
+                .any(|part| matches!(part, completion::AssistantContent::ToolCall(_)))
+        );
+    }
+
+    /// Reasoning blocks are not text, so a reasoning-carrying refusal turn
+    /// still needs the fallback for its visible content.
+    #[test]
+    fn refusal_fallback_applies_beside_reasoning_details() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I can't help with that.",
+            "reasoning_details": [
+                { "type": "reasoning.summary", "id": "rs_1", "format": "openai-responses-v1",
+                  "index": 0, "summary": "considered" }
+            ],
+        }));
+
+        let converted = response.normalize(PROVIDER_NAME).unwrap();
+        assert_eq!(text_parts(&converted), vec!["I can't help with that."]);
+        assert!(
+            converted
+                .choice
+                .iter()
+                .any(|part| matches!(part, completion::AssistantContent::Reasoning(_)))
+        );
+    }
+
+    /// The Responses-API spelling — a `refusal` *content part* — still works;
+    /// the fix adds the sibling-field rule without displacing it, and the two
+    /// must not both fire.
+    #[test]
+    fn refusal_fallback_does_not_double_up_with_a_refusal_content_part() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": [{ "type": "refusal", "refusal": "I can't help with that." }],
+            "refusal": "I can't help with that.",
+        }));
+
+        assert_eq!(
+            text_parts(&response.normalize(PROVIDER_NAME).unwrap()),
+            vec!["I can't help with that."]
+        );
+    }
+
+    /// The raw text view and the normalized response must never disagree
+    /// about whether a refused turn said anything — the internal
+    /// inconsistency that made this bug visible.
+    #[test]
+    fn refusal_fallback_keeps_raw_and_normalized_text_in_step() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm sorry, but I can't help with that.",
+        }));
+
+        let raw_text = response.get_text_response().unwrap();
+        let normalized = response.normalize(PROVIDER_NAME).unwrap();
+
+        assert_eq!(text_parts(&normalized), vec![raw_text]);
     }
 }

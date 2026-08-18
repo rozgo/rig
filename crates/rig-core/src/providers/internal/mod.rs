@@ -1,9 +1,10 @@
 //! Shared provider infrastructure: the wire-adapter contract, its
 //! single-policy-site driver, and the decode-then-validate classify layer.
 //!
-//! [`adapter`], [`wire`], and [`tool_call_bridge`] are public so out-of-tree
-//! providers implement [`adapter::WireAdapter`] and inherit the shared driver,
-//! frame-triage policy, and index→identity tool-call bridging instead of
+//! [`adapter`], [`wire`], [`tool_call_bridge`], and [`chunk_lifecycle`] are
+//! public so out-of-tree providers implement [`adapter::WireAdapter`] and
+//! inherit the shared driver, frame-triage policy, index→identity tool-call
+//! bridging, and the boundary-less reasoning lifecycle derivation instead of
 //! hand-rolling per-provider assemblers; the remaining helpers are
 //! crate-private.
 
@@ -12,7 +13,10 @@ pub(crate) mod anthropic_compatible;
 #[cfg(feature = "audio")]
 pub(crate) mod audio_generation;
 pub(crate) mod auth;
-pub(crate) mod chunk_lifecycle;
+pub mod chunk_lifecycle;
+pub(crate) mod completion_send;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod device_auth;
 pub(crate) mod envelope;
 #[cfg(feature = "image")]
 pub(crate) mod image_generation;
@@ -21,6 +25,7 @@ pub(crate) mod openai_chat_completions_compatible;
 pub(crate) mod schema;
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod sequence_law;
+pub(crate) mod sse_transport;
 pub mod tool_call_bridge;
 pub(crate) mod transcription;
 pub mod wire;
@@ -92,6 +97,34 @@ pub fn resolve_empty_tool_result_names(history: &mut [crate::message::Message]) 
                 result.name = name.clone();
             }
         }
+    }
+}
+
+/// A rig logging target for [`trace_json`]. An enum (not a `&str`) because
+/// `tracing` targets must be literals, so the dispatch is total by
+/// construction.
+#[derive(Clone, Copy)]
+pub(crate) enum LogTarget {
+    Completions,
+    Streaming,
+}
+
+/// Trace-log `value` as pretty-printed JSON under one of rig's logging
+/// targets. Infallible: does nothing when TRACE is disabled for the target or
+/// the value fails to serialize.
+pub(crate) fn trace_json(target: LogTarget, label: &str, value: &impl serde::Serialize) {
+    macro_rules! emit {
+        ($target:literal) => {
+            if tracing::enabled!(target: $target, tracing::Level::TRACE) {
+                if let Ok(json) = serde_json::to_string_pretty(value) {
+                    tracing::trace!(target: $target, "{label}: {json}");
+                }
+            }
+        };
+    }
+    match target {
+        LogTarget::Streaming => emit!("rig::streaming"),
+        LogTarget::Completions => emit!("rig::completions"),
     }
 }
 

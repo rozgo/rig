@@ -5,7 +5,9 @@ mod cassette {
     mod default_max_turns;
     mod document_file_id;
     mod empty_end_turn;
+    mod empty_stop_sequence_matrix;
     mod error_envelope;
+    mod error_identity_edge;
     mod image;
     mod messages_behaviors;
     mod messages_sessions;
@@ -17,12 +19,22 @@ mod cassette {
     mod multi_turn_streaming;
     mod opus_4_7;
     mod opus_4_8;
+    mod pdf_citations;
     mod plaintext_document;
     mod prompt_caching;
+    mod raw_capture_agent_matrix;
+    mod raw_capture_matrix;
+    mod raw_completion_parity_matrix;
+    mod raw_stream_capture_matrix;
     mod reasoning_roundtrip;
     mod reasoning_tool_roundtrip;
+    mod reasoning_usage_matrix;
     mod regression_suite;
     mod request_override;
+    mod response_identity;
+    mod response_identity_edge;
+    mod stop_sequence_terminal_matrix;
+    mod streamed_server_tools;
     mod streaming;
     mod streaming_grammar;
     mod streaming_tools;
@@ -36,6 +48,7 @@ mod cassette {
     mod think_tool_with_other_tools;
     mod tool_call_rewrite_args;
     mod tool_result_rewrite;
+    mod turn_termination_matrix;
     mod url_pdf_document;
 }
 

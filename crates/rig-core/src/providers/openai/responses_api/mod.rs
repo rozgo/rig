@@ -16,20 +16,20 @@
 use super::InputAudio;
 use crate::completion::CompletionError;
 use crate::completion::NormalizeCompletionResponse;
-use crate::http_client;
 use crate::http_client::HttpClientExt;
 use crate::json_utils;
 use crate::json_utils::string_or_vec;
 use crate::message::{
     Document, DocumentMediaType, DocumentSourceKind, ImageDetail, MessageError, MimeType, Text,
 };
+use crate::providers::internal::completion_send::send_completion;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use crate::{completion, message};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
-use tracing::{Instrument, Level, enabled};
+use tracing::Instrument;
 
 use std::convert::Infallible;
 use std::ops::Add;
@@ -152,6 +152,21 @@ impl InputItem {
                 content: vec![SystemContent::InputText {
                     text: content.into(),
                 }],
+                name: None,
+            }),
+        }
+    }
+
+    /// A user-role input item carrying one content part.
+    ///
+    /// Every user block the history conversion emits — text, image, file, a
+    /// document flattened to text — becomes its own single-part item, so the
+    /// wrapper is built here once instead of per block.
+    fn user_content(content: UserContent) -> Self {
+        Self {
+            role: Some(Role::User),
+            input: InputContent::Message(Message::User {
+                content: vec![content],
                 name: None,
             }),
         }
@@ -316,6 +331,23 @@ pub enum ToolResultOutputContent {
     },
 }
 
+/// The request error for a document or image source this API cannot carry.
+///
+/// Raw bytes must be base64-encoded by the caller (the wire has no binary
+/// channel); any other source kind is one the Responses input conversion does
+/// not model, and is reported with its own rendering rather than a `Debug`
+/// name.
+fn unsupported_document_source(source: DocumentSourceKind) -> CompletionError {
+    match source {
+        DocumentSourceKind::Raw(_) => CompletionError::RequestError(
+            "Raw file data not supported, encode as base64 first".into(),
+        ),
+        source => {
+            CompletionError::RequestError(format!("Unsupported document type: {source}").into())
+        }
+    }
+}
+
 fn responses_tool_result_output(
     content: Vec<message::ToolResultContent>,
 ) -> Result<ToolResultOutput, MessageError> {
@@ -438,13 +470,7 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                 for user_content in content {
                     match user_content {
                         crate::message::UserContent::Text(Text { text, .. }) => {
-                            items.push(InputItem {
-                                role: Some(Role::User),
-                                input: InputContent::Message(Message::User {
-                                    content: vec![UserContent::InputText { text }],
-                                    name: None,
-                                }),
-                            });
+                            items.push(InputItem::user_content(UserContent::InputText { text }));
                         }
                         crate::message::UserContent::ToolResult(tool_result) => {
                             // Provider-issued call id when one exists, else
@@ -467,18 +493,12 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                         crate::message::UserContent::Document(Document {
                             data: DocumentSourceKind::FileId(file_id),
                             ..
-                        }) => items.push(InputItem {
-                            role: Some(Role::User),
-                            input: InputContent::Message(Message::User {
-                                content: vec![UserContent::InputFile {
-                                    file_id: Some(file_id),
-                                    file_data: None,
-                                    file_url: None,
-                                    filename: None,
-                                }],
-                                name: None,
-                            }),
-                        }),
+                        }) => items.push(InputItem::user_content(UserContent::InputFile {
+                            file_id: Some(file_id),
+                            file_data: None,
+                            file_url: None,
+                            filename: None,
+                        })),
                         crate::message::UserContent::Document(Document {
                             data,
                             media_type: Some(DocumentMediaType::PDF),
@@ -491,43 +511,21 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                     Some("document.pdf".to_string()),
                                 ),
                                 DocumentSourceKind::Url(url) => (None, Some(url), None),
-                                DocumentSourceKind::Raw(_) => {
-                                    return Err(CompletionError::RequestError(
-                                        "Raw file data not supported, encode as base64 first"
-                                            .into(),
-                                    ));
-                                }
-                                doc => {
-                                    return Err(CompletionError::RequestError(
-                                        format!("Unsupported document type: {doc}").into(),
-                                    ));
-                                }
+                                source => return Err(unsupported_document_source(source)),
                             };
 
-                            items.push(InputItem {
-                                role: Some(Role::User),
-                                input: InputContent::Message(Message::User {
-                                    content: vec![UserContent::InputFile {
-                                        file_id: None,
-                                        file_data,
-                                        file_url,
-                                        filename,
-                                    }],
-                                    name: None,
-                                }),
-                            })
+                            items.push(InputItem::user_content(UserContent::InputFile {
+                                file_id: None,
+                                file_data,
+                                file_url,
+                                filename,
+                            }))
                         }
                         crate::message::UserContent::Document(Document {
                             data:
                                 DocumentSourceKind::Base64(text) | DocumentSourceKind::String(text),
                             ..
-                        }) => items.push(InputItem {
-                            role: Some(Role::User),
-                            input: InputContent::Message(Message::User {
-                                content: vec![UserContent::InputText { text }],
-                                name: None,
-                            }),
-                        }),
+                        }) => items.push(InputItem::user_content(UserContent::InputText { text })),
                         crate::message::UserContent::Image(crate::message::Image {
                             data,
                             media_type,
@@ -544,28 +542,12 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                     format!("data:{media_type};base64,{data}")
                                 }
                                 DocumentSourceKind::Url(url) => url,
-                                DocumentSourceKind::Raw(_) => {
-                                    return Err(CompletionError::RequestError(
-                                        "Raw file data not supported, encode as base64 first"
-                                            .into(),
-                                    ));
-                                }
-                                doc => {
-                                    return Err(CompletionError::RequestError(
-                                        format!("Unsupported document type: {doc}").into(),
-                                    ));
-                                }
+                                source => return Err(unsupported_document_source(source)),
                             };
-                            items.push(InputItem {
-                                role: Some(Role::User),
-                                input: InputContent::Message(Message::User {
-                                    content: vec![UserContent::InputImage {
-                                        image_url: url,
-                                        detail: detail.unwrap_or_default(),
-                                    }],
-                                    name: None,
-                                }),
-                            });
+                            items.push(InputItem::user_content(UserContent::InputImage {
+                                image_url: url,
+                                detail: detail.unwrap_or_default(),
+                            }));
                         }
                         message => {
                             return Err(CompletionError::ProviderError(format!(
@@ -662,6 +644,43 @@ pub fn reasoning_summaries(value: Vec<String>) -> Vec<ReasoningSummary> {
         .into_iter()
         .map(|text| ReasoningSummary::SummaryText { text })
         .collect()
+}
+
+/// The canonical blocks of one Responses reasoning item, in the wire's own
+/// field order: every summary, then every raw reasoning text, then the opaque
+/// `encrypted_content` payload.
+///
+/// One builder because both directions of the same item must agree: the unary
+/// decode ([`Output::Reasoning`] → assistant content) and the streaming
+/// done-item restatement (`streaming::reasoning_end_from_done_item`) read the
+/// identical triple, and an empty `encrypted_content` is the wire's "absent"
+/// spelling — it must contribute no block on either path.
+pub(crate) fn reasoning_content_blocks(
+    summary: Vec<ReasoningSummary>,
+    content: Vec<String>,
+    encrypted_content: Option<String>,
+) -> Vec<message::ReasoningContent> {
+    let mut blocks = summary
+        .into_iter()
+        .map(|summary| match summary {
+            ReasoningSummary::SummaryText { text } => message::ReasoningContent::Summary(text),
+        })
+        .collect::<Vec<_>>();
+
+    blocks.extend(
+        content
+            .into_iter()
+            .map(|text| message::ReasoningContent::Text {
+                text,
+                signature: None,
+            }),
+    );
+
+    if let Some(encrypted_content) = encrypted_content.filter(|content| !content.is_empty()) {
+        blocks.push(message::ReasoningContent::Encrypted(encrypted_content));
+    }
+
+    blocks
 }
 
 fn openai_reasoning_from_core(
@@ -988,31 +1007,32 @@ impl From<ResponsesUsage> for crate::completion::Usage {
     }
 }
 
+/// Sum two optional token-detail breakdowns: both present adds them, one
+/// present carries through unchanged, both absent stays absent — a partial
+/// breakdown must never zero out the side that reported one.
+fn add_optional_details<T: Add<Output = T>>(lhs: Option<T>, rhs: Option<T>) -> Option<T> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+        (lhs, rhs) => lhs.or(rhs),
+    }
+}
+
 impl Add for ResponsesUsage {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let input_tokens = self.input_tokens + rhs.input_tokens;
-        let input_tokens_details = match (self.input_tokens_details, rhs.input_tokens_details) {
-            (Some(lhs), Some(rhs)) => Some(lhs + rhs),
-            (Some(lhs), None) => Some(lhs),
-            (None, Some(rhs)) => Some(rhs),
-            (None, None) => None,
-        };
-        let output_tokens = self.output_tokens + rhs.output_tokens;
-        let output_tokens_details = match (self.output_tokens_details, rhs.output_tokens_details) {
-            (Some(lhs), Some(rhs)) => Some(lhs + rhs),
-            (Some(lhs), None) => Some(lhs),
-            (None, Some(rhs)) => Some(rhs),
-            (None, None) => None,
-        };
-        let total_tokens = self.total_tokens + rhs.total_tokens;
         Self {
-            input_tokens,
-            input_tokens_details,
-            output_tokens,
-            output_tokens_details,
-            total_tokens,
+            input_tokens: self.input_tokens + rhs.input_tokens,
+            input_tokens_details: add_optional_details(
+                self.input_tokens_details,
+                rhs.input_tokens_details,
+            ),
+            output_tokens: self.output_tokens + rhs.output_tokens,
+            output_tokens_details: add_optional_details(
+                self.output_tokens_details,
+                rhs.output_tokens_details,
+            ),
+            total_tokens: self.total_tokens + rhs.total_tokens,
         }
     }
 }
@@ -1087,8 +1107,7 @@ pub enum ResponseObject {
 }
 
 /// The response status as an enum (ensures type validation)
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ResponseStatus {
     InProgress,
     Completed,
@@ -1096,6 +1115,8 @@ pub enum ResponseStatus {
     Cancelled,
     Queued,
     Incomplete,
+    /// A provider-specific status added after this client was released.
+    Other(String),
 }
 
 /// The wire spelling of a [`ResponseStatus`].
@@ -1103,7 +1124,7 @@ pub enum ResponseStatus {
 /// Statuses outside the normalized finish-reason vocabulary are carried through
 /// as [`completion::FinishReason::Other`], so they must keep OpenAI's own
 /// spelling rather than a Rust `Debug` name.
-fn response_status_wire_name(status: &ResponseStatus) -> &'static str {
+fn response_status_wire_name(status: &ResponseStatus) -> &str {
     match status {
         ResponseStatus::InProgress => "in_progress",
         ResponseStatus::Completed => "completed",
@@ -1111,6 +1132,33 @@ fn response_status_wire_name(status: &ResponseStatus) -> &'static str {
         ResponseStatus::Cancelled => "cancelled",
         ResponseStatus::Queued => "queued",
         ResponseStatus::Incomplete => "incomplete",
+        ResponseStatus::Other(status) => status,
+    }
+}
+
+impl Serialize for ResponseStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(response_status_wire_name(self))
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "queued" => Self::Queued,
+            "incomplete" => Self::Incomplete,
+            other => Self::Other(other.to_owned()),
+        })
     }
 }
 
@@ -1152,7 +1200,8 @@ pub(crate) fn map_finish_reason(
                 }
             },
         ),
-        ResponseStatus::Failed | ResponseStatus::Cancelled => Some(
+        ResponseStatus::Other(status) if status.is_empty() => None,
+        ResponseStatus::Failed | ResponseStatus::Cancelled | ResponseStatus::Other(_) => Some(
             completion::FinishReason::Other(response_status_wire_name(status).to_owned()),
         ),
         // The turn has not terminated, so there is genuinely no reason yet.
@@ -1162,7 +1211,6 @@ pub(crate) fn map_finish_reason(
 
 /// Controls where Rig system instructions are placed in an OpenAI Responses request.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SystemInstructionsPlacement {
     /// Send the leading run of system instructions (the preamble and any system
     /// messages that open the conversation) through the official top-level
@@ -1196,6 +1244,27 @@ pub trait ResponsesProviderExt {
     /// shared wire type never mislabels them.
     const PROVIDER_NAME: &'static str = "openai";
 
+    /// Response header carrying the provider's transport request id, when the
+    /// provider reports one. Defaults to OpenAI's `x-request-id` because this
+    /// wire format is OpenAI's; a backend that omits the header simply yields
+    /// `None`, never an error.
+    const REQUEST_ID_HEADER: Option<&'static str> = Some("x-request-id");
+
+    /// Relative path of the provider's Responses endpoint.
+    const RESPONSES_PATH: &'static str = "/responses";
+
+    /// Whether a complete function call should be emitted as soon as its
+    /// `output_item.done` event arrives instead of waiting for the terminal
+    /// response event.
+    const EMITS_COMPLETE_TOOL_CALLS_IMMEDIATELY: bool = false;
+
+    /// Whether a successful HTTP response can carry the provider's error
+    /// envelope instead of a Responses payload.
+    const USES_2XX_ERROR_ENVELOPE: bool = false;
+
+    /// Whether native structured output composes with provider tool calls.
+    const COMPOSES_NATIVE_OUTPUT_WITH_TOOLS: bool = true;
+
     /// Where Rig system instructions are placed in requests built from this
     /// provider. See [`SystemInstructionsPlacement`].
     ///
@@ -1203,7 +1272,49 @@ pub trait ResponsesProviderExt {
     /// placement explicitly, so a backend that can't handle the default
     /// (top-level `instructions`) is never inherited by accident.
     fn system_instructions_placement(&self) -> SystemInstructionsPlacement;
+
+    /// Convert a Rig request into this provider's Responses wire value.
+    ///
+    /// The default is the OpenAI wire. Compatible providers override only
+    /// when their request shape genuinely differs; response and streaming
+    /// normalization remain shared.
+    #[doc(hidden)]
+    fn create_responses_request(
+        &self,
+        model: String,
+        request: crate::completion::CompletionRequest,
+        default_tools: &[ResponsesToolDefinition],
+        strict_tools: bool,
+        system_instructions_placement: SystemInstructionsPlacement,
+        stream: bool,
+    ) -> Result<(String, Value), CompletionError> {
+        let mut request = CompletionRequest::try_from(ResponsesRequestParams {
+            model,
+            request,
+            system_instructions_placement,
+        })?;
+        request.tools.extend(default_tools.iter().cloned());
+        if strict_tools {
+            request.tools = request
+                .tools
+                .into_iter()
+                .map(ResponsesToolDefinition::normalize)
+                .collect();
+        }
+        if stream {
+            request.stream = Some(true);
+        }
+        Ok((request.model.clone(), serde_json::to_value(request)?))
+    }
 }
+
+/// Marks Responses providers that let individual models override the client's
+/// system-instruction placement.
+///
+/// Providers with a fixed wire representation deliberately do not implement
+/// this trait, so the corresponding model builders are not exposed for them.
+#[doc(hidden)]
+pub trait ConfigurableSystemInstructionsPlacement: ResponsesProviderExt {}
 
 /// Attempt to try and create a `NewCompletionRequest` from a model name and [`crate::completion::CompletionRequest`]
 impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionRequest {
@@ -1361,14 +1472,7 @@ impl TryFrom<ResponsesRequestParams> for CompletionRequest {
         if additional_parameters.text.is_none()
             && let Some(schema) = req.output_schema
         {
-            let name = schema
-                .as_object()
-                .and_then(|o| o.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("response_schema")
-                .to_string();
-            let mut schema_value = schema.to_value();
-            super::sanitize_schema(&mut schema_value);
+            let (name, schema_value) = super::structured_output_schema(schema);
             additional_parameters.text = Some(TextConfig::structured_output(name, schema_value));
         }
 
@@ -1419,9 +1523,7 @@ pub type ResponsesCompletionModel<H = reqwest::Client> =
 
 impl<Ext, H> GenericResponsesCompletionModel<Ext, H>
 where
-    crate::client::Client<Ext, H>: HttpClientExt + Clone + std::fmt::Debug + 'static,
-    Ext: crate::client::Provider + ResponsesProviderExt + Clone + 'static,
-    H: Clone + Default + std::fmt::Debug + 'static,
+    Ext: crate::client::Provider + ResponsesProviderExt,
 {
     /// Creates a new [`ResponsesCompletionModel`].
     pub fn new(client: crate::client::Client<Ext, H>, model: impl Into<String>) -> Self {
@@ -1452,27 +1554,6 @@ where
     pub fn with_strict_tools(mut self) -> Self {
         self.strict_tools = true;
         self
-    }
-
-    /// Sets where Rig system instructions are placed in requests from this
-    /// model, overriding the client-level default. See
-    /// [`SystemInstructionsPlacement`] for when each placement applies.
-    pub fn with_system_instructions_placement(
-        mut self,
-        placement: SystemInstructionsPlacement,
-    ) -> Self {
-        self.system_instructions_placement = placement;
-        self
-    }
-
-    /// Sends Rig system instructions as `system` messages in `input` instead of
-    /// as top-level Responses API `instructions`.
-    ///
-    /// OpenAI's Responses API supports `instructions`, and Rig uses it by
-    /// default. Use this compatibility fallback for OpenAI-compatible providers
-    /// that reject or ignore top-level `instructions`.
-    pub fn with_system_instructions_as_messages(self) -> Self {
-        self.with_system_instructions_placement(SystemInstructionsPlacement::InputSystemMessages)
     }
 
     /// Adds a default tool to all requests from this model.
@@ -1513,6 +1594,47 @@ where
 
         Ok(req)
     }
+
+    fn create_provider_request(
+        &self,
+        request: crate::completion::CompletionRequest,
+        stream: bool,
+    ) -> Result<(String, Value), CompletionError> {
+        self.client.ext().create_responses_request(
+            self.model.clone(),
+            request,
+            &self.tools,
+            self.strict_tools,
+            self.system_instructions_placement,
+            stream,
+        )
+    }
+}
+
+impl<Ext, H> GenericResponsesCompletionModel<Ext, H>
+where
+    Ext: crate::client::Provider + ResponsesProviderExt + ConfigurableSystemInstructionsPlacement,
+{
+    /// Sets where Rig system instructions are placed in requests from this
+    /// model, overriding the client-level default. See
+    /// [`SystemInstructionsPlacement`] for when each placement applies.
+    pub fn with_system_instructions_placement(
+        mut self,
+        placement: SystemInstructionsPlacement,
+    ) -> Self {
+        self.system_instructions_placement = placement;
+        self
+    }
+
+    /// Sends Rig system instructions as `system` messages in `input` instead of
+    /// as top-level Responses API `instructions`.
+    ///
+    /// OpenAI's Responses API supports `instructions`, and Rig uses it by
+    /// default. Use this compatibility fallback for OpenAI-compatible providers
+    /// that reject or ignore top-level `instructions`.
+    pub fn with_system_instructions_as_messages(self) -> Self {
+        self.with_system_instructions_placement(SystemInstructionsPlacement::InputSystemMessages)
+    }
 }
 
 impl<T> GenericResponsesCompletionModel<super::OpenAIResponsesExt, T>
@@ -1549,6 +1671,11 @@ pub struct CompletionResponse {
     /// Provider-specific top-level reasoning content returned by some
     /// OpenAI-compatible Responses implementations.
     pub provider_reasoning: Option<String>,
+    /// The transport request id from the `x-request-id` response header — not
+    /// part of the response body; stamped by the request driver, so wire
+    /// deserialization always leaves it `None` and the manual `Serialize`
+    /// (which mirrors the wire body) never emits it.
+    pub provider_request_id: Option<String>,
     /// The complete object-shaped top-level reasoning metadata returned by the provider.
     ///
     /// Unknown fields, unknown values, and null-valued members inside the object
@@ -1702,6 +1829,7 @@ impl<'de> Deserialize<'de> for CompletionResponse {
             max_output_tokens: response.max_output_tokens,
             model: response.model,
             provider_reasoning,
+            provider_request_id: None,
             reasoning_metadata,
             reasoning_context,
             usage: response.usage,
@@ -1830,6 +1958,9 @@ pub enum TextFormat {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StructuredOutputsInput {
     /// The name of your schema.
+    ///
+    /// Compatible providers may omit it when echoing a response configuration.
+    #[serde(default)]
     pub name: String,
     /// Your required output schema. It is recommended that you use the JsonSchema macro, which you can check out at <https://docs.rs/schemars/latest/schemars/trait.JsonSchema.html>.
     pub schema: serde_json::Value,
@@ -2203,36 +2334,15 @@ impl From<Output> for Vec<completion::AssistantContent> {
             Output::Reasoning {
                 id,
                 summary,
-                content: reasoning_content,
+                content,
                 encrypted_content,
                 ..
-            } => {
-                let mut content = summary
-                    .into_iter()
-                    .map(|summary| match summary {
-                        ReasoningSummary::SummaryText { text } => {
-                            message::ReasoningContent::Summary(text)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                content.extend(reasoning_content.into_iter().map(|text| {
-                    message::ReasoningContent::Text {
-                        text,
-                        signature: None,
-                    }
-                }));
-                if let Some(encrypted_content) =
-                    encrypted_content.filter(|content| !content.is_empty())
-                {
-                    content.push(message::ReasoningContent::Encrypted(encrypted_content));
-                }
-                vec![completion::AssistantContent::Reasoning(
-                    message::Reasoning {
-                        id: Some(id),
-                        content,
-                    },
-                )]
-            }
+            } => vec![completion::AssistantContent::Reasoning(
+                message::Reasoning {
+                    id: Some(id),
+                    content: reasoning_content_blocks(summary, content, encrypted_content),
+                },
+            )],
             Output::Unknown(_) => Vec::new(),
         };
 
@@ -2351,7 +2461,6 @@ pub enum OutputRole {
 }
 
 impl crate::telemetry::ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Output;
     type Usage = ResponsesUsage;
 
     /// The response ID (`resp_...`), which is deliberately *not* the assistant
@@ -2362,10 +2471,6 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
 
     fn get_response_model_name(&self) -> Option<String> {
         Some(self.model.clone())
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.output.clone()
     }
 
     fn get_text_response(&self) -> Option<String> {
@@ -2429,60 +2534,70 @@ where
     ) -> Result<CompletionResponse, CompletionError> {
         let system_instructions = completion_request.preamble.clone();
         let record_telemetry_content = completion_request.record_telemetry_content;
-        let request = self.create_completion_request(completion_request)?;
+        let (request_model, request) = self.create_provider_request(completion_request, false)?;
         let span = CompletionSpanBuilder::new(
             Ext::PROVIDER_NAME,
-            &request.model,
+            &request_model,
             CompletionOperation::Chat,
         )
         .system_instructions(system_instructions.as_deref(), record_telemetry_content)
         .build();
         let body = serde_json::to_vec(&request)?;
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "OpenAI Responses completion request: {request}",
-                request = serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Responses completion request",
+            &request,
+        );
 
         let req = self
             .client
-            .post("/responses")?
+            .post(Ext::RESPONSES_PATH)?
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
-        async move {
-            let response = self.client.send(req).await?;
-
-            if response.status().is_success() {
-                let t = http_client::text(response).await?;
-                let response = serde_json::from_str::<CompletionResponse>(&t)?;
-                let span = tracing::Span::current();
-                span.record_response_metadata(&response);
-                let usage = response
-                    .usage
-                    .as_ref()
-                    .map(crate::completion::Usage::from)
-                    .unwrap_or_default();
-                span.record_token_usage(&usage);
-                if enabled!(Level::TRACE) {
-                    tracing::trace!(
-                        target: "rig::completions",
-                        "OpenAI Responses completion response: {response}",
-                        response = serde_json::to_string_pretty(&response)?
-                    );
-                }
-                Ok(response)
-            } else {
-                let status = response.status();
-                let text = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, text))
-            }
+        fn record_response(response: &CompletionResponse) {
+            let span = tracing::Span::current();
+            span.record_response_metadata(response);
+            let usage = response
+                .usage
+                .as_ref()
+                .map(crate::completion::Usage::from)
+                .unwrap_or_default();
+            span.record_token_usage(&usage);
         }
-        .instrument(span)
-        .await
+
+        let (mut response, provider_request_id) = if Ext::USES_2XX_ERROR_ENVELOPE {
+            send_completion::<
+                _,
+                crate::providers::openai::client::ApiResponse<CompletionResponse>,
+                _,
+            >(
+                &self.client,
+                req,
+                "Responses completion",
+                Ext::REQUEST_ID_HEADER,
+                record_response,
+            )
+            .instrument(span)
+            .await?
+        } else {
+            send_completion::<
+                _,
+                crate::providers::internal::envelope::DirectPayload<CompletionResponse>,
+                _,
+            >(
+                &self.client,
+                req,
+                "Responses completion",
+                Ext::REQUEST_ID_HEADER,
+                record_response,
+            )
+            .instrument(span)
+            .await?
+        };
+        response.provider_request_id = provider_request_id;
+        Ok(response)
     }
 }
 
@@ -2503,15 +2618,18 @@ where
         // The OpenAI Responses API constrains only the final assistant message via
         // `text.format`; tools are still called across turns, so native structured
         // output composes with tool calls. See issue #1928.
-        completion::ProviderCapabilities::default().with_native_output_tool_composition(true)
+        completion::ProviderCapabilities::default()
+            .with_native_output_tool_composition(Ext::COMPOSES_NATIVE_OUTPUT_WITH_TOOLS)
     }
 
     async fn completion(
         &self,
         completion_request: crate::completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
+        // Capture before `normalize` consumes the raw value.
         let response = self.raw_completion(completion_request).await?;
-        response.normalize(Ext::PROVIDER_NAME)
+        let captured = serde_json::to_value(&response)?;
+        Ok(response.normalize(Ext::PROVIDER_NAME)?.with_raw(captured))
     }
 
     async fn stream(
@@ -2525,9 +2643,8 @@ where
 impl<Ext, H> crate::client::ConstructCompletionModel<crate::client::Client<Ext, H>>
     for GenericResponsesCompletionModel<Ext, H>
 where
-    crate::client::Client<Ext, H>: HttpClientExt + Clone + std::fmt::Debug + 'static,
-    Ext: crate::client::Provider + ResponsesProviderExt + Clone + 'static,
-    H: Clone + Default + std::fmt::Debug + 'static,
+    Ext: crate::client::Provider + ResponsesProviderExt + Clone,
+    H: Clone,
 {
     fn construct(client: &crate::client::Client<Ext, H>, model: String) -> Self {
         Self::new(client.clone(), model)
@@ -2601,6 +2718,7 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
         Ok(completion::CompletionResponse::new(choice, usage, provider)
             .with_optional_message_id(message_id)
             .with_optional_response_id(Some(response.id.as_str()).filter(|id| !id.is_empty()))
+            .with_optional_provider_request_id(response.provider_request_id.clone())
             .with_optional_model(Some(response.model.as_str()).filter(|model| !model.is_empty()))
             .with_optional_finish_reason(finish_reason))
     }
@@ -4388,6 +4506,17 @@ mod tests {
             map_finish_reason(&ResponseStatus::Cancelled, None),
             Some(completion::FinishReason::Other("cancelled".to_string()))
         );
+        let status: ResponseStatus = serde_json::from_str(r#""throttled""#)
+            .expect("an unknown provider status should deserialize");
+        assert_eq!(status, ResponseStatus::Other("throttled".to_string()));
+        assert_eq!(
+            map_finish_reason(&status, None),
+            Some(completion::FinishReason::Other("throttled".to_string()))
+        );
+        assert_eq!(
+            serde_json::to_string(&status).expect("unknown status should serialize"),
+            r#""throttled""#
+        );
         assert_eq!(
             map_finish_reason(&ResponseStatus::Incomplete, None),
             Some(completion::FinishReason::Other("incomplete".to_string()))
@@ -5104,7 +5233,11 @@ mod tests {
             .await
             .expect_err("completion should fail with non-success status");
 
-        assert!(matches!(error, CompletionError::HttpError(_)));
+        // rig#2314: a provider with a request-id contract preserves its
+        // non-success responses as ProviderResponse, so the transport id has
+        // a home on the error; this mock sent no header, so the id is None.
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_request_id(), None);
         assert_eq!(
             error.provider_response_status(),
             Some(http::StatusCode::BAD_REQUEST)
@@ -5513,5 +5646,150 @@ mod tests {
             None,
             "base64 PDF should not carry file_url: {input_file:#}"
         );
+    }
+
+    /// Raw-capture tests: the `normalize` shape through the Responses model,
+    /// driven end to end over a mock transport that hands back a Responses
+    /// body *and* an `x-request-id` response header. The Responses raw type
+    /// carries the transport id (`CompletionResponse::provider_request_id`,
+    /// stamped by the driver), which is why the Part A contract here is a
+    /// plain `raw_completion` → `normalize`. Its manual `Serialize` mirrors
+    /// the wire body and deliberately never emits that id, so the captured
+    /// value is the body as parsed — the transport id lives on the normalized
+    /// response, beside the capture, not inside it. `with_error_response_headers`
+    /// with `200 OK` is the one unary double that carries response headers.
+    mod raw_capture {
+        use super::*;
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::openai::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        const REQUEST_ID: &str = "req_unit_responses_0001";
+
+        /// A Responses body carrying `service_tier`, which the normalized
+        /// response provably lacks.
+        const BODY: &str = r#"{
+            "id": "resp_raw_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-4o-mini-2024-07-18",
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 3,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 7
+            },
+            "output": [{
+                "type": "message",
+                "id": "msg_raw_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+            }],
+            "tools": []
+        }"#;
+
+        fn model() -> ResponsesCompletionModel<RecordingHttpClient> {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-request-id", http::HeaderValue::from_static(REQUEST_ID));
+            let http_client = RecordingHttpClient::with_error_response_headers(
+                http::StatusCode::OK,
+                BODY,
+                headers,
+            );
+            let client = Client::builder()
+                .api_key("test-key")
+                .http_client(http_client)
+                .build()
+                .expect("build client");
+            client.completion_model("gpt-4o-mini")
+        }
+
+        /// The load-bearing capture property: `raw` is the Responses
+        /// `CompletionResponse` as rig parsed it — it deserializes back into
+        /// that type and re-serializes to the identical value — and
+        /// re-normalizing that capture (with the header id reattached, since
+        /// the capture is body only) reproduces every normalized field. Also
+        /// reads `service_tier` off the capture,
+        /// and pins that the capture mirrors the wire body: the transport id
+        /// the driver stamped onto the raw type is not part of it (the manual
+        /// `Serialize` never emits it), so a value deserialized from `raw`
+        /// reports `None` there while the normalized response beside it still
+        /// carries the header.
+        #[tokio::test]
+        async fn completion_captures_raw_that_round_trips_into_the_wire_type() {
+            let model = model();
+
+            let response = model
+                .completion(model.completion_request("hello").build())
+                .await
+                .expect("completion");
+
+            let raw = &response.raw;
+            let typed: CompletionResponse =
+                serde_json::from_value(raw.clone()).expect("raw must deserialize");
+            assert_eq!(
+                serde_json::to_value(&typed).expect("re-serialize"),
+                *raw,
+                "the capture must be exactly what the wire type serializes to"
+            );
+            assert!(matches!(
+                typed.additional_parameters.service_tier,
+                Some(OpenAIServiceTier::Default)
+            ));
+            assert_eq!(raw["service_tier"], "default");
+            assert!(raw.get("provider_request_id").is_none());
+            assert_eq!(typed.provider_request_id, None);
+
+            let renormalized = typed
+                .normalize(<crate::providers::openai::OpenAIResponsesExt as ResponsesProviderExt>::PROVIDER_NAME)
+                .expect("re-normalize the capture")
+                .with_optional_provider_request_id(Some(REQUEST_ID.to_string()));
+            assert_eq!(response.identity(), renormalized.identity());
+            assert_eq!(response.finish_reason(), renormalized.finish_reason());
+            assert_eq!(response.model, renormalized.model);
+            assert_eq!(response.usage, renormalized.usage);
+            assert_eq!(response.choice, renormalized.choice);
+            assert_eq!(response.provider_request_id.as_deref(), Some(REQUEST_ID));
+            assert_eq!(response.identity().message_id.as_deref(), Some("msg_raw_1"));
+        }
+
+        /// Part A contract statement for a provider whose raw type carries the
+        /// transport id: `raw_completion` → `normalize` reproduces
+        /// `completion()` on identity, finish reason, model and usage — the id
+        /// included — with nothing to reattach.
+        #[tokio::test]
+        async fn raw_completion_then_normalize_reproduces_completion() {
+            let model = model();
+
+            let raw = model
+                .raw_completion(model.completion_request("hello").build())
+                .await
+                .expect("typed route");
+            assert_eq!(raw.provider_request_id.as_deref(), Some(REQUEST_ID));
+            let reassembled = raw
+                .normalize(<crate::providers::openai::OpenAIResponsesExt as ResponsesProviderExt>::PROVIDER_NAME)
+                .expect("normalize");
+
+            let normalized = model
+                .completion(model.completion_request("hello").build())
+                .await
+                .expect("normalized route");
+
+            assert_eq!(reassembled.identity(), normalized.identity());
+            assert_eq!(reassembled.finish_reason(), normalized.finish_reason());
+            assert_eq!(reassembled.model, normalized.model);
+            assert_eq!(reassembled.usage, normalized.usage);
+            assert_eq!(reassembled.provider_request_id.as_deref(), Some(REQUEST_ID));
+            assert_eq!(normalized.provider_request_id.as_deref(), Some(REQUEST_ID));
+        }
     }
 }

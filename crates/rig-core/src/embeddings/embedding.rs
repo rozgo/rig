@@ -1,5 +1,5 @@
-//! The module defines the [EmbeddingModel] trait, which represents an embedding model that can
-//! generate embeddings for documents.
+//! The module defines the [EmbeddingModel] and [ImageEmbeddingModel] traits, which represent
+//! embedding models that can generate embeddings for text documents and images.
 //!
 //! The module also defines the [Embedding] struct, which represents a single document embedding.
 //!
@@ -8,26 +8,12 @@
 
 use crate::{
     completion::Usage,
-    http_client, provider_response,
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use serde::{Deserialize, Serialize};
 
-/// Errors returned by embedding models.
-///
-/// Inspect provider failures with [`Self::provider_response_body`],
-/// [`Self::provider_response_json`], and [`Self::provider_response_status`].
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum EmbeddingError {
-    /// Http error (e.g.: connection error, timeout, etc.)
-    #[error("HttpError: {0}")]
-    HttpError(#[from] http_client::Error),
-
-    /// Json error (e.g.: serialization, deserialization)
-    #[error("JsonError: {0}")]
-    JsonError(#[from] serde_json::Error),
-
+crate::provider_response::provider_error_enum!(
+    EmbeddingError, "embedding" {
     /// URL construction or parsing failed while preparing a provider request.
     #[error("UrlError: {0}")]
     UrlError(#[from] url::ParseError),
@@ -41,11 +27,7 @@ pub enum EmbeddingError {
     /// Error processing the document for embedding
     #[error("DocumentError: {0}")]
     DocumentError(Box<dyn std::error::Error + 'static>),
-
-    /// Error parsing the completion response
-    #[error("ResponseError: {0}")]
-    ResponseError(String),
-
+    } {
     /// The provider does not support an embedding request parameter configured on the model.
     #[error("{provider} embeddings do not support the `{parameter}` parameter")]
     UnsupportedParameter {
@@ -82,17 +64,8 @@ pub enum EmbeddingError {
         /// Provider whose response omitted usage.
         provider: &'static str,
     },
-
-    /// Error returned by the embedding model provider
-    #[error("ProviderError: {0}")]
-    ProviderError(String),
-
-    /// Raw error response preserved from the embedding model provider
-    #[error("ProviderResponseError: {0}")]
-    ProviderResponse(provider_response::ProviderResponseError),
-}
-
-crate::provider_response::impl_provider_response_helpers!(EmbeddingError);
+    }
+);
 
 /// Trait for embedding models that can generate embeddings for documents.
 pub trait EmbeddingModel: WasmCompatSend + WasmCompatSync {
@@ -179,10 +152,45 @@ pub struct EmbeddingResponse {
     pub usage: Usage,
 }
 
+/// Trait for embedding models that can generate embeddings for images.
+pub trait ImageEmbeddingModel: Clone + WasmCompatSend + WasmCompatSync {
+    /// The maximum number of images the provider accepts in one request.
+    const MAX_DOCUMENTS: usize;
+
+    /// The number of dimensions in the embedding vector.
+    fn ndims(&self) -> usize;
+
+    /// Embed a batch of images from their encoded file bytes.
+    ///
+    /// Implementations must preserve input order in the returned embeddings.
+    /// The returned [`Embedding::document`] should identify the input without
+    /// retaining the raw image or a reversible encoding of it.
+    fn embed_images(
+        &self,
+        images: impl IntoIterator<Item = Vec<u8>> + WasmCompatSend,
+    ) -> impl std::future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + WasmCompatSend;
+
+    /// Embed a single image from its encoded file bytes.
+    fn embed_image<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<Embedding, EmbeddingError>> + WasmCompatSend {
+        async move {
+            let mut embeddings = self.embed_images(vec![bytes.to_owned()]).await?;
+            embeddings.pop().ok_or_else(|| {
+                EmbeddingError::ResponseError(
+                    "embedding provider returned an empty response for embed_image".to_string(),
+                )
+            })
+        }
+    }
+}
+
 /// Struct that holds a single document and its embedding.
 #[derive(Clone, Default, Deserialize, Serialize, Debug)]
 pub struct Embedding {
-    /// The document that was embedded. Used for debugging.
+    /// The text that was embedded, or a non-sensitive input identifier for
+    /// non-text embeddings. Used for debugging and equality.
     pub document: String,
     /// The embedding vector
     pub vec: Vec<f64>,
@@ -199,15 +207,15 @@ impl Eq for Embedding {}
 #[cfg(test)]
 mod provider_response_tests {
     use super::*;
+    use crate::{http_client, provider_response};
     use http::StatusCode;
 
     #[test]
     fn embedding_error_provider_response_helpers_with_preserved_json_body() {
         let body = r#"{"error":{"message":"rate limited"}}"#;
-        let error = EmbeddingError::ProviderResponse(provider_response::ProviderResponseError {
-            status: None,
-            body: body.to_string(),
-        });
+        let error = EmbeddingError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status(body.to_string()),
+        );
 
         assert_eq!(error.provider_response_body(), Some(body));
         assert_eq!(error.provider_response_status(), None);
@@ -247,10 +255,9 @@ mod provider_response_tests {
 
     #[test]
     fn embedding_error_provider_response_helpers_with_preserved_plain_text_body() {
-        let error = EmbeddingError::ProviderResponse(provider_response::ProviderResponseError {
-            status: None,
-            body: "not json".to_string(),
-        });
+        let error = EmbeddingError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status("not json".to_string()),
+        );
 
         assert_eq!(error.provider_response_body(), Some("not json"));
         assert!(error.provider_response_json().is_err());

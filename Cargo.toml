@@ -9,6 +9,16 @@ repository = "https://github.com/0xPlaygrounds/rig"
 # Examples now live in their own packages under `examples/*`; don't auto-discover
 # them as examples of this crate.
 autoexamples = false
+# This package's own `src/` is ~12 KiB of re-exports, but the manifest sits at the
+# repo root, so every sibling path is swept into the published tarball, including
+# the 1,100+ provider cassettes. They grew the crate from 6.66 MiB at 0.39.0 to
+# 9.51 MiB today, against a crates.io upload limit of 10 MiB: the next release was
+# on track to be rejected outright. That limit is enforced server-side, so no
+# amount of `cargo publish --dry-run` surfaces it. Excluding the cassettes drops
+# the tarball to 3.33 MiB. They are replay fixtures the test binaries read at
+# runtime from `CARGO_MANIFEST_DIR`, never embedded with `include_*!`, so nothing
+# in the package needs them to compile.
+exclude = ["tests/cassettes/**"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -71,116 +81,143 @@ opt-level = "s"
 
 
 [workspace.package]
-version = "0.41.0"
+version = "0.42.0"
 edition = "2024"
 
 [workspace.dependencies]
+# Every requirement below is a FLOOR, not a pin: `tokio = "1"` means `^1`,
+# and a downstream resolves anywhere inside that range — usually to whatever
+# its own lockfile already holds. So each floor is the lowest version rig's
+# own code needs, to the best it can be verified: a bare major (or `0.minor`)
+# where rig uses only long-stable API, and `major.minor[.patch]` only where a
+# feature or API rig relies on first appeared (each such floor says which).
+# Do not raise a floor because a newer release exists — Dependabot is
+# configured (`versioning-strategy: increase-if-necessary`) to move only
+# `Cargo.lock` for in-range releases, and every rig release used to ship the
+# raised floors, forcing downstream users to `cargo update` a dozen crates
+# just to take a point release (#2195). Raise a floor when rig starts using
+# an API the old floor lacks, and say so in the changelog.
+# `scripts/check-dependency-floors.py` (CI: nightly.yaml `dependency-floors`)
+# downgrades every direct dependency to its floor and builds the workspace,
+# so a floor that has silently rotted fails there rather than downstream.
+#
 # The `rig` facade is the workspace-root package; examples depend on it via
 # `rig.workspace = true` (add per-example features at the use site).
-rig = { path = ".", version = "0.41.0" }
-rig-agent = { path = "crates/rig-agent", version = "0.41.0" }
-rig-core = { path = "crates/rig-core", version = "0.41.0" }
-anyhow = "1.0.102"
+rig = { path = ".", version = "0.42.0" }
+rig-agent = { path = "crates/rig-agent", version = "0.42.0" }
+rig-core = { path = "crates/rig-core", version = "0.42.0" }
+anyhow = "1"
 arrow-array = "58"
-as-any = "0.3.2"
-assert_fs = "1.1.3"
-async-stream = "0.3.6"
-axum = "0.8.4"
-aws-config = { version = "1.8.5", default-features = false }
-aws-sdk-bedrockruntime = { version = "1.124.0", default-features = false }
-aws-smithy-eventstream = "0.60.18"
-aws-smithy-runtime-api = "1.11.3"
-aws-smithy-types = "1.3.2"
-base64 = "0.22.1"
-bytes = "1.10.1"
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
+as-any = "0.3"
+assert_fs = "1"
+async-stream = "0.3"
+axum = "0.8"
+aws-config = { version = "1", default-features = false }
+# 1.124: `OutputConfig`/`ServiceTier`/citations types rig-bedrock maps.
+aws-sdk-bedrockruntime = { version = "1.124", default-features = false }
+aws-smithy-eventstream = "0.60"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+base64 = "0.22"
+bytes = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 chrono = "0.4"
-convert_case = "0.11.0"
-deranged = "=0.5.8"
-dotenvy = "0.15.7"
-epub = "2.1.4"
-ethers = "2.0.14"
+convert_case = "0.11"
+dotenvy = "0.15"
+epub = "2"
+ethers = "2"
+# 0.2.3: `EventStream::set_last_event_id`.
 eventsource-stream = "0.2.3"
-fastembed = { version = "4.9.1", default-features = false }
-fastrand = "2.3.0"
-futures = "0.3.32"
-futures-timer = "3.0.3"
-glob = "0.3.2"
-google-cloud-auth = "1.10"
-google-cloud-aiplatform-v1 = { version = "1.11.0", default-features = false, features = [
+# 4.5: the `hf-hub-*` feature split rig-fastembed forwards.
+fastembed = { version = "4.5", default-features = false }
+fastrand = "2"
+futures = "0.3"
+futures-timer = "3"
+glob = "0.3"
+google-cloud-auth = "1"
+# 1.7: `ThinkingLevel`, `ImageConfig`, `FunctionResponse{Blob,FileData}`.
+google-cloud-aiplatform-v1 = { version = "1.7", default-features = false, features = [
     "prediction-service",
 ] }
-http = "1.3.1"
-httpmock = "0.8.3"
-hyper-util = "0.1.14"
-indexmap = "2.14.0"
-indoc = "2.0.6"
+http = "1"
+# 0.8.2: `Recording::export_async` (cassette harness).
+httpmock = "0.8.2"
+# 0.1.2: the `service` feature.
+hyper-util = "0.1.2"
+indexmap = "2"
+indoc = "2"
 lancedb = { version = "0.30", default-features = false }
-log = "0.4.27"
-lopdf = { version = "0.44.0", default-features = false, features = ["rayon"] }
-mime = "0.3.17"
-mime_guess = "2.0.5"
-mongodb = "3.7.0"
-neo4rs = "0.8.0"
-opentelemetry = "0.32.0"
-opentelemetry-otlp = "0.32.0"
-opentelemetry_sdk = "0.32.1"
-ordered-float = "5.0.0"
+log = "0.4"
+lopdf = { version = "0.44", default-features = false, features = ["rayon"] }
+mime = "0.3"
+mime_guess = "2"
+# 3.2: 3.0/3.1 no longer build against their own `^3` macro crate.
+mongodb = "3.2"
+neo4rs = "0.8"
+opentelemetry = "0.32"
+opentelemetry-otlp = "0.32"
+opentelemetry_sdk = "0.32"
+ordered-float = "5"
+# 0.4.2: the first release whose `sqlx` feature accepts sqlx 0.9.
 pgvector = "0.4.2"
-pin-project-lite = "0.2.16"
-proc-macro2 = "1.0.95"
-qdrant-client = { version = "1.14.0", default-features = false, features = [
+pin-project-lite = "0.2"
+proc-macro2 = "1"
+# 1.10: the `Qdrant` client, `Payload`, and the query/upsert builders.
+qdrant-client = { version = "1.10", default-features = false, features = [
     "serde",
 ] }
-quick-xml = "0.40.1"
-quote = "1.0.40"
-rayon = "1.10.0"
-redis = "1.2.1"
+quick-xml = "0.41"
+quote = "1"
+rayon = "1"
+redis = "1"
 reqwest = { version = "0.13", default-features = false }
-reqwest-middleware = { version = "0.5.2", default-features = false }
+reqwest-middleware = { version = "0.5", default-features = false }
 reqwest-retry = "0.9"
-rmcp = { version = "=3.1.2", git = "https://github.com/rozgo/rust-sdk", rev = "b7a5ad0f3894b7b66ad8a789cd49a79787e5d65f" }
-url = "2.5"
+rmcp = { version = "=3.1.3", git = "https://github.com/rozgo/rust-sdk", rev = "17f851388f5d2c422c1bd625374c4dee53c67da1" }
+url = "2"
 rusqlite = "0.32"
-scylla = "1.2.0"
-schemars = "1.0.4"
-serde = "1.0.219"
-serde_yaml = "0.9.34"
-serde_json = "1.0.150"
-safetensors = "0.8.0"
-sha2 = "0.10.9"
-serde_path_to_error = "0.1.17"
+scylla = "1"
+schemars = "1"
+serde = "1"
+serde_yaml = "0.9"
+# 1.0.54: the `float_roundtrip` feature.
+serde_json = "1.0.54"
+safetensors = "0.8"
+sha2 = "0.10"
+serde_path_to_error = "0.1"
 sqlite-vec = "0.1"
-sqlx = "0.9.0"
-surrealdb = "3.0.2"
-syn = "2.0.104"
-serenity = "0.12.4"
-term_size = "0.3.2"
+sqlx = "0.9"
+# 3.2: 3.0/3.1 no longer build against `surrealdb-core ^3` as published.
+surrealdb = "3.2"
+syn = "2"
+serenity = "0.12"
+term_size = "0.3"
 testcontainers = "0.27"
-textwrap = "0.16.2"
-thiserror = "2.0.12"
-tokio = "1.52.3"
-tokio-rusqlite = { version = "0.6.0", default-features = false }
-tokio-test = "0.4.4"
-tokio-stream = "0.1.17"
-tokio-tungstenite = { version = "0.28.0", default-features = false }
-tokenizers = { version = "0.22.2", default-features = false }
-tonic = "0.14.6"
-tonic-build = "0.14.6"
-tonic-prost = "0.14.5"
-tonic-prost-build = "0.14.6"
-prost = "0.14.3"
-tracing = "0.1.41"
+textwrap = "0.16"
+thiserror = "2"
+tokio = "1"
+tokio-rusqlite = { version = "0.6", default-features = false }
+tokio-test = "0.4"
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.29", default-features = false }
+tokenizers = { version = "0.22", default-features = false }
+tonic = "0.14"
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+tracing = "0.1"
+# 0.2.5: `Instrumented<S>: Stream` under `futures-03` for futures 0.3 stable.
 tracing-futures = "0.2.5"
-tracing-opentelemetry = "0.33.0"
-tracing-subscriber = "0.3.19"
-uuid = "1.17.0"
-wasm-bindgen-futures = "0.4.54"
-wasm-bindgen = "0.2.118"
-web-time = "1.1.0"
-zerocopy = "0.8.50"
+tracing-opentelemetry = "0.33"
+tracing-subscriber = "0.3"
+uuid = "1"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen = "0.2"
+web-time = "1"
+zerocopy = "0.8"
 
 [workspace.metadata.cargo-autoinherit]
 # Skip cargo-autoinherit for these packages
@@ -190,27 +227,28 @@ exclude-members = ["crates/rig-core", "crates/rig-derive"]
 workspace = true
 
 [dependencies]
-rig-core = { path = "crates/rig-core", version = "0.41.0", default-features = false }
-rig-agent = { path = "crates/rig-agent", version = "0.41.0", optional = true, default-features = false }
-rig-bedrock = { path = "crates/rig-bedrock", version = "0.41.0", optional = true, default-features = false }
-rig-candle = { path = "crates/rig-candle", version = "0.41.0", optional = true, default-features = false }
-rig-fastembed = { path = "crates/rig-fastembed", version = "0.41.0", optional = true, default-features = false }
-rig-gemini-grpc = { path = "crates/rig-gemini-grpc", version = "0.41.0", optional = true, default-features = false }
-rig-helixdb = { path = "crates/rig-helixdb", version = "0.41.0", optional = true, default-features = false }
-rig-lancedb = { path = "crates/rig-lancedb", version = "0.41.0", optional = true, default-features = false }
-rig-memory = { path = "crates/rig-memory", version = "0.41.0", optional = true, default-features = false }
-rig-derive = { path = "crates/rig-derive", version = "0.41.0", optional = true }
-rig-milvus = { path = "crates/rig-milvus", version = "0.41.0", optional = true, default-features = false }
-rig-mongodb = { path = "crates/rig-mongodb", version = "0.41.0", optional = true, default-features = false }
-rig-neo4j = { path = "crates/rig-neo4j", version = "0.41.0", optional = true, default-features = false }
-rig-postgres = { path = "crates/rig-postgres", version = "0.41.0", optional = true, default-features = false }
-rig-qdrant = { path = "crates/rig-qdrant", version = "0.41.0", optional = true, default-features = false }
-rig-s3vectors = { path = "crates/rig-s3vectors", version = "0.41.0", optional = true, default-features = false }
-rig-scylladb = { path = "crates/rig-scylladb", version = "0.41.0", optional = true, default-features = false }
-rig-sqlite = { path = "crates/rig-sqlite", version = "0.41.0", optional = true, default-features = false }
-rig-surrealdb = { path = "crates/rig-surrealdb", version = "0.41.0", optional = true, default-features = false }
-rig-vectorize = { path = "crates/rig-vectorize", version = "0.41.0", optional = true, default-features = false }
-rig-vertexai = { path = "crates/rig-vertexai", version = "0.41.0", optional = true, default-features = false }
+rig-core = { path = "crates/rig-core", version = "0.42.0", default-features = false }
+rig-agent = { path = "crates/rig-agent", version = "0.42.0", optional = true, default-features = false }
+rig-bedrock = { path = "crates/rig-bedrock", version = "0.42.0", optional = true, default-features = false }
+rig-candle = { path = "crates/rig-candle", version = "0.42.0", optional = true, default-features = false }
+rig-fastembed = { path = "crates/rig-fastembed", version = "0.42.0", optional = true, default-features = false }
+rig-gemini-grpc = { path = "crates/rig-gemini-grpc", version = "0.42.0", optional = true, default-features = false }
+rig-helixdb = { path = "crates/rig-helixdb", version = "0.42.0", optional = true, default-features = false }
+rig-lancedb = { path = "crates/rig-lancedb", version = "0.42.0", optional = true, default-features = false }
+lancedb = { workspace = true, optional = true }
+rig-memory = { path = "crates/rig-memory", version = "0.42.0", optional = true, default-features = false }
+rig-derive = { path = "crates/rig-derive", version = "0.42.0", optional = true }
+rig-milvus = { path = "crates/rig-milvus", version = "0.42.0", optional = true, default-features = false }
+rig-mongodb = { path = "crates/rig-mongodb", version = "0.42.0", optional = true, default-features = false }
+rig-neo4j = { path = "crates/rig-neo4j", version = "0.42.0", optional = true, default-features = false }
+rig-postgres = { path = "crates/rig-postgres", version = "0.42.0", optional = true, default-features = false }
+rig-qdrant = { path = "crates/rig-qdrant", version = "0.42.0", optional = true, default-features = false }
+rig-s3vectors = { path = "crates/rig-s3vectors", version = "0.42.0", optional = true, default-features = false }
+rig-scylladb = { path = "crates/rig-scylladb", version = "0.42.0", optional = true, default-features = false }
+rig-sqlite = { path = "crates/rig-sqlite", version = "0.42.0", optional = true, default-features = false }
+rig-surrealdb = { path = "crates/rig-surrealdb", version = "0.42.0", optional = true, default-features = false }
+rig-vectorize = { path = "crates/rig-vectorize", version = "0.42.0", optional = true, default-features = false }
+rig-vertexai = { path = "crates/rig-vertexai", version = "0.42.0", optional = true, default-features = false }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -222,10 +260,10 @@ aws-sdk-bedrockruntime = { workspace = true }
 aws-smithy-eventstream = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-rig-core = { path = "crates/rig-core", version = "0.41.0", default-features = false, features = [
+rig-core = { path = "crates/rig-core", version = "0.42.0", default-features = false, features = [
   "test-utils",
 ] }
-rig-agent = { path = "crates/rig-agent", version = "0.41.0", default-features = false, features = [
+rig-agent = { path = "crates/rig-agent", version = "0.42.0", default-features = false, features = [
   "test-utils",
 ] }
 tokio = { workspace = true, features = ["full"] }
@@ -237,7 +275,6 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 httpmock = { workspace = true, features = ["record", "proxy"] }
-lancedb = { workspace = true }
 mongodb = { workspace = true }
 neo4rs = { workspace = true }
 qdrant-client = { workspace = true }
@@ -303,7 +340,7 @@ fastembed-hf-hub = ["dep:rig-fastembed", "rig-fastembed/hf-hub"]
 fastembed-ort-download-binaries = ["dep:rig-fastembed", "rig-fastembed/ort-download-binaries"]
 gemini-grpc = ["dep:rig-gemini-grpc"]
 helixdb = ["dep:rig-helixdb"]
-lancedb = ["dep:rig-lancedb"]
+lancedb = ["dep:rig-lancedb", "dep:lancedb"]
 memory = ["dep:rig-memory"]
 milvus = ["dep:rig-milvus"]
 mongodb = ["dep:rig-mongodb"]

@@ -5,9 +5,10 @@
 use super::client::ApiResponse;
 use crate::completion::NormalizeCompletionResponse;
 use crate::completion::{CompletionError, CompletionRequest as CoreCompletionRequest};
-use crate::http_client::{self, HttpClientExt};
+use crate::http_client::HttpClientExt;
 use crate::json_utils::string_or_vec;
 use crate::message::{AudioMediaType, DocumentSourceKind, ImageDetail, MimeType};
+use crate::providers::internal::completion_send::send_completion;
 use crate::telemetry::{
     CompletionOperation, CompletionSpanBuilder, ProviderResponseExt, SpanCombinator,
 };
@@ -16,7 +17,7 @@ use crate::{completion, json_utils, message};
 use serde::{Deserialize, Serialize, Serializer};
 use std::convert::Infallible;
 use std::fmt;
-use tracing::{Instrument, Level, enabled};
+use tracing::Instrument;
 
 use std::str::FromStr;
 
@@ -181,7 +182,7 @@ pub enum Message {
         name: Option<String>,
         #[serde(
             default,
-            deserialize_with = "json_utils::null_or_vec",
+            deserialize_with = "json_utils::null_or_default",
             skip_serializing_if = "Vec::is_empty"
         )]
         tool_calls: Vec<ToolCall>,
@@ -493,7 +494,6 @@ impl ToolDefinition {
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
-#[non_exhaustive]
 pub enum ToolChoice {
     #[default]
     Auto,
@@ -954,6 +954,7 @@ impl TryFrom<Message> for message::Message {
                 content,
                 tool_calls,
                 reasoning,
+                refusal,
                 ..
             } => {
                 let mut assistant_content = Vec::new();
@@ -964,12 +965,23 @@ impl TryFrom<Message> for message::Message {
                     assistant_content.push(message::AssistantContent::reasoning(reasoning));
                 }
 
-                assistant_content.extend(content.into_iter().map(|content| match content {
-                    AssistantContent::Text { text, .. } => message::AssistantContent::text(text),
-                    AssistantContent::Refusal { refusal } => {
-                        message::AssistantContent::text(refusal)
-                    }
-                }));
+                // Either/or, not both: the fallback fires only when no part
+                // carried text, so every part left is an empty one. Appending
+                // them anyway would put an empty text block on the wire beside
+                // the refusal and make this view of the message disagree with
+                // the one `normalize` builds, which drops empty parts.
+                if let Some(refusal) = assistant_refusal_fallback(&content, refusal.as_deref()) {
+                    assistant_content.push(message::AssistantContent::text(refusal));
+                } else {
+                    assistant_content.extend(content.into_iter().map(|content| match content {
+                        AssistantContent::Text { text, .. } => {
+                            message::AssistantContent::text(text)
+                        }
+                        AssistantContent::Refusal { refusal } => {
+                            message::AssistantContent::text(refusal)
+                        }
+                    }));
+                }
 
                 assistant_content.extend(
                     tool_calls
@@ -1079,9 +1091,7 @@ impl From<String> for UserContent {
 
 impl From<&str> for UserContent {
     fn from(s: &str) -> Self {
-        UserContent::Text {
-            text: s.to_string(),
-        }
+        s.to_owned().into()
     }
 }
 
@@ -1089,9 +1099,7 @@ impl FromStr for UserContent {
     type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(UserContent::Text {
-            text: s.to_string(),
-        })
+        Ok(s.to_owned().into())
     }
 }
 
@@ -1105,9 +1113,7 @@ impl FromStr for AssistantContent {
     type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(AssistantContent::Text {
-            text: s.to_string(),
-        })
+        Ok(s.to_owned().into())
     }
 }
 impl From<String> for SystemContent {
@@ -1123,24 +1129,28 @@ impl FromStr for SystemContent {
     type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(SystemContent {
-            r#type: SystemContentType::default(),
-            text: s.to_string(),
-        })
+        Ok(s.to_owned().into())
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
-    // Defaulted on deserialization: some OpenAI-compatible gateways
-    // (HuggingFace router sub-providers, TGI variants) omit them.
-    #[serde(default)]
+    // Null-or-missing tolerated on deserialization: some OpenAI-compatible
+    // gateways (HuggingFace router sub-providers, TGI variants, Copilot's
+    // multi-vendor chat route) omit them or send explicit `null`.
+    #[serde(default, deserialize_with = "json_utils::null_or_default")]
     pub object: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "json_utils::null_or_default")]
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
+    /// Service tier that processed the request, when OpenAI reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(
+        deserialize_with = "crate::providers::internal::openai_chat_completions_compatible::deserialize_choices_dropping_incomplete_tool_calls"
+    )]
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
 }
@@ -1169,12 +1179,13 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
             |choice| choice.finish_reason.as_str(),
             |choice| match &choice.message {
                 Message::Assistant {
-                    content,
+                    content: wire_content,
                     tool_calls,
                     reasoning,
+                    refusal,
                     ..
                 } => {
-                    let mut content = content
+                    let mut content = wire_content
                         .iter()
                         .filter_map(|c| {
                             let s = match c {
@@ -1188,6 +1199,12 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
                             }
                         })
                         .collect::<Vec<_>>();
+
+                    if let Some(refusal) =
+                        assistant_refusal_fallback(wire_content, refusal.as_deref())
+                    {
+                        content.push(completion::AssistantContent::text(refusal));
+                    }
 
                     if let Some(reasoning) = reasoning {
                         // llama.cpp exposes hidden reasoning on a separate non-standard field.
@@ -1212,7 +1229,6 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
 }
 
 impl ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Choice;
     type Usage = Usage;
 
     fn get_response_id(&self) -> Option<String> {
@@ -1221,10 +1237,6 @@ impl ProviderResponseExt for CompletionResponse {
 
     fn get_response_model_name(&self) -> Option<String> {
         Some(self.model.to_owned())
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.choices.clone()
     }
 
     fn get_text_response(&self) -> Option<String> {
@@ -1247,6 +1259,49 @@ impl ProviderResponseExt for CompletionResponse {
     }
 }
 
+/// The assistant message's top-level `refusal`, when it is the turn's only
+/// visible text.
+///
+/// This wire spells a refusal as a *sibling* of `content`
+/// (`{"content": null, "refusal": "I'm sorry, …"}`); the `refusal` **content
+/// part** modeled by [`AssistantContent::Refusal`] is the Responses API's
+/// shape, which chat completions never sends. Every path that reads `content`
+/// alone therefore drops a real refusal entirely, so all of them route the
+/// fallback through here — one home for the rule, and no way for the raw text
+/// view and the normalized response to disagree about whether a refusal is
+/// content.
+///
+/// The verdict is taken from the wire parts themselves rather than from
+/// whatever each caller built out of them, so a caller that discards empty
+/// parts and one that keeps them cannot disagree about when the fallback
+/// applies.
+///
+/// This is a *whole-message* rule and the three unary paths share it. The
+/// streaming path cannot: it decides per delta, before it knows whether text
+/// arrives later
+/// ([`delta_text`](super::completion::streaming), which prefers a delta's own
+/// content and falls back to its refusal). The two therefore agree on every
+/// shape this wire has been observed to send — a refusal turn holds `content`
+/// at `null` for its whole length — but would differ on a turn mixing both,
+/// where this rule keeps only the text and the streaming rule would deliver
+/// both in arrival order. That shape is pinned in
+/// `delta_text_prefers_content_over_a_simultaneous_refusal` so the difference
+/// is recorded rather than assumed away.
+pub(crate) fn assistant_refusal_fallback<'a>(
+    content: &[AssistantContent],
+    refusal: Option<&'a str>,
+) -> Option<&'a str> {
+    let has_text = content.iter().any(|part| {
+        !match part {
+            AssistantContent::Text { text } => text,
+            AssistantContent::Refusal { refusal } => refusal,
+        }
+        .is_empty()
+    });
+
+    refusal.filter(|refusal| !has_text && !refusal.is_empty())
+}
+
 pub(crate) fn assistant_message_text_response(message: &Message) -> Option<String> {
     let Message::Assistant {
         content, refusal, ..
@@ -1263,10 +1318,8 @@ pub(crate) fn assistant_message_text_response(message: &Message) -> Option<Strin
         })
         .collect::<Vec<_>>();
 
-    if segments.is_empty()
-        && let Some(refusal) = refusal.as_ref().filter(|refusal| !refusal.is_empty())
-    {
-        segments.push(refusal.clone());
+    if let Some(refusal) = assistant_refusal_fallback(content, refusal.as_deref()) {
+        segments.push(refusal.to_owned());
     }
 
     if segments.is_empty() {
@@ -1278,9 +1331,14 @@ pub(crate) fn assistant_message_text_response(message: &Message) -> Option<Strin
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Choice {
+    // Null-or-missing tolerated on deserialization: Copilot's chat route
+    // (fronting non-OpenAI vendors) can omit either field or send explicit
+    // `null`; normalization treats "" as absent.
+    #[serde(default, deserialize_with = "json_utils::null_or_default")]
     pub index: usize,
     pub message: Message,
     pub logprobs: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "json_utils::null_or_default")]
     pub finish_reason: String,
 }
 
@@ -1417,6 +1475,12 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
     /// Provider name recorded on `gen_ai.provider.name` telemetry spans.
     const PROVIDER_NAME: &'static str;
 
+    /// Response header carrying the provider's transport request id, when the
+    /// provider reports one (OpenAI sends `x-request-id`). `None` — the
+    /// default — means the provider does not report one; the normalized
+    /// response's `provider_request_id` is then `None`, never an error.
+    const REQUEST_ID_HEADER: Option<&'static str> = None;
+
     /// Whether the backend can emit a whole tool call (id, name, and complete
     /// arguments) in a single streaming chunk, as llama.cpp-based servers do.
     /// When true, the shared streaming layer emits such calls as soon as they
@@ -1439,6 +1503,49 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
     /// unknown parameters and already report usage on the final chunk set
     /// this to false.
     const STREAM_INCLUDE_USAGE: bool = true;
+
+    /// Map a streamed terminal reason for this compatible provider.
+    ///
+    /// The normalized Chat Completions field is the default contract. Gateway
+    /// providers that also expose an upstream-native reason can override this
+    /// to apply their documented precedence without teaching the shared wire
+    /// adapter provider names or native vocabularies.
+    fn map_streaming_finish_reason(
+        &self,
+        finish_reason: Option<&str>,
+        _native_finish_reason: Option<&str>,
+    ) -> Option<crate::completion::FinishReason> {
+        finish_reason
+            .filter(|reason| !reason.is_empty())
+            .map(crate::providers::internal::openai_chat_completions_compatible::map_openai_finish_reason)
+    }
+
+    /// Whether `model`'s endpoint rejects the legacy `max_tokens` field and
+    /// requires `max_completion_tokens` instead.
+    ///
+    /// OpenAI's reasoning-class models answer a capped request with
+    /// `"Unsupported parameter: 'max_tokens' is not supported with this model.
+    /// Use 'max_completion_tokens' instead."`, so such a request cannot
+    /// succeed at all until the field is respelled.
+    ///
+    /// Scoped to the model rather than applied to every request on purpose:
+    /// this same extension is how rig reaches OpenAI-*compatible* servers
+    /// (mistral.rs, vLLM, llama.cpp, gateways), whose endpoints mostly know
+    /// only the legacy field, and OpenAI's own non-reasoning models still take
+    /// it. Everything outside the returned set keeps the bytes it always sent.
+    /// The default is `false` — a provider that has not been observed to
+    /// reject the legacy field says so by saying nothing.
+    ///
+    /// Azure OpenAI deliberately keeps the default even though it fronts the
+    /// same models: an Azure model handle is a *deployment* name chosen by the
+    /// account owner, so it carries no family information to classify. A
+    /// capped reasoning deployment there still gets the provider's explicit
+    /// `Unsupported parameter` error, which is the honest outcome until Azure
+    /// can be given a signal that does not require guessing.
+    fn requires_modern_output_cap(&self, model: &str) -> bool {
+        let _ = model;
+        false
+    }
 
     /// The usage payload parsed from streaming chunks and carried on the
     /// final streaming response. OpenAI's [`Usage`] for most providers;
@@ -1547,6 +1654,14 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
         None
     }
 
+    /// Extract a signature-only reasoning detail from a streamed compatible
+    /// response. The default wire has no such extension; gateway providers
+    /// can attach the signature to the shared plaintext reasoning lifecycle.
+    fn streaming_reasoning_signature(&self, detail: &serde_json::Value) -> Option<String> {
+        let _ = detail;
+        None
+    }
+
     /// Decorate a streamed tool call from a provider-specific streaming
     /// detail payload, matched by its established provider id. Most
     /// OpenAI-compatible providers do not emit such details.
@@ -1565,9 +1680,82 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
 
 impl OpenAICompatibleProvider for super::OpenAICompletionsExt {
     const PROVIDER_NAME: &'static str = "openai";
+    const REQUEST_ID_HEADER: Option<&'static str> = Some("x-request-id");
 
     type StreamingUsage = Usage;
     type Response = CompletionResponse;
+
+    fn requires_modern_output_cap(&self, model: &str) -> bool {
+        is_openai_reasoning_model(model)
+    }
+}
+
+/// Whether `model` names one of OpenAI's reasoning families, which take the
+/// output cap only as `max_completion_tokens`.
+///
+/// Matched by family prefix rather than by an exhaustive list of releases: the
+/// families are `gpt-5` and up, and the `o`-series (`o1`, `o3-mini`,
+/// `o4-mini`, …), and each gains dated snapshots and size variants that an
+/// enumerated list could not keep up with. A future family this misses keeps
+/// today's behavior — the legacy field, and the provider's own explicit
+/// `Unsupported parameter` error — rather than silently sending a field some
+/// other backend does not know.
+pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
+    /// `gpt-5` … `gpt-9`, in any spelling the family uses (`gpt-5`,
+    /// `gpt-5.1`, `gpt-5-nano`, `gpt-5-2025-08-07`).
+    ///
+    /// The major version is a single digit on purpose. Every released
+    /// generation is spelled `gpt-<digit>` or `gpt-<digit>.<minor>`, so a
+    /// multi-digit run (`gpt-45`, or a compatible server's own model name) is
+    /// not a generation number and must not be read as one. A hypothetical
+    /// `gpt-10` would fall through to the legacy field — today's behavior, and
+    /// a visible provider error — rather than a field its backend may not know.
+    fn is_numbered_gpt_family(model: &str, lowest: u32) -> bool {
+        model
+            .strip_prefix("gpt-")
+            .and_then(|rest| rest.split(['.', '-']).next())
+            .filter(|major| major.len() == 1)
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= lowest)
+    }
+
+    /// `o1`, `o3`, `o4`, … — but not `openai-…` or any other `o` word.
+    fn is_o_series(model: &str) -> bool {
+        let mut chars = model.chars();
+        chars.next() == Some('o')
+            && chars.next().is_some_and(|digit| digit.is_ascii_digit())
+            && chars
+                .next()
+                .is_none_or(|next| next == '-' || next.is_ascii_digit())
+    }
+
+    is_numbered_gpt_family(model, 5) || is_o_series(model)
+}
+
+/// Serialize a chat-completions request into the body the target endpoint
+/// expects, applying the spellings that depend on the endpoint rather than on
+/// the request.
+///
+/// Both the unary and the streaming path build their body through here so the
+/// two cannot disagree about what rig sends.
+pub(crate) fn request_body(
+    request: &CompletionRequest,
+    modern_output_cap: bool,
+) -> Result<serde_json::Value, CompletionError> {
+    let mut body = serde_json::to_value(request)?;
+
+    if modern_output_cap
+        && let Some(object) = body.as_object_mut()
+        && let Some(max_tokens) = object.remove("max_tokens")
+    {
+        // A caller who spelled the modern field themselves (through
+        // `additional_params`) keeps their own value; the legacy key still has
+        // to go, since reasoning models reject its mere presence — and behind
+        // this endpoint there is no backend that wants it.
+        object.entry("max_completion_tokens").or_insert(max_tokens);
+    }
+
+    Ok(body)
 }
 
 /// A chat-completions model over any [`OpenAICompatibleProvider`] extension.
@@ -1932,14 +2120,7 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
         let additional_params = if let Some(schema) = output_schema
             && should_apply_response_format
         {
-            let name = schema
-                .as_object()
-                .and_then(|o| o.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("response_schema")
-                .to_string();
-            let mut schema_value = schema.to_value();
-            super::sanitize_schema(&mut schema_value);
+            let (name, schema_value) = super::structured_output_schema(schema);
             let response_format = serde_json::json!({
                 "response_format": {
                     "type": "json_schema",
@@ -1989,6 +2170,22 @@ impl TryFrom<(String, CoreCompletionRequest)> for CompletionRequest {
 
 impl<Ext, H> GenericCompletionModel<Ext, H>
 where
+    Ext: OpenAICompatibleProvider,
+{
+    /// Whether outgoing requests for `model` spell the output-token cap
+    /// `max_completion_tokens`; see
+    /// [`OpenAICompatibleProvider::requires_modern_output_cap`].
+    ///
+    /// `model` is the request's resolved model, not the handle's: a per-request
+    /// override changes which endpoint answers, so it has to decide the
+    /// spelling too.
+    pub(crate) fn sends_modern_output_cap(&self, model: &str) -> bool {
+        self.client.ext().requires_modern_output_cap(model)
+    }
+}
+
+impl<Ext, H> GenericCompletionModel<Ext, H>
+where
     crate::client::Client<Ext, H>:
         HttpClientExt + Clone + WasmCompatSend + WasmCompatSync + 'static,
     Ext: crate::client::Provider
@@ -2008,10 +2205,36 @@ where
     /// [`CompletionModel::completion`](completion::CompletionModel::completion),
     /// which calls it and then applies the provider-local mapping — one
     /// network request either way.
+    ///
+    /// The transport request id is not on the wire type and is dropped here;
+    /// use [`Self::raw_completion_with_request_id`] when the typed route must
+    /// reproduce everything `completion` returns.
     pub async fn raw_completion(
         &self,
         completion_request: CoreCompletionRequest,
     ) -> Result<Ext::Response, CompletionError> {
+        self.raw_completion_with_request_id(completion_request)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::raw_completion`] plus the transport request id from the
+    /// provider's request-id response header ([`OpenAICompatibleProvider::REQUEST_ID_HEADER`]).
+    ///
+    /// The pair exists because the wire type is substitutable — `Ext::Response`
+    /// is whatever the compatible provider parses — so the transport id cannot
+    /// live on it, while the normalized [`completion::CompletionResponse`]
+    /// carries one. Without this method, `raw_completion(..)` followed by
+    /// [`normalize`](crate::completion::NormalizeCompletionResponse::normalize)
+    /// would silently lack the `provider_request_id` that
+    /// [`CompletionModel::completion`](completion::CompletionModel::completion)
+    /// reports — the typed escape hatch would not reproduce the normalized
+    /// path. Reassemble with
+    /// [`with_optional_provider_request_id`](completion::CompletionResponse::with_optional_provider_request_id).
+    pub async fn raw_completion_with_request_id(
+        &self,
+        completion_request: CoreCompletionRequest,
+    ) -> Result<(Ext::Response, Option<String>), CompletionError> {
         let system_instructions = completion_request.preamble.clone();
         let record_telemetry_content = completion_request.record_telemetry_content;
         let options = CompletionModelOptions {
@@ -2033,17 +2256,16 @@ where
         .system_instructions(system_instructions.as_deref(), record_telemetry_content)
         .build();
 
-        let mut request_body = serde_json::to_value(&request)?;
+        let modern_output_cap = self.sends_modern_output_cap(&request.model);
+        let mut request_body = request_body(&request, modern_output_cap)?;
         self.client
             .ext()
             .finalize_request_body_with_options(&mut request_body, options)?;
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "OpenAI Chat Completions completion request: {}",
-                serde_json::to_string_pretty(&request_body)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "OpenAI Chat Completions completion request",
+            &request_body,
+        );
 
         let body = serde_json::to_vec(&request_body)?;
         // Deliberately the configured model, not the per-request override:
@@ -2056,42 +2278,18 @@ where
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
-        async move {
-            let response = self.client.send(req).await?;
-
-            let status = response.status();
-            if status.is_success() {
-                let text = http_client::text(response).await?;
-
-                match serde_json::from_str::<ApiResponse<Ext::Response>>(&text)? {
-                    ApiResponse::Ok(response) => {
-                        let span = tracing::Span::current();
-                        span.record_response_metadata(&response);
-                        let usage = response
-                            .get_usage()
-                            .map(Into::into)
-                            .unwrap_or_default();
-                        span.record_token_usage(&usage);
-                        if enabled!(Level::TRACE) {
-                            tracing::trace!(
-                                target: "rig::completions",
-                                "OpenAI Chat Completions completion response: {}",
-                                serde_json::to_string_pretty(&response)?
-                            );
-                        }
-
-                        Ok(response)
-                    }
-                    ApiResponse::Err(err) => {
-                        tracing::warn!(message = %err.message, "provider returned an error response");
-                        Err(CompletionError::from_http_response(status, text))
-                    }
-                }
-            } else {
-                let text = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, text))
-            }
-        }
+        send_completion::<_, ApiResponse<Ext::Response>, _>(
+            &self.client,
+            req,
+            "OpenAI Chat Completions completion",
+            Ext::REQUEST_ID_HEADER,
+            |response| {
+                let span = tracing::Span::current();
+                span.record_response_metadata(response);
+                let usage = response.get_usage().map(Into::into).unwrap_or_default();
+                span.record_token_usage(&usage);
+            },
+        )
         .instrument(span)
         .await
     }
@@ -2130,8 +2328,15 @@ where
         &self,
         completion_request: CoreCompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        let response = self.raw_completion(completion_request).await?;
-        response.normalize(Ext::PROVIDER_NAME)
+        // Capture before `normalize` consumes the raw value.
+        let (response, provider_request_id) = self
+            .raw_completion_with_request_id(completion_request)
+            .await?;
+        let captured = serde_json::to_value(&response)?;
+        Ok(response
+            .normalize(Ext::PROVIDER_NAME)?
+            .with_optional_provider_request_id(provider_request_id)
+            .with_raw(captured))
     }
 
     async fn stream(
@@ -2169,6 +2374,33 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The shared chat-completions response type is deliberately lenient about
+    /// envelope metadata: `object`, `created`, `choices[].index`, and
+    /// `choices[].finish_reason` may be missing or explicit `null` (lossy
+    /// OpenAI-compatible gateways and Copilot's multi-vendor chat route both
+    /// rely on this). An empty `finish_reason` normalizes to `None` rather
+    /// than erroring. This pins that contract next to the type itself.
+    #[test]
+    fn completion_response_tolerates_null_or_missing_envelope_metadata() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": null,
+            "created": null,
+            "model": "some-model",
+            "choices": [{
+                "index": null,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": null
+            }]
+        }"#;
+        let response: super::CompletionResponse =
+            serde_json::from_str(json).expect("null envelope metadata should deserialize");
+        assert_eq!(response.object, "");
+        assert_eq!(response.created, 0);
+        assert_eq!(response.choices[0].index, 0);
+        assert_eq!(response.choices[0].finish_reason, "");
+    }
+
     /// Boundary-minted tool ids (`tool-{index}`, from id-less streamed calls)
     /// replay to the chat wire as a self-consistent pair: the assistant
     /// message's `tool_calls[].id` and the tool result's `tool_call_id` carry
@@ -2227,6 +2459,7 @@ mod tests {
     use crate::completion::CompletionRequestBuilder;
     use crate::telemetry::ProviderResponseExt;
     use crate::test_utils::MockCompletionModel;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
 
     fn test_document(id: &str, text: &str) -> crate::completion::Document {
@@ -2761,6 +2994,7 @@ mod tests {
             created: 0,
             model: GPT_4O.to_owned(),
             system_fingerprint: None,
+            service_tier: None,
             choices: vec![Choice {
                 index: 0,
                 message: Message::Assistant {
@@ -2796,6 +3030,26 @@ mod tests {
     }
 
     #[test]
+    fn raw_completion_response_retains_service_tier() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-tier",
+            "object": "chat.completion",
+            "created": 0,
+            "model": GPT_4O,
+            "system_fingerprint": "fp_test",
+            "service_tier": "priority",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("live Chat Completions metadata should deserialize");
+
+        assert_eq!(response.service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
     fn provider_response_text_response_falls_back_to_assistant_refusal_field() {
         let response = CompletionResponse {
             id: "resp_123".to_owned(),
@@ -2803,6 +3057,7 @@ mod tests {
             created: 0,
             model: GPT_4O.to_owned(),
             system_fingerprint: None,
+            service_tier: None,
             choices: vec![Choice {
                 index: 0,
                 message: Message::Assistant {
@@ -2822,6 +3077,225 @@ mod tests {
         };
 
         assert_eq!(response.get_text_response(), Some("blocked".to_owned()));
+    }
+
+    /// One chat-completions turn, built from the wire shape a structured-output
+    /// refusal actually has (`content: null` beside a top-level `refusal`).
+    fn refusal_response(body: Value) -> CompletionResponse {
+        serde_json::from_value(json!({
+            "id": "chatcmpl-refusal",
+            "object": "chat.completion",
+            "created": 0,
+            "model": GPT_4O,
+            "choices": [{ "index": 0, "message": body, "finish_reason": "stop" }],
+        }))
+        .expect("the refusal wire shape must deserialize")
+    }
+
+    fn normalized_text(response: CompletionResponse) -> Vec<completion::AssistantContent> {
+        use crate::completion::NormalizeCompletionResponse;
+
+        response
+            .normalize("openai")
+            .expect("a refusal turn must normalize")
+            .choice
+    }
+
+    #[test]
+    fn refusal_sibling_of_null_content_becomes_assistant_text() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm sorry, I can't help with that."
+        }));
+
+        assert_eq!(
+            normalized_text(response),
+            vec![completion::AssistantContent::text(
+                "I'm sorry, I can't help with that."
+            )]
+        );
+    }
+
+    /// The raw text view and the normalized response must not disagree about
+    /// whether the turn said anything — the disagreement was the bug.
+    #[test]
+    fn refusal_raw_and_normalized_views_agree() {
+        let message = json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm sorry, I can't help with that."
+        });
+        let raw_text = refusal_response(message.clone())
+            .get_text_response()
+            .expect("raw text view");
+
+        assert_eq!(
+            normalized_text(refusal_response(message)),
+            vec![completion::AssistantContent::text(raw_text)]
+        );
+    }
+
+    /// Content wins: the fallback only fires when the parts carry nothing, so a
+    /// turn with both never duplicates its text.
+    #[test]
+    fn refusal_beside_non_empty_content_does_not_duplicate() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": "here is the answer",
+            "refusal": "I'm sorry, I can't help with that."
+        }));
+
+        assert_eq!(
+            normalized_text(response),
+            vec![completion::AssistantContent::text("here is the answer")]
+        );
+    }
+
+    /// An empty `refusal` is not content: the turn stays an empty-response
+    /// error rather than gaining a fabricated empty text block.
+    #[test]
+    fn empty_refusal_is_not_content() {
+        use crate::completion::NormalizeCompletionResponse;
+
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": ""
+        }));
+
+        assert!(response.normalize("openai").is_err());
+    }
+
+    /// A refusal beside tool calls keeps both — the fallback is about the
+    /// message's *text*, and tool calls are appended as before.
+    #[test]
+    fn refusal_beside_tool_calls_keeps_both() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm sorry, I can't help with that.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "lookup", "arguments": "{}" }
+            }]
+        }));
+
+        let content = normalized_text(response);
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content.first(),
+            Some(&completion::AssistantContent::text(
+                "I'm sorry, I can't help with that."
+            ))
+        );
+        assert!(matches!(
+            content.get(1),
+            Some(completion::AssistantContent::ToolCall(_))
+        ));
+    }
+
+    /// The Responses-shaped `refusal` **content part** is not what chat
+    /// completions sends, but the model still accepts it — and it must not
+    /// also trigger the sibling fallback.
+    #[test]
+    fn refusal_content_part_still_maps_to_text_without_the_fallback() {
+        let response = refusal_response(json!({
+            "role": "assistant",
+            "content": [{ "type": "refusal", "refusal": "part refusal" }],
+            "refusal": "sibling refusal"
+        }));
+
+        assert_eq!(
+            normalized_text(response),
+            vec![completion::AssistantContent::text("part refusal")]
+        );
+    }
+
+    /// The history round trip: a stored refusal-only assistant message used to
+    /// fail conversion outright.
+    #[test]
+    fn refusal_only_message_converts_into_rig_history() {
+        let wire: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": "I'm sorry, I can't help with that."
+        }))
+        .expect("wire message");
+
+        let converted = message::Message::try_from(wire).expect("history conversion");
+
+        assert_eq!(
+            converted,
+            message::Message::Assistant {
+                id: None,
+                content: vec![message::AssistantContent::text(
+                    "I'm sorry, I can't help with that."
+                )],
+            }
+        );
+    }
+
+    /// `"content": ""` decodes to a *present but empty* text part, so the
+    /// fallback and the parts must be either/or: appending both would put an
+    /// empty text block back on the wire beside the refusal and make this view
+    /// of the message disagree with the one `normalize` builds.
+    #[test]
+    fn refusal_beside_an_empty_content_string_converts_to_the_refusal_alone() {
+        let wire: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "",
+            "refusal": "I'm sorry, I can't help with that."
+        }))
+        .expect("wire message");
+
+        let converted = message::Message::try_from(wire).expect("history conversion");
+
+        assert_eq!(
+            converted,
+            message::Message::Assistant {
+                id: None,
+                content: vec![message::AssistantContent::text(
+                    "I'm sorry, I can't help with that."
+                )],
+            },
+            "the empty part must not ride along beside the refusal"
+        );
+    }
+
+    /// The other side of that branch: content that carries text keeps every
+    /// part, and the refusal is not appended.
+    #[test]
+    fn refusal_beside_real_content_converts_to_the_content_alone() {
+        let wire: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "here is the answer",
+            "refusal": "I'm sorry, I can't help with that."
+        }))
+        .expect("wire message");
+
+        let converted = message::Message::try_from(wire).expect("history conversion");
+
+        assert_eq!(
+            converted,
+            message::Message::Assistant {
+                id: None,
+                content: vec![message::AssistantContent::text("here is the answer")],
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_only_message_with_empty_refusal_still_fails_conversion() {
+        let wire: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": ""
+        }))
+        .expect("wire message");
+
+        assert!(message::Message::try_from(wire).is_err());
     }
 
     #[test]
@@ -2853,6 +3327,166 @@ mod tests {
             serde_json::to_value(openai_request).expect("serialization should succeed");
 
         assert_eq!(serialized["max_tokens"], 4096);
+    }
+
+    /// A chat-completions request whose only interesting property is the cap.
+    fn capped_request(
+        max_tokens: Option<u64>,
+        additional_params: Option<Value>,
+    ) -> CompletionRequest {
+        CompletionRequest::try_from(OpenAIRequestParams {
+            model: "gpt-4o-mini".to_string(),
+            request: crate::completion::CompletionRequest {
+                model: None,
+                preamble: None,
+                chat_history: vec!["Hello".into()],
+                documents: vec![],
+                tools: vec![],
+                temperature: None,
+                max_tokens,
+                tool_choice: None,
+                additional_params,
+                output_schema: None,
+                record_telemetry_content: false,
+            },
+            strict_tools: false,
+            tool_result_array_content: false,
+            supports_response_format: true,
+            supports_tools: true,
+        })
+        .expect("request conversion should succeed")
+    }
+
+    #[test]
+    fn request_body_keeps_the_legacy_cap_when_the_endpoint_wants_it() {
+        let body =
+            request_body(&capped_request(Some(4096), None), false).expect("body should serialize");
+
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn request_body_renames_the_cap_for_the_modern_endpoint() {
+        let body =
+            request_body(&capped_request(Some(4096), None), true).expect("body should serialize");
+
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "the legacy key must leave the body: reasoning models reject its presence"
+        );
+    }
+
+    #[test]
+    fn request_body_without_a_cap_carries_neither_spelling() {
+        let body = request_body(&capped_request(None, None), true).expect("body should serialize");
+
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn request_body_keeps_a_caller_supplied_modern_cap() {
+        let body = request_body(
+            &capped_request(Some(4096), Some(json!({ "max_completion_tokens": 48 }))),
+            true,
+        )
+        .expect("body should serialize");
+
+        assert_eq!(body["max_completion_tokens"], 48);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn request_body_upgrades_a_caller_supplied_legacy_cap() {
+        let body = request_body(
+            &capped_request(None, Some(json!({ "max_tokens": 48 }))),
+            true,
+        )
+        .expect("body should serialize");
+
+        assert_eq!(body["max_completion_tokens"], 48);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn request_body_moves_nothing_but_the_cap() {
+        let request = capped_request(Some(4096), Some(json!({ "top_p": 0.5 })));
+        let plain = serde_json::to_value(&request).expect("serialization should succeed");
+        let mut renamed = request_body(&request, true).expect("body");
+
+        let cap = renamed
+            .as_object_mut()
+            .expect("object body")
+            .remove("max_completion_tokens")
+            .expect("renamed cap");
+        renamed["max_tokens"] = cap;
+
+        assert_eq!(renamed, plain);
+    }
+
+    /// The gate itself, over every family whose behavior was measured against
+    /// the live endpoint: the reasoning models reject the legacy field, and
+    /// everything else — including OpenAI's own older models and any
+    /// compatible server's model names — still gets the bytes it always got.
+    #[test]
+    fn modern_output_cap_covers_exactly_the_reasoning_families() {
+        for model in [
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5-nano",
+            "gpt-5-2025-08-07",
+            "gpt-6",
+            "o1",
+            "o1-mini",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "o4-mini-2025-04-16",
+        ] {
+            assert!(
+                is_openai_reasoning_model(model),
+                "{model} rejects `max_tokens` and must get the modern spelling"
+            );
+        }
+
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-nano",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo",
+            "chatgpt-4o-latest",
+            // Compatible-server model names reached through this extension.
+            "Qwen/Qwen3-4B",
+            "openai/gpt-oss-20b",
+            "gpt-oss-120b",
+            "llama-3.1-8b-instruct",
+            // Near misses that must not be read as a family or a series.
+            "gpt-45",
+            "gpt-",
+            "o",
+            "opus",
+            "o5x",
+            "",
+        ] {
+            assert!(
+                !is_openai_reasoning_model(model),
+                "{model:?} still takes `max_tokens`; changing its request would be a regression"
+            );
+        }
+    }
+
+    /// The predicate is what the provider extension actually consults.
+    #[test]
+    fn openai_extension_asks_for_the_modern_cap_only_on_reasoning_models() {
+        let ext = super::super::OpenAICompletionsExt::default();
+
+        assert!(ext.requires_modern_output_cap("gpt-5-nano"));
+        assert!(!ext.requires_modern_output_cap(GPT_4O_MINI));
     }
 
     #[test]
@@ -3185,6 +3819,229 @@ mod tests {
         );
     }
 
+    /// A `max_tokens`-capped turn still emits the tool call, with `arguments`
+    /// cut off partway through the JSON object. Parsing strictly failed the
+    /// *whole* response -- the text, usage, id and finish reason went with it
+    /// -- where the streaming path keeps the turn and drops the unusable call.
+    /// Reproduced live against DeepSeek (rig#2354) at 24/32/48/64-token
+    /// budgets; this wire type backs every other OpenAI-compatible provider in
+    /// the tree, so the same shape is pinned here.
+    #[test]
+    fn truncated_tool_arguments_do_not_destroy_the_response() {
+        let request = r#"{
+            "choices": [{
+                "finish_reason": "length",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Acknowledged.",
+                    "tool_calls": [
+                        { "type": "function", "id": "call_1", "function": { "name": "page", "arguments": "{\"team\":\"platform\"}" } },
+                        { "type": "function", "id": "call_2", "function": { "name": "file_report", "arguments": "{\"summary\": " } }
+                    ]
+                }
+            }],
+            "created": 0,
+            "model": "gpt-4o-mini",
+            "object": "chat.completion",
+            "usage": { "completion_tokens": 24, "prompt_tokens": 372, "total_tokens": 396 },
+            "id": "chatcmpl-truncated"
+        }
+        "#;
+
+        let ApiResponse::Ok(response) =
+            serde_json::from_str::<ApiResponse<CompletionResponse>>(request).unwrap()
+        else {
+            panic!("expected successful completion response");
+        };
+
+        let Message::Assistant { tool_calls, .. } = &response.choices[0].message else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "the unusable call is dropped at decode; the complete one survives"
+        );
+
+        let converted = response.normalize("openai").unwrap();
+
+        assert_eq!(
+            converted.finish_reason(),
+            Some(crate::completion::FinishReason::Length)
+        );
+        assert_eq!(converted.usage.total_tokens, 396);
+        assert_eq!(converted.response_id.as_deref(), Some("chatcmpl-truncated"));
+        let names = converted
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                completion::AssistantContent::ToolCall(call) => Some(call.function.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["page"], "only the truncated call is dropped");
+        assert!(
+            converted.choice.iter().any(|content| matches!(
+                content,
+                completion::AssistantContent::Text(text) if text.text == "Acknowledged."
+            )),
+            "the turn's text survives: {:?}",
+            converted.choice
+        );
+    }
+
+    fn response_with_tool_call(finish_reason: &str, call: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "finish_reason": finish_reason,
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [call]
+                },
+                "logprobs": null
+            }],
+            "created": 0,
+            "model": "gpt-4o-mini",
+            "object": "chat.completion",
+            "system_fingerprint": null,
+            "usage": { "completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2 },
+            "id": "chatcmpl-tool-call"
+        })
+    }
+
+    /// Invalid JSON on a completed tool turn is a provider defect, not
+    /// truncation evidence. It must stay visible on the native raw surface.
+    #[test]
+    fn malformed_completed_tool_call_is_not_silently_dropped() {
+        let response = response_with_tool_call(
+            "tool_calls",
+            serde_json::json!({
+                "type": "function",
+                "id": "call_1",
+                "function": { "name": "page", "arguments": "{\"team\":" }
+            }),
+        );
+
+        assert!(
+            serde_json::from_value::<CompletionResponse>(response).is_err(),
+            "ordinary malformed tool output must remain a loud response defect"
+        );
+    }
+
+    /// Repairing the arguments in a validation copy must not hide an
+    /// independent defect on the same truncated call.
+    #[test]
+    fn truncated_tool_call_with_a_compound_defect_is_not_dropped() {
+        let response = response_with_tool_call(
+            "length",
+            serde_json::json!({
+                "type": "not_a_real_tool_type",
+                "id": "call_1",
+                "function": { "name": "page", "arguments": "{\"team\":" }
+            }),
+        );
+
+        assert!(
+            serde_json::from_value::<CompletionResponse>(response).is_err(),
+            "the unknown type must remain loud even beside truncated arguments"
+        );
+    }
+
+    /// Under `length`, an empty string means the turn ended before the first
+    /// argument token. Treating it as `{}` could dispatch a zero-argument
+    /// side-effect tool from an incomplete turn.
+    #[test]
+    fn output_length_drops_a_tool_call_with_no_argument_tokens() {
+        let response = response_with_tool_call(
+            "length",
+            serde_json::json!({
+                "type": "function",
+                "id": "call_1",
+                "function": { "name": "page", "arguments": "" }
+            }),
+        );
+        let response: CompletionResponse =
+            serde_json::from_value(response).expect("the truncated turn should survive");
+        let Message::Assistant { tool_calls, .. } = &response.choices[0].message else {
+            panic!("expected assistant message");
+        };
+        assert!(tool_calls.is_empty());
+    }
+
+    /// The choice-level truncation policy must not weaken a complete payload:
+    /// an empty string and Groq's literal `"null"` are both parameterless
+    /// invocations, and object-valued `arguments` (llama.cpp, Hugging Face)
+    /// still pass through untouched.
+    ///
+    /// The `"null"` spelling is not hypothetical: every zero-argument call in
+    /// `tests/cassettes/groq/agent_tool_sessions/parallel_tool_calls_single_turn_nonstreaming.yaml`
+    /// carries it, so folding it to `{}` is what keeps the truncation sentinel
+    /// from swallowing a real call.
+    #[test]
+    fn tolerant_tool_arguments_leave_complete_payloads_alone() {
+        let request = r#"{
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        { "type": "function", "id": "a", "function": { "name": "ping", "arguments": "" } },
+                        { "type": "function", "id": "b", "function": { "name": "hello", "arguments": { "city": "Paris" } } },
+                        { "type": "function", "id": "c", "function": { "name": "pong", "arguments": "null" } },
+                        { "type": "function", "id": "d", "function": { "name": "pang", "arguments": null } }
+                    ]
+                }
+            }],
+            "created": 0,
+            "model": "gpt-4o-mini",
+            "object": "chat.completion",
+            "usage": { "completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2 },
+            "id": "chatcmpl-complete"
+        }
+        "#;
+
+        let ApiResponse::Ok(response) =
+            serde_json::from_str::<ApiResponse<CompletionResponse>>(request).unwrap()
+        else {
+            panic!("expected successful completion response");
+        };
+        let Message::Assistant { tool_calls, .. } = &response.choices[0].message else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(tool_calls[0].function.arguments, serde_json::json!({}));
+        assert_eq!(
+            tool_calls[1].function.arguments,
+            serde_json::json!({"city": "Paris"})
+        );
+        assert_eq!(
+            tool_calls[2].function.arguments,
+            serde_json::Value::Null,
+            "Groq's `\"null\"` spelling parses, so the call survives untouched — \
+             which is exactly why `null` cannot be a truncation sentinel"
+        );
+        assert_eq!(
+            tool_calls[3].function.arguments,
+            serde_json::Value::Null,
+            "and the same for a bare JSON null in the non-string branch"
+        );
+
+        let converted = response.normalize("openai").unwrap();
+        assert_eq!(
+            converted
+                .choice
+                .iter()
+                .filter(|content| matches!(content, completion::AssistantContent::ToolCall(_)))
+                .count(),
+            4,
+            "every completed parameterless call survives"
+        );
+    }
+
     #[test]
     fn deserialize_llama_cpp_response_with_reasoning_content() {
         let request = r#"
@@ -3491,7 +4348,11 @@ mod tests {
             .await
             .expect_err("completion should fail with non-success status");
 
-        assert!(matches!(error, CompletionError::HttpError(_)));
+        // rig#2314: a provider with a request-id contract preserves its
+        // non-success responses as ProviderResponse, so the transport id has
+        // a home on the error; this mock sent no header, so the id is None.
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_request_id(), None);
         assert_eq!(
             error.provider_response_status(),
             Some(http::StatusCode::TOO_MANY_REQUESTS)
@@ -3502,5 +4363,134 @@ mod tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["type"], "rate_limit_error");
+    }
+
+    /// Raw-capture tests: the `normalize` shape through the OpenAI-compatible
+    /// model, driven end to end over a mock transport that hands back a real
+    /// chat-completions body *and* an `x-request-id` response header, so the
+    /// same fixture serves the capture contract and the Part A parity
+    /// contract. `with_error_response_headers` is the only unary double that
+    /// carries headers; with `200 OK` it is simply a successful response with
+    /// headers (`completion_send` already relies on that).
+    mod raw_capture {
+        use super::*;
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::openai::CompletionsClient;
+        use crate::test_utils::RecordingHttpClient;
+
+        const REQUEST_ID: &str = "req_unit_chat_0001";
+
+        /// A chat-completions body carrying fields the normalized response
+        /// provably lacks (`system_fingerprint`, `service_tier`), so the
+        /// captured value can be shown to answer more than `completion()`.
+        const BODY: &str = r#"{
+            "id": "chatcmpl-raw-1",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini-2024-07-18",
+            "system_fingerprint": "fp_unit_test",
+            "service_tier": "default",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "logprobs": null,
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}
+        }"#;
+
+        fn model() -> CompletionModel<RecordingHttpClient> {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-request-id", http::HeaderValue::from_static(REQUEST_ID));
+            let http_client = RecordingHttpClient::with_error_response_headers(
+                http::StatusCode::OK,
+                BODY,
+                headers,
+            );
+            let client = CompletionsClient::builder()
+                .api_key("test-key")
+                .http_client(http_client)
+                .build()
+                .expect("build client");
+            client.completion_model("gpt-4o-mini")
+        }
+
+        /// The load-bearing capture property: `raw` is the wire type as rig
+        /// parsed it — it deserializes back into
+        /// `openai::completion::CompletionResponse` and re-serializes to the
+        /// identical value — and re-normalizing that capture (with the header
+        /// id reattached, exactly as `completion()` does) reproduces every
+        /// normalized field. Also reads a field rig does not normalize
+        /// (`system_fingerprint`) off the capture.
+        #[tokio::test]
+        async fn completion_captures_raw_that_round_trips_into_the_wire_type() {
+            let model = model();
+
+            let response = model
+                .completion(model.completion_request("hello").build())
+                .await
+                .expect("completion");
+
+            let raw = &response.raw;
+            let typed = super::CompletionResponse::deserialize(raw)
+                .expect("raw must deserialize into the provider wire type");
+            assert_eq!(
+                serde_json::to_value(&typed).expect("re-serialize"),
+                *raw,
+                "the capture must be exactly what the wire type serializes to"
+            );
+            assert_eq!(typed.system_fingerprint.as_deref(), Some("fp_unit_test"));
+            assert_eq!(raw["service_tier"], "default");
+
+            // The capture and the normalized response tell one story.
+            let renormalized = typed
+                .normalize(<crate::providers::openai::OpenAICompletionsExt as OpenAICompatibleProvider>::PROVIDER_NAME)
+                .expect("re-normalize the capture")
+                .with_optional_provider_request_id(Some(REQUEST_ID.to_string()));
+            assert_eq!(response.identity(), renormalized.identity());
+            assert_eq!(response.finish_reason(), renormalized.finish_reason());
+            assert_eq!(response.model, renormalized.model);
+            assert_eq!(response.usage, renormalized.usage);
+            assert_eq!(response.choice, renormalized.choice);
+            assert_eq!(response.provider_request_id.as_deref(), Some(REQUEST_ID));
+            assert_eq!(
+                response.finish_reason(),
+                Some(crate::completion::FinishReason::Stop)
+            );
+        }
+
+        /// Part A parity, unit form: the typed route
+        /// `raw_completion_with_request_id` → `normalize` →
+        /// `with_optional_provider_request_id` reproduces `completion()` on
+        /// identity, finish reason, model and usage — and specifically the
+        /// transport id, which lives only on the response header and which
+        /// plain `raw_completion` drops. This is why the pair is public.
+        #[tokio::test]
+        async fn raw_completion_with_request_id_reproduces_completion() {
+            let model = model();
+
+            let (raw, id) = model
+                .raw_completion_with_request_id(model.completion_request("hello").build())
+                .await
+                .expect("typed route");
+            assert_eq!(id.as_deref(), Some(REQUEST_ID));
+            let reassembled = raw
+                .normalize(<crate::providers::openai::OpenAICompletionsExt as OpenAICompatibleProvider>::PROVIDER_NAME)
+                .expect("normalize")
+                .with_optional_provider_request_id(id);
+
+            let normalized = model
+                .completion(model.completion_request("hello").build())
+                .await
+                .expect("normalized route");
+
+            assert_eq!(reassembled.identity(), normalized.identity());
+            assert_eq!(reassembled.finish_reason(), normalized.finish_reason());
+            assert_eq!(reassembled.model, normalized.model);
+            assert_eq!(reassembled.usage, normalized.usage);
+            assert_eq!(reassembled.provider_request_id.as_deref(), Some(REQUEST_ID));
+            assert_eq!(normalized.provider_request_id.as_deref(), Some(REQUEST_ID));
+        }
     }
 }

@@ -115,6 +115,83 @@
 //! }
 //! # let _hook = RetryOnMarker::new(2);
 //! ```
+//!
+//! # Retrying a turn the provider cut short
+//!
+//! [`ModelTurnFinished::finish_reason`] and [`ModelTurnFinished::max_tokens`]
+//! carry a turn's termination metadata in portable form, so the common
+//! "truncated at the cap, so raise it and go again" policy needs no provider
+//! types. `finish_reason` is a normalized [`FinishReason`] — anything outside
+//! the shared vocabulary arrives as `Other` in the provider's own spelling
+//! rather than as a natural stop, and `None` means the provider reported no
+//! reason at all. `max_tokens` is the cap *this* attempt ran under, after the
+//! agent's configuration, the runner override, and any merged [`RequestPatch`],
+//! so the pair below reads its own escalation back on the retried turn:
+//!
+//! ```
+//! use std::sync::atomic::{AtomicU64, Ordering};
+//! use rig_agent::agent::{
+//!     AgentHook, CompletionCallAction, CompletionCallEvent, HookContext,
+//!     ModelTurnAction, ModelTurnFinished, RequestPatch,
+//! };
+//! use rig_core::completion::FinishReason;
+//! use rig_core::message::AssistantContent;
+//!
+//! /// Doubles the output cap each time a turn is truncated, up to a ceiling.
+//! struct GrowCapOnTruncation {
+//!     cap: AtomicU64,
+//!     ceiling: u64,
+//! }
+//!
+//! impl AgentHook for GrowCapOnTruncation {
+//!     /// Every attempt is prepared afresh, so the current cap is applied here
+//!     /// and reported back on that attempt's `ModelTurnFinished`.
+//!     async fn on_completion_call(
+//!         &self,
+//!         _ctx: &HookContext,
+//!         _event: CompletionCallEvent<'_>,
+//!     ) -> CompletionCallAction {
+//!         CompletionCallAction::patch(
+//!             RequestPatch::new().max_tokens(self.cap.load(Ordering::Relaxed)),
+//!         )
+//!     }
+//!
+//!     async fn on_model_turn_finished(
+//!         &self,
+//!         _ctx: &HookContext,
+//!         event: ModelTurnFinished<'_>,
+//!     ) -> ModelTurnAction {
+//!         // `truncated_output` covers every reason that means "cut short",
+//!         // so a provider reporting a filter stop retries here too.
+//!         let truncated = event
+//!             .finish_reason
+//!             .is_some_and(FinishReason::truncated_output);
+//!         // Retrying a turn that carries tool calls is rejected, so a policy
+//!         // that might see one has to check before asking.
+//!         let has_tool_call = event
+//!             .content
+//!             .iter()
+//!             .any(|content| matches!(content, AssistantContent::ToolCall(_)));
+//!         // `max_tokens` is this attempt's own cap: growing past the ceiling
+//!         // would be retrying a limit we already know we cannot raise.
+//!         let room = event.max_tokens.is_none_or(|cap| cap < self.ceiling);
+//!
+//!         if truncated && !has_tool_call && room {
+//!             let grown = event.max_tokens.map_or(self.ceiling, |cap| {
+//!                 cap.saturating_mul(2).min(self.ceiling)
+//!             });
+//!             self.cap.store(grown, Ordering::Relaxed);
+//!             return ModelTurnAction::repeat();
+//!         }
+//!         ModelTurnAction::continue_run()
+//!     }
+//! }
+//! # let _hook = GrowCapOnTruncation { cap: AtomicU64::new(256), ceiling: 4096 };
+//! ```
+//!
+//! `cargo run -p rig-agent --example retry_on_truncation` runs this policy
+//! against a credential-free scripted model whose output genuinely depends on
+//! the cap, on both surfaces.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,13 +199,14 @@ use std::{future::Future, sync::Arc};
 
 use crate::tool::extensions::TypeMap;
 use rig_core::{
+    completion::FinishReason,
     message::{AssistantContent, Message, ToolChoice},
     wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
 };
 
 use crate::{
     agent::model::ModelHandle,
-    completion::{Document, Usage},
+    completion::{Document, ResponseIdentity, Usage},
     json_utils,
     tool::{
         DeferredToolDescriptor, DeferredToolLifecycleEvent, ToolContext, ToolOutput, ToolResult,
@@ -366,7 +444,6 @@ impl HookContext {
 
 /// Diagnostics for an invalid model-emitted tool call.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct InvalidToolCallContext {
     /// Name emitted by the model.
     pub tool_name: String,
@@ -439,7 +516,6 @@ pub struct CompletionCall<'a> {
 /// default candidate for every retry, not a hard pin: selection hooks may
 /// override it on each retry.
 #[derive(Clone, Copy)]
-#[non_exhaustive]
 pub struct ModelSelection<'a> {
     /// Prompt for the pending model call.
     pub prompt: &'a Message,
@@ -459,9 +535,8 @@ pub struct ModelSelection<'a> {
 impl<'a> ModelSelection<'a> {
     /// Construct a `ModelSelection` event from its parts.
     ///
-    /// The struct is `#[non_exhaustive]`, so external code cannot build it
-    /// with a struct literal; this constructor exists so that custom
-    /// model-selection routers can be unit-tested outside this crate.
+    /// Provided so that custom model-selection routers can be unit-tested
+    /// outside this crate without restating every field.
     pub fn new(
         prompt: &'a Message,
         history: &'a [Message],
@@ -490,8 +565,22 @@ pub struct CompletionResponse<'a> {
     pub content: &'a Vec<AssistantContent>,
     /// Usage reported for this turn.
     pub usage: Usage,
-    /// Provider-assigned message ID, when available.
+    /// Provider-assigned message ID, when available. Always equal to
+    /// [`identity`](Self::identity)`.message_id`; kept as a field for
+    /// continuity with pre-identity hooks.
     pub message_id: Option<&'a str>,
+    /// This exact attempt's response identity metadata (message-scoped,
+    /// response-scoped, and transport request ids).
+    pub identity: &'a ResponseIdentity,
+    /// The provider's own response for this attempt — see
+    /// `CompletionResponse::raw` in `rig-core` for the exact meaning of the
+    /// payload: the value the model's inherent `raw_completion` /
+    /// `raw_stream` would have returned, serialized. Every provider seam
+    /// populates it; `Value::Null` only when the response was built without
+    /// a provider behind it (a hand-constructed model, a record persisted
+    /// before the field). On a retry this is the retried attempt's own,
+    /// never a previous attempt's.
+    pub raw: &'a serde_json::Value,
 }
 
 /// Medium-neutral accepted model-turn event.
@@ -507,6 +596,60 @@ pub struct ModelTurnFinished<'a> {
     pub content: &'a Vec<AssistantContent>,
     /// Usage reported for the turn.
     pub usage: Usage,
+    /// This exact attempt's response identity metadata. Fired for every
+    /// completed model call on both surfaces — including streamed tool-only
+    /// and reasoning-only turns, which fire no [`StreamResponseFinish`] — so
+    /// a provider-neutral hook observing this event alone records identity
+    /// for every accepted call. On a retry, this is the retried attempt's own
+    /// identity, never a previous attempt's.
+    pub identity: &'a ResponseIdentity,
+    /// Why the provider stopped generating this attempt, normalized.
+    ///
+    /// [`FinishReason`] is the portable vocabulary — `Stop`, `Length`,
+    /// `ToolCalls`, `ContentFilter`, and `Other(String)` carrying a provider's
+    /// own spelling verbatim for anything outside it — so a hook can decide
+    /// whether to accept a turn without naming a provider or touching a raw
+    /// response type. [`FinishReason::truncated_output`] is the predicate for
+    /// "the provider cut this turn short", which is the usual retry trigger.
+    ///
+    /// `None` means the provider reported no reason at all, which is a real
+    /// outcome for several OpenAI-compatible gateways; it is deliberately not
+    /// smoothed into `Stop`, because "finished normally" and "did not say" are
+    /// different facts to steer on.
+    ///
+    /// The value is the one recorded for this attempt's completion call, after
+    /// the `Stop`→`ToolCalls` reconciliation that both surfaces apply, so a
+    /// provider that reports a bare `stop` on a turn carrying tool calls still
+    /// reads as `ToolCalls` here. On a retry this is the retried attempt's own
+    /// reason, never a previous attempt's.
+    pub finish_reason: Option<&'a FinishReason>,
+    /// The output-token cap this exact attempt was prepared with.
+    ///
+    /// Resolved after the agent's configured value, the runner/request
+    /// override, and the merged completion-call
+    /// [`RequestPatch`] — so a stateful
+    /// completion-call hook that raises the cap for a retry sees its own new
+    /// value here on the following turn, not the agent's baseline. `None` means
+    /// no cap was sent, so the provider's own default applied.
+    ///
+    /// Paired with [`finish_reason`](Self::finish_reason) this is what makes a
+    /// portable retry-on-truncation decision possible: a hook can tell a turn
+    /// cut short at a cap it chose from one cut short at a cap it did not.
+    pub max_tokens: Option<u64>,
+    /// The provider's own response for this attempt — see
+    /// `CompletionResponse::raw` in `rig-core` for the exact meaning of the
+    /// payload: the value the model's inherent `raw_completion` /
+    /// `raw_stream` would have returned, serialized. Every provider seam
+    /// populates it; `Value::Null` only when the response was built without
+    /// a provider behind it (a hand-constructed model, a record persisted
+    /// before the field). On a retry this is the retried attempt's own,
+    /// never a previous attempt's.
+    ///
+    /// Carried here, and not only on the surface-specific events, for the
+    /// same reason identity is: this is the medium-neutral event, so a hook
+    /// observing it alone sees the payload for every accepted call on both
+    /// surfaces.
+    pub raw: &'a serde_json::Value,
 }
 
 /// How an accepted, tool-free model turn should be retried.
@@ -661,13 +804,26 @@ pub struct StreamResponseFinish<'a> {
     pub content: &'a Vec<AssistantContent>,
     /// Usage reported for this turn.
     pub usage: Usage,
-    /// Provider-assigned message ID, when available.
+    /// Provider-assigned message ID, when available. Always equal to
+    /// [`identity`](Self::identity)`.message_id`; kept as a field for
+    /// continuity with pre-identity hooks.
     pub message_id: Option<&'a str>,
+    /// This exact attempt's response identity metadata (message-scoped,
+    /// response-scoped, and transport request ids).
+    pub identity: &'a ResponseIdentity,
+    /// The provider's own response for this attempt — see
+    /// `CompletionResponse::raw` in `rig-core` for the exact meaning of the
+    /// payload: the value the model's inherent `raw_completion` /
+    /// `raw_stream` would have returned, serialized. Every provider seam
+    /// populates it; `Value::Null` only when the response was built without
+    /// a provider behind it (a hand-constructed model, a record persisted
+    /// before the field). On a retry this is the retried attempt's own,
+    /// never a previous attempt's.
+    pub raw: &'a serde_json::Value,
 }
 
 /// Hook event kind used only as an observation performance hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum StepEventKind {
     CompletionCall,
     CompletionResponse,
@@ -697,7 +853,6 @@ pub enum StepEventKind {
 /// The merged patch does not mutate the agent's configured baseline and is not
 /// carried into subsequent turns.
 #[derive(Debug, Clone, Default, PartialEq)]
-#[non_exhaustive]
 pub struct RequestPatch {
     /// Preamble to use instead of the agent's configured preamble for this turn.
     pub preamble: Option<String>,
@@ -845,7 +1000,6 @@ impl RequestPatch {
 
 /// Action for model-selection hooks.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum ModelSelectionAction {
     /// Keep the candidate supplied to this hook.
     Continue,

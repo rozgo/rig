@@ -2,10 +2,12 @@
 //! Please see the `openai_streaming` or `openai_streaming_with_tools` example for more practical usage.
 use crate::completion::{self, CompletionError};
 use crate::http_client::HttpClientExt;
-use crate::http_client::sse::{Event, GenericEventSource};
-use crate::message::ReasoningContent;
+use crate::http_client::sse::GenericEventSource;
 use crate::providers::internal::adapter::{
-    AdapterOutput, WireAdapter, WireFrame, run_wire_buffered, run_wire_stream,
+    AdapterOutput, WireAdapter, WireFrame, run_wire_buffered,
+};
+use crate::providers::internal::sse_transport::{
+    FrameDisposition, OpenLog, SseTransportOptions, open_wire_stream,
 };
 use crate::providers::internal::wire::{self, WireEvent};
 use crate::providers::openai::responses_api::{
@@ -15,11 +17,8 @@ use crate::streaming;
 use crate::streaming::RawStreamingChoice;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder};
 use crate::wasm_compat::WasmCompatSend;
-use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, enabled};
-use tracing_futures::Instrument as _;
 
 use super::{CompletionResponse, GenericResponsesCompletionModel, Output, ResponsesProviderExt};
 
@@ -76,6 +75,11 @@ pub struct StreamingCompletionResponse {
     /// The model identifier reported by the terminal response event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The transport request id from the SSE connection's `x-request-id`
+    /// response header — not part of any stream frame; stamped by the
+    /// transport. `None` when the provider did not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
 }
 
 impl StreamingCompletionResponse {
@@ -84,6 +88,7 @@ impl StreamingCompletionResponse {
     pub fn new(usage: ResponsesUsage) -> Self {
         Self {
             usage,
+            provider_request_id: None,
             reasoning_metadata: None,
             reasoning_context: None,
             status: None,
@@ -114,6 +119,7 @@ impl From<(&str, StreamingCompletionResponse)> for streaming::StreamFinal {
             .with_optional_finish_reason(finish_reason)
             .with_optional_message_id(response.message_id)
             .with_optional_response_id(response.response_id)
+            .with_optional_provider_request_id(response.provider_request_id)
             .with_optional_model(response.model)
     }
 }
@@ -151,25 +157,13 @@ pub(crate) fn normalize_responses_stream(
 pub(crate) fn reasoning_end_from_done_item(
     id: &crate::streaming::StreamPartId,
     provider_id: Option<&crate::streaming::WireId>,
-    summary: &[ReasoningSummary],
-    content: &[String],
-    encrypted_content: Option<&str>,
+    summary: Vec<ReasoningSummary>,
+    content: Vec<String>,
+    encrypted_content: Option<String>,
 ) -> Option<RawStreamingChoice<StreamingCompletionResponse>> {
-    let mut blocks = summary
-        .iter()
-        .map(|reasoning_summary| match reasoning_summary {
-            ReasoningSummary::SummaryText { text } => ReasoningContent::Summary(text.to_owned()),
-        })
-        .collect::<Vec<_>>();
-
-    blocks.extend(content.iter().map(|text| ReasoningContent::Text {
-        text: text.to_owned(),
-        signature: None,
-    }));
-
-    if let Some(encrypted_content) = encrypted_content.filter(|s| !s.is_empty()) {
-        blocks.push(ReasoningContent::Encrypted(encrypted_content.to_owned()));
-    }
+    // Same builder as the unary decode, so the restatement and the
+    // non-streaming conversion of one item cannot drift.
+    let blocks = super::reasoning_content_blocks(summary, content, encrypted_content);
 
     if blocks.is_empty() {
         return None;
@@ -306,21 +300,28 @@ impl ResponsesStreamOptions {
     }
 }
 
+/// The payload of every content-bearing `data:` line in a buffered SSE body.
+///
+/// Blank lines, non-`data:` fields (SSE comments, `event:`), and the `[DONE]`
+/// sentinel are skipped, so both buffered readers below see exactly the frame
+/// payloads a live transport would deliver.
+fn sse_data_frames(body: &str) -> impl Iterator<Item = &str> {
+    body.lines()
+        .map(|line| {
+            line.strip_prefix("data:")
+                .map(str::trim)
+                .unwrap_or_default()
+        })
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+}
+
 pub(crate) fn parse_sse_completion_body(
     body: &str,
     provider_name: &str,
 ) -> Result<CompletionResponse, CompletionError> {
     let mut completed = None;
 
-    for line in body.lines() {
-        let data = line
-            .strip_prefix("data:")
-            .map(str::trim)
-            .unwrap_or_default();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-
+    for data in sse_data_frames(body) {
         if let Ok(chunk) = serde_json::from_str::<StreamingCompletionChunk>(data) {
             if let StreamingCompletionChunk::Response(chunk) = chunk {
                 let ResponseChunk { kind, response, .. } = *chunk;
@@ -548,11 +549,19 @@ impl RawChoiceAccumulator {
                     options.emits_completed_tool_calls_immediately(),
                 );
             }
-            ItemChunkKind::OutputTextDelta(delta) => {
+            // Text and refusal deltas are the same visible-text stream: a
+            // refusal is the assistant's message for that turn, and both
+            // (re)open the item's text block before their fragment.
+            ItemChunkKind::OutputTextDelta(DeltaTextChunk { delta, .. })
+            | ItemChunkKind::RefusalDelta(DeltaTextChunk { delta, .. }) => {
                 self.start_text_item(&outer_item_id, &mut immediate);
-                immediate.push(streaming::RawStreamingChoice::Message(delta.delta));
+                immediate.push(streaming::RawStreamingChoice::Message(delta));
             }
-            ItemChunkKind::ReasoningSummaryTextDelta(delta) => {
+            // Summary and raw-reasoning deltas differ only in which wire
+            // event carries them; both are fragments of the output item's
+            // reasoning block and accumulate under its slot identity.
+            ItemChunkKind::ReasoningSummaryTextDelta(SummaryTextChunk { delta, .. })
+            | ItemChunkKind::ReasoningTextDelta(DeltaTextChunkWithItemId { delta, .. }) => {
                 // Reasoning interleaving text closes the open text block
                 // downstream (`PartsAccumulator::reasoning_delta`); forget the
                 // open message item so a later delta for the *same* item
@@ -565,24 +574,8 @@ impl RawChoiceAccumulator {
                     provider_id: outer_item_id
                         .clone()
                         .and_then(crate::streaming::WireId::new),
-                    reasoning: delta.delta,
+                    reasoning: delta,
                 });
-            }
-            ItemChunkKind::ReasoningTextDelta(delta) => {
-                // Same interleaving boundary as the summary-delta arm above.
-                self.current_text_item = None;
-                let id = self.reasoning_slot_key(output_index, outer_item_id.as_deref());
-                immediate.push(streaming::RawStreamingChoice::ReasoningDelta {
-                    id,
-                    provider_id: outer_item_id
-                        .clone()
-                        .and_then(crate::streaming::WireId::new),
-                    reasoning: delta.delta,
-                });
-            }
-            ItemChunkKind::RefusalDelta(delta) => {
-                self.start_text_item(&outer_item_id, &mut immediate);
-                immediate.push(streaming::RawStreamingChoice::Message(delta.delta));
             }
             ItemChunkKind::FunctionCallArgsDelta(delta) => {
                 // Tool output interleaving text is a block boundary too.
@@ -776,9 +769,9 @@ impl RawChoiceAccumulator {
                 immediate.extend(reasoning_end_from_done_item(
                     &key,
                     provider_id.as_ref(),
-                    &summary,
-                    &content,
-                    encrypted_content.as_deref(),
+                    summary,
+                    content,
+                    encrypted_content,
                 ));
             }
             Output::Message(message) => {
@@ -815,6 +808,8 @@ impl RawChoiceAccumulator {
         choices.push(RawStreamingChoice::FinalResponse(
             StreamingCompletionResponse {
                 usage: self.final_usage,
+                // Stamped by the transport layer.
+                provider_request_id: None,
                 reasoning_metadata: self.reasoning_metadata,
                 reasoning_context: self.reasoning_context,
                 status: self.status,
@@ -900,15 +895,7 @@ pub(crate) fn raw_choices_from_sse_body(
     // pre-check (which fails the operation, mirroring the live transport).
     // Classification and policy live in the buffered driver.
     let mut frames = Vec::new();
-    for line in body.lines() {
-        let data = line
-            .strip_prefix("data:")
-            .map(str::trim)
-            .unwrap_or_default();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-
+    for data in sse_data_frames(body) {
         if let Some(error) = provider_response_from_responses_sse_data(data) {
             return Err(error);
         }
@@ -1082,46 +1069,31 @@ where
     HttpClient: HttpClientExt + Clone + 'static,
     RequestBody: Into<bytes::Bytes> + Clone + WasmCompatSend + 'static,
 {
-    // Transport layer: SSE events → `WireFrame`s. Byte splitting, framing,
-    // and the wire's in-band provider `error` envelope (a terminal transport
-    // condition, detected pre-classification exactly as an HTTP failure would
-    // be) — classification and policy live downstream.
-    let transport = stream! {
-        let mut event_source = Box::pin(event_source);
-        while let Some(event_result) = event_source.next().await {
-            match event_result {
-                Ok(Event::Open) => {
-                    tracing::trace!("SSE connection opened");
-                }
-                Ok(Event::Message(evt)) => {
-                    if evt.data.trim().is_empty() || evt.data == "[DONE]" {
-                        continue;
-                    }
-
-                    if let Some(error) = provider_response_from_responses_sse_data(&evt.data) {
-                        // A terminal failure: the driver flushes
-                        // fully-delivered content, yields this error last,
-                        // and emits no terminal record.
-                        yield Err(error);
-                        break;
-                    }
-
-                    yield Ok(WireFrame::Text(evt.data));
-                }
-                Err(crate::http_client::Error::StreamEnded) => {
-                    break;
-                }
-                Err(error) => {
-                    tracing::error!(?error, "SSE error");
-                    yield Err(CompletionError::from_stream_transport(error));
-                    break;
-                }
+    // The wire's in-band provider `error` envelope is a terminal transport
+    // condition, detected pre-classification exactly as an HTTP failure
+    // would be.
+    open_wire_stream(
+        event_source,
+        SseTransportOptions {
+            open_log: OpenLog::Trace,
+            stream_ended_is_error: false,
+            log_transport_errors: true,
+        },
+        |data| {
+            if data.trim().is_empty() || data == "[DONE]" {
+                return FrameDisposition::Skip;
             }
-        }
-        event_source.close();
-    };
-
-    Box::pin(run_wire_stream(transport, ResponsesAdapter::live(options)).instrument(span))
+            if let Some(error) = provider_response_from_responses_sse_data(&data) {
+                // A terminal failure: the driver flushes fully-delivered
+                // content, yields this error last, and emits no terminal
+                // record.
+                return FrameDisposition::Fail(error);
+            }
+            FrameDisposition::Frame(data)
+        },
+        ResponsesAdapter::live(options),
+        span,
+    )
 }
 
 /// One classified Responses frame, carrying its raw payload alongside the
@@ -1500,10 +1472,9 @@ pub enum SummaryPartChunkPart {
 
 impl<Ext, H> GenericResponsesCompletionModel<Ext, H>
 where
-    crate::client::Client<Ext, H>:
-        HttpClientExt + Clone + std::fmt::Debug + WasmCompatSend + 'static,
+    crate::client::Client<Ext, H>: HttpClientExt + Clone + WasmCompatSend + 'static,
     Ext: crate::client::Provider + ResponsesProviderExt + Clone + 'static,
-    H: Clone + Default + std::fmt::Debug + WasmCompatSend + 'static,
+    H: Clone + WasmCompatSend + 'static,
 {
     /// Open a stream whose terminal record stays provider-native.
     ///
@@ -1519,36 +1490,53 @@ where
     ) -> Result<streaming::RawStreamingResult<StreamingCompletionResponse>, CompletionError> {
         let system_instructions = completion_request.preamble.clone();
         let record_telemetry_content = completion_request.record_telemetry_content;
-        let mut request = self.create_completion_request(completion_request)?;
-        request.stream = Some(true);
+        let (request_model, request) = self.create_provider_request(completion_request, true)?;
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "OpenAI Responses streaming completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Responses streaming completion request",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
 
         let req = self
             .client
-            .post("/responses")?
+            .post(Ext::RESPONSES_PATH)?
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
         let span = CompletionSpanBuilder::new(
             Ext::PROVIDER_NAME,
-            &request.model,
+            &request_model,
             CompletionOperation::ChatStreaming,
         )
         .system_instructions(system_instructions.as_deref(), record_telemetry_content)
         .build();
         let client = self.client.clone();
         let event_source = GenericEventSource::new(client, req);
+        let (event_source, request_id_slot) = match Ext::REQUEST_ID_HEADER {
+            Some(header) => {
+                let (event_source, slot) = event_source.capture_request_id(header);
+                (event_source, Some(slot))
+            }
+            None => (event_source, None),
+        };
 
-        Ok(raw_stream_from_event_source(event_source, span))
+        let options = if Ext::EMITS_COMPLETE_TOOL_CALLS_IMMEDIATELY {
+            ResponsesStreamOptions::strict_with_immediate_tool_calls()
+        } else {
+            ResponsesStreamOptions::strict()
+        };
+        let stream = raw_stream_from_event_source_with_options(event_source, span, options);
+        Ok(
+            crate::providers::internal::sse_transport::stamp_terminal_request_id(
+                stream,
+                request_id_slot,
+                Ext::REQUEST_ID_HEADER,
+                |response, id| response.provider_request_id = Some(id),
+            ),
+        )
     }
 
     pub(crate) async fn stream(
@@ -1782,6 +1770,7 @@ mod tests {
         CompletionResponse {
             id: "resp_123".to_string(),
             object: ResponseObject::Response,
+            provider_request_id: None,
             created_at: 0,
             status,
             error: None,
@@ -1925,9 +1914,9 @@ mod tests {
         let end = reasoning_end_from_done_item(
             &crate::streaming::StreamPartId::wire("rs_1"),
             crate::streaming::WireId::new("rs_1").as_ref(),
-            &summary,
-            &content,
-            Some("enc_blob"),
+            summary,
+            content,
+            Some("enc_blob".to_string()),
         );
 
         // ONE end event carrying every block in wire field order — never a
@@ -2109,8 +2098,8 @@ mod tests {
         let end = reasoning_end_from_done_item(
             &crate::streaming::StreamPartId::wire("rs_2"),
             crate::streaming::WireId::new("rs_2").as_ref(),
-            &summary,
-            &[],
+            summary,
+            Vec::new(),
             None,
         );
 
@@ -2136,9 +2125,9 @@ mod tests {
         let end = reasoning_end_from_done_item(
             &crate::streaming::StreamPartId::wire("rs_1"),
             crate::streaming::WireId::new("rs_1").as_ref(),
-            &[],
-            &content,
-            Some(""),
+            Vec::new(),
+            content,
+            Some(String::new()),
         );
 
         let Some(RawStreamingChoice::ReasoningEnd {
@@ -2162,9 +2151,9 @@ mod tests {
             reasoning_end_from_done_item(
                 &crate::streaming::StreamPartId::wire("rs_1"),
                 crate::streaming::WireId::new("rs_1").as_ref(),
-                &[],
-                &[],
-                Some(""),
+                Vec::new(),
+                Vec::new(),
+                Some(String::new()),
             )
             .is_none()
         );

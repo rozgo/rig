@@ -132,9 +132,6 @@ enum ModelSource<'a> {
 /// backend also supports validated Qwen3 checkpoints.
 pub type LlamaModel = CandleModel;
 
-/// Backwards-compatible alias for [`CandleModelBuilder`].
-pub type LlamaModelBuilder<'a> = CandleModelBuilder<'a>;
-
 impl CandleModel {
     /// Loads a model from config, tokenizer, and one unsharded safetensors buffer.
     pub fn from_safetensors(data: ModelData) -> Result<Self, CandleError> {
@@ -152,11 +149,6 @@ impl CandleModel {
     /// the GGUF bytes are needed only while Candle constructs its owned tensors.
     pub fn from_gguf_bytes(data: GgufModelData<'_>) -> Result<Self, CandleError> {
         Self::builder_from_gguf_bytes(data).build()
-    }
-
-    /// Loads a model from explicitly typed byte-backed artifacts.
-    pub fn from_artifacts(artifacts: ModelArtifacts) -> Result<Self, CandleError> {
-        Self::builder_from_artifacts(artifacts).build()
     }
 
     /// Starts a byte-backed model builder.
@@ -194,37 +186,9 @@ impl CandleModel {
         Self::builder(data).build_async().await
     }
 
-    /// Asynchronously loads owned GGUF artifacts outside the async executor.
-    #[cfg(not(target_family = "wasm"))]
-    pub async fn from_gguf_async(data: ModelData) -> Result<Self, CandleError> {
-        Self::builder_from_artifacts(ModelArtifacts::Gguf(data))
-            .build_async()
-            .await
-    }
-
-    /// Asynchronously loads borrowed static GGUF artifacts outside the async executor.
-    ///
-    /// Static buffers such as `include_bytes!` remain zero-copy at the API
-    /// boundary and satisfy the blocking task's ownership requirement.
-    #[cfg(not(target_family = "wasm"))]
-    pub async fn from_gguf_bytes_async(data: GgufModelData<'static>) -> Result<Self, CandleError> {
-        Self::builder_from_gguf_bytes(data).build_async().await
-    }
-
-    /// Asynchronously loads explicitly typed owned artifacts outside the async executor.
-    #[cfg(not(target_family = "wasm"))]
-    pub async fn from_artifacts_async(artifacts: ModelArtifacts) -> Result<Self, CandleError> {
-        Self::builder_from_artifacts(artifacts).build_async().await
-    }
-
     /// Returns the validated conversation/output protocol.
     pub fn conversation_protocol(&self) -> Option<ConversationProtocol> {
         Some(self.state.profile.definition.protocol)
-    }
-
-    /// Backwards-compatible alias for [`Self::conversation_protocol`].
-    pub fn model_family(&self) -> Option<ModelFamily> {
-        self.conversation_protocol()
     }
 
     /// Returns the validated transformer architecture of the loaded checkpoint.
@@ -245,11 +209,6 @@ impl<'a> CandleModelBuilder<'a> {
         self
     }
 
-    /// Backwards-compatible alias for [`Self::conversation_protocol`].
-    pub fn model_family(mut self, family: ModelFamily) -> Self {
-        self.family = Some(family);
-        self
-    }
     /// Sets the default maximum generated token count.
     pub fn max_tokens(mut self, max_tokens: u64) -> Self {
         self.generation.max_tokens = max_tokens;
@@ -581,7 +540,11 @@ impl CompletionModel for CandleModel {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, CompletionError> {
-        Ok(self.infer_completion(request).await?.into_normalized())
+        // Capture the local model's own record — what `raw_completion`
+        // returns — before `into_normalized` consumes it.
+        let inferred = self.infer_completion(request).await?;
+        let captured = serde_json::to_value(&inferred.response)?;
+        Ok(inferred.into_normalized().with_raw(captured))
     }
 
     async fn stream(

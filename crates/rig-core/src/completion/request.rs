@@ -79,7 +79,6 @@ use thiserror::Error;
 /// }
 /// ```
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum CompletionError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("HttpError: {0}")]
@@ -261,6 +260,30 @@ impl FinishReason {
             self
         }
     }
+
+    /// Whether the provider cut the turn short instead of letting the model
+    /// finish.
+    ///
+    /// A turn that ended this way can legitimately carry *no content at all* —
+    /// an output-token cap consumed entirely by hidden reasoning tokens, or a
+    /// filter that removed everything the model produced — and the reason is
+    /// then the only diagnostic the caller has. Normalization keeps such an
+    /// empty turn rather than rejecting it as a malformed response, so a
+    /// caller can tell "you hit the cap" from "the provider misbehaved".
+    ///
+    /// [`Stop`](Self::Stop) and [`ToolCalls`](Self::ToolCalls) describe turns
+    /// that ran to completion, so an empty one really is a provider defect;
+    /// [`Other`](Self::Other) is unclassified and gets the strict treatment —
+    /// it carries a provider's own wire spelling with no normalized meaning.
+    ///
+    /// This is also the set rig-agent has a remedy for when a turn arrives
+    /// without an answer ("raise `max_tokens`" / "the provider filtered the
+    /// response"), and that is the same question: the reasons a provider may
+    /// hand back an answerless turn are the reasons there is something useful
+    /// to say about it. Both sides read this predicate so they cannot drift.
+    pub fn truncated_output(&self) -> bool {
+        matches!(self, Self::Length | Self::ContentFilter)
+    }
 }
 
 /// General completion response struct: the completion choice plus normalized
@@ -268,12 +291,14 @@ impl FinishReason {
 /// content items.
 ///
 /// This type is concrete — it carries no provider-typed payload. Callers who
-/// need a provider's own wire response call that model's inherent
-/// `raw_completion` method, which performs the same request and returns the
-/// provider's native type.
+/// hold a concrete model and need a provider's own wire response *typed* call
+/// that model's inherent `raw_completion` method, which performs the same
+/// request and returns the provider's native type. Callers who do not hold the
+/// concrete model — an agent erases it at construction — read the same value,
+/// serialized, from [`CompletionResponse::raw`], which every provider seam
+/// populates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "CompletionResponseRepr")]
-#[non_exhaustive]
 pub struct CompletionResponse {
     /// The completion choice (represented by one or more assistant message content)
     /// returned by the completion model provider
@@ -299,6 +324,16 @@ pub struct CompletionResponse {
     /// provider as a message ID.
     #[serde(default)]
     pub response_id: Option<String>,
+    /// The provider's transport-level request identifier, taken from the HTTP
+    /// response headers (Anthropic `request-id`, OpenAI/xAI `x-request-id`) or
+    /// the provider SDK's response metadata (Bedrock) — the id provider
+    /// support asks for when investigating a request. Never the body's
+    /// `message.id`/response id; those are [`Self::message_id`] and
+    /// [`Self::response_id`]. `None` means the provider did not report one —
+    /// that is a documented outcome (e.g. Gemini sends no id header), never an
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
     /// Why the model stopped generating, when the provider reported it.
     ///
     /// Private so that every write flows through
@@ -319,6 +354,49 @@ pub struct CompletionResponse {
     /// requested; it is `None` when the provider reports no identifier.
     #[serde(default)]
     pub model: Option<String>,
+    /// The provider's own response for this call: the value the model's
+    /// inherent `raw_completion` would have returned, serialized. It is the
+    /// response as rig's wire type parsed it — fields that type does not model
+    /// are not here. Every provider seam populates it, unconditionally — the
+    /// same parity the pre-normalization `raw_response: T` had.
+    ///
+    /// An escape hatch for provider-specific data rig does not normalize — it
+    /// never replaces a normalized field, and every normalized field means the
+    /// same thing whatever this holds. `Value::Null` means the value was built
+    /// without a provider behind it — [`CompletionResponse::new`] without
+    /// `with_raw` (test doubles, hand-built responses), or a response
+    /// persisted before the field existed — never that the provider sent
+    /// nothing: no provider seam produces `Null`.
+    ///
+    /// Typed access is recoverable: provider raw types are `Deserialize`, so
+    /// `provider::CompletionResponse::deserialize(&raw)` returns the
+    /// provider's own type, and [`NormalizeCompletionResponse`] converts
+    /// forward.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub raw: serde_json::Value,
+}
+
+/// Response identity metadata for one completed model call: which provider
+/// objects this exact attempt produced. The three axes stay distinct —
+/// message-scoped, response-scoped, and transport — and every field is `None`
+/// when the provider did not report it: a documented outcome, never an error.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseIdentity {
+    /// Provider-assigned *assistant message* ID (e.g. an Anthropic or OpenAI
+    /// Responses `msg_…`) — an ID the provider would recognize on a replayed
+    /// assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Provider-assigned *response-scoped* ID (e.g. an OpenAI `chatcmpl-` or
+    /// `resp_…` ID) — names the whole response, never replayed as a message
+    /// ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// The provider's *transport* request id (HTTP response header such as
+    /// Anthropic `request-id`, or provider SDK response metadata) — the id
+    /// provider support asks for. Never the body's message/response id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
 }
 
 impl CompletionResponse {
@@ -330,46 +408,26 @@ impl CompletionResponse {
             usage,
             message_id: None,
             response_id: None,
+            provider_request_id: None,
             finish_reason: None,
             provider: provider.into(),
             model: None,
+            raw: serde_json::Value::Null,
         }
-    }
-
-    /// Attach the provider-assigned message ID.
-    ///
-    /// An empty string is treated as absent: gateways that echo `""` for
-    /// fields they don't populate must not produce a `Some("")` that differs
-    /// from the streaming path. All identifier and model setters share this
-    /// rule so the invariant lives here rather than at every provider call
-    /// site.
-    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
-        self.message_id = Some(message_id.into()).filter(|id| !id.is_empty());
-        self
-    }
-
-    /// Attach the provider-assigned message ID when the provider reported one.
-    pub fn with_optional_message_id(mut self, message_id: Option<impl Into<String>>) -> Self {
-        self.message_id = message_id.map(Into::into).filter(|id| !id.is_empty());
-        self
-    }
-
-    /// Attach the provider-assigned response-scoped ID.
-    pub fn with_response_id(mut self, response_id: impl Into<String>) -> Self {
-        self.response_id = Some(response_id.into()).filter(|id| !id.is_empty());
-        self
-    }
-
-    /// Attach the provider-assigned response-scoped ID when the provider
-    /// reported one.
-    pub fn with_optional_response_id(mut self, response_id: Option<impl Into<String>>) -> Self {
-        self.response_id = response_id.map(Into::into).filter(|id| !id.is_empty());
-        self
     }
 
     /// Why the model stopped generating, when the provider reported it.
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish_reason.clone()
+    }
+
+    /// This response's identity metadata as one [`ResponseIdentity`] carrier.
+    pub fn identity(&self) -> ResponseIdentity {
+        ResponseIdentity {
+            message_id: self.message_id.clone(),
+            response_id: self.response_id.clone(),
+            provider_request_id: self.provider_request_id.clone(),
+        }
     }
 
     /// Attach the normalized finish reason, reconciled against the choice via
@@ -393,22 +451,9 @@ impl CompletionResponse {
             finish_reason.map(|reason| reason.reconcile_with_output(has_tool_call));
         self
     }
-
-    /// Attach the provider-reported model identifier.
-    ///
-    /// An empty string is treated as absent, matching the identifier setters.
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into()).filter(|model| !model.is_empty());
-        self
-    }
-
-    /// Attach the provider-reported model identifier when the response carried
-    /// one.
-    pub fn with_optional_model(mut self, model: Option<impl Into<String>>) -> Self {
-        self.model = model.map(Into::into).filter(|model| !model.is_empty());
-        self
-    }
 }
+
+crate::provider_response::response_metadata_setters!(CompletionResponse);
 
 /// Wire-shape mirror of [`CompletionResponse`], used only for deserialization.
 ///
@@ -429,10 +474,17 @@ struct CompletionResponseRepr {
     #[serde(default)]
     response_id: Option<String>,
     #[serde(default)]
+    provider_request_id: Option<String>,
+    #[serde(default)]
     finish_reason: Option<FinishReason>,
     provider: String,
     #[serde(default)]
     model: Option<String>,
+    // `default` because persisted responses predate the field; a missing key
+    // loads as `Null`, which is exactly what "no provider response behind this
+    // value" means.
+    #[serde(default)]
+    raw: serde_json::Value,
 }
 
 impl From<CompletionResponseRepr> for CompletionResponse {
@@ -442,15 +494,19 @@ impl From<CompletionResponseRepr> for CompletionResponse {
             usage,
             message_id,
             response_id,
+            provider_request_id,
             finish_reason,
             provider,
             model,
+            raw,
         } = repr;
         Self::new(choice, usage, provider)
             .with_optional_message_id(message_id)
             .with_optional_response_id(response_id)
+            .with_optional_provider_request_id(provider_request_id)
             .with_optional_finish_reason(finish_reason)
             .with_optional_model(model)
+            .with_raw(raw)
     }
 }
 
@@ -552,11 +608,11 @@ impl AddAssign for Usage {
 /// per-request state, so a runtime can snapshot this value when it erases a
 /// concrete model instead of retaining a callback into the provider.
 ///
-/// The type is `#[non_exhaustive]`: build from [`ProviderCapabilities::new`] or
-/// [`Default`] and enable flags with the `with_*` methods, which keeps external
-/// implementations compiling when new capabilities are added.
+/// Prefer building from [`ProviderCapabilities::new`] or [`Default`] and
+/// enabling flags with the `with_*` methods: that form keeps external
+/// implementations compiling when new capabilities are added, where a struct
+/// literal does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
 pub struct ProviderCapabilities {
     /// Whether this provider's native structured output (`output_schema` ->
     /// `format`/`response_format`) composes with tool calls in the same
@@ -1605,6 +1661,53 @@ mod tests {
         );
     }
 
+    /// The deserialization mirror carries `raw`: a response with a captured
+    /// payload survives serialize → deserialize with the payload intact, a
+    /// response serialized before the field existed still loads with `raw`
+    /// unset, and an unset `raw` is not written.
+    #[test]
+    fn normalized_response_raw_round_trips_through_serde_mirror() {
+        let payload = serde_json::json!({
+            "id": "chatcmpl-1",
+            "system_fingerprint": "fp_abc",
+            "choices": [{"finish_reason": "stop"}]
+        });
+        let response = CompletionResponse::new(
+            vec![AssistantContent::text("hello")],
+            Usage::new(),
+            "example",
+        )
+        .with_response_id("chatcmpl-1")
+        .with_raw(payload.clone());
+
+        let encoded = serde_json::to_value(&response).expect("serialize response");
+        assert_eq!(encoded["raw"], payload);
+        let decoded: CompletionResponse =
+            serde_json::from_value(encoded.clone()).expect("deserialize response");
+        assert_eq!(decoded.raw, payload);
+        assert_eq!(decoded.response_id.as_deref(), Some("chatcmpl-1"));
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("re-serialize"),
+            encoded
+        );
+
+        let legacy = serde_json::json!({
+            "choice": [{"type": "text", "text": "hello"}],
+            "usage": serde_json::to_value(Usage::new()).unwrap(),
+            "provider": "example"
+        });
+        let decoded: CompletionResponse = serde_json::from_value(legacy).expect("legacy loads");
+        assert!(decoded.raw.is_null());
+
+        let bare = serde_json::to_value(CompletionResponse::new(
+            vec![AssistantContent::text("hello")],
+            Usage::new(),
+            "example",
+        ))
+        .unwrap();
+        assert!(bare.get("raw").is_none());
+    }
+
     fn test_document(id: &str, text: &str) -> Document {
         Document {
             id: id.to_string(),
@@ -1952,10 +2055,9 @@ mod tests {
     #[test]
     fn completion_error_provider_response_helpers_with_preserved_json_body() {
         let body = r#"{"error":{"code":"rate_limit","message":"slow down"}}"#;
-        let error = CompletionError::ProviderResponse(provider_response::ProviderResponseError {
-            status: None,
-            body: body.to_string(),
-        });
+        let error = CompletionError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status(body.to_string()),
+        );
 
         assert_eq!(error.provider_response_body(), Some(body));
         assert_eq!(error.provider_response_status(), None);
@@ -1975,10 +2077,11 @@ mod tests {
     #[test]
     fn completion_error_provider_response_helpers_with_preserved_status() {
         let body = r#"{"error":{"message":"too many requests"}}"#;
-        let error = CompletionError::ProviderResponse(provider_response::ProviderResponseError {
-            status: Some(http::StatusCode::TOO_MANY_REQUESTS),
-            body: body.to_string(),
-        });
+        let error =
+            CompletionError::ProviderResponse(provider_response::ProviderResponseError::new(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                body.to_string(),
+            ));
 
         assert_eq!(error.provider_response_body(), Some(body));
         assert_eq!(
@@ -1989,10 +2092,11 @@ mod tests {
 
     #[test]
     fn completion_error_provider_response_helpers_with_preserved_plain_text_body() {
-        let error = CompletionError::ProviderResponse(provider_response::ProviderResponseError {
-            status: None,
-            body: "provider exploded".to_string(),
-        });
+        let error = CompletionError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status(
+                "provider exploded".to_string(),
+            ),
+        );
 
         assert_eq!(error.provider_response_body(), Some("provider exploded"));
         assert_eq!(error.provider_response_status(), None);
@@ -2055,10 +2159,9 @@ mod tests {
 
     #[test]
     fn provider_response_json_returns_none_for_empty_preserved_body() {
-        let error = CompletionError::ProviderResponse(provider_response::ProviderResponseError {
-            status: None,
-            body: String::new(),
-        });
+        let error = CompletionError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status(String::new()),
+        );
 
         assert_eq!(error.provider_response_body(), Some(""));
         assert_eq!(
@@ -2066,6 +2169,48 @@ mod tests {
                 .provider_response_json()
                 .expect("empty body is not a JSON parse error"),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_identity_tests {
+    use super::*;
+
+    /// Serde compatibility (rig#2265): responses persisted before
+    /// `provider_request_id` existed still load, with the field `None`.
+    #[test]
+    fn completion_response_without_request_id_still_deserializes() {
+        let response: CompletionResponse = serde_json::from_str(
+            r#"{"choice": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                          "cached_input_tokens": 0, "cache_creation_input_tokens": 0,
+                          "reasoning_tokens": 0},
+                "provider": "test"}"#,
+        )
+        .expect("pre-identity CompletionResponse JSON should load");
+        assert_eq!(response.provider_request_id, None);
+        assert_eq!(response.identity(), ResponseIdentity::default());
+    }
+
+    /// The identity accessor mirrors the flat fields exactly.
+    #[test]
+    fn identity_accessor_mirrors_flat_fields() {
+        let response = CompletionResponse::new(
+            vec![crate::completion::AssistantContent::text("hi")],
+            Usage::new(),
+            "test",
+        )
+        .with_message_id("msg_1")
+        .with_response_id("resp_1")
+        .with_provider_request_id("req_1");
+        assert_eq!(
+            response.identity(),
+            ResponseIdentity {
+                message_id: Some("msg_1".into()),
+                response_id: Some("resp_1".into()),
+                provider_request_id: Some("req_1".into()),
+            }
         );
     }
 }

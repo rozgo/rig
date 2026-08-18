@@ -1,11 +1,14 @@
 use crate::completion::{CompletionError, CompletionRequest};
 use crate::http_client::HttpClientExt;
-use crate::http_client::sse::{Event, GenericEventSource};
+use crate::http_client::sse::GenericEventSource;
 use crate::providers::cohere::CompletionModel;
 use crate::providers::cohere::completion::{
     CohereCompletionRequest, FinishReason, PROVIDER_NAME, Usage, map_finish_reason,
 };
-use crate::providers::internal::adapter::{AdapterOutput, WireAdapter, WireFrame, run_wire_stream};
+use crate::providers::internal::adapter::{AdapterOutput, WireAdapter, WireFrame};
+use crate::providers::internal::sse_transport::{
+    OpenLog, SseTransportOptions, open_wire_stream, skip_blank_and_done,
+};
 use crate::providers::internal::wire;
 use crate::streaming::{
     MintKind, RawStreamingChoice, RawStreamingResult, StreamFinal, StreamPartId,
@@ -17,11 +20,7 @@ use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinato
 /// keys their accumulation and can never reach a request.
 const REASONING_ID: StreamPartId = StreamPartId::minted(MintKind::Reasoning, 0);
 use crate::{json_utils, streaming};
-use async_stream::stream;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, enabled};
-use tracing_futures::Instrument;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
@@ -357,13 +356,11 @@ where
 
         request.additional_params = Some(params);
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::streaming",
-                "Cohere streaming completion input: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Streaming,
+            "Cohere streaming completion input",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
 
@@ -373,42 +370,17 @@ where
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
-        let event_source = GenericEventSource::new(self.client.clone(), req);
-
-        // Transport layer: SSE events → `WireFrame`s. Byte splitting and
-        // framing only — classification and policy live downstream.
-        let transport = stream! {
-            let mut event_source = Box::pin(event_source);
-            while let Some(event_result) = event_source.next().await {
-                match event_result {
-                    Ok(Event::Open) => {
-                        tracing::trace!("SSE connection opened");
-                    }
-                    Ok(Event::Message(message)) => {
-                        let data_str = message.data.trim();
-                        if data_str.is_empty() || data_str == "[DONE]" {
-                            continue;
-                        }
-                        yield Ok(WireFrame::Text(data_str.to_owned()));
-                    }
-                    Err(crate::http_client::Error::StreamEnded) => {
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, "SSE error");
-                        yield Err(CompletionError::from_stream_transport(err));
-                        break;
-                    }
-                }
-            }
-            // Ensure event source is closed when stream ends
-            event_source.close();
-        };
-
-        let stream: RawStreamingResult<StreamingCompletionResponse> =
-            Box::pin(run_wire_stream(transport, CohereAdapter::default()).instrument(span));
-
-        Ok(stream)
+        Ok(open_wire_stream(
+            GenericEventSource::new(self.client.clone(), req),
+            SseTransportOptions {
+                open_log: OpenLog::Trace,
+                stream_ended_is_error: false,
+                log_transport_errors: true,
+            },
+            skip_blank_and_done,
+            CohereAdapter::default(),
+            span,
+        ))
     }
 
     pub(crate) async fn stream(
@@ -416,7 +388,10 @@ where
         request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse, CompletionError> {
         let stream = self.raw_stream(request).await?;
-        let normalized = streaming::normalize_stream(stream, |response| Ok(response.into()));
+        let normalized =
+            streaming::normalize_stream(stream, |response: StreamingCompletionResponse| {
+                Ok(response.into())
+            });
 
         Ok(streaming::StreamingCompletionResponse::stream(
             PROVIDER_NAME,

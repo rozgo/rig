@@ -477,6 +477,143 @@ pub(crate) fn assert_embeddings_nonempty_and_consistent(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Model-turn termination metadata (rig#2184).
+//
+// One implementation, driven by every provider suite that covers the feature.
+// That is the portability claim as code: if a provider needed its own probe,
+// the metadata would not be provider-neutral.
+// ---------------------------------------------------------------------------
+
+/// One turn's termination as a hook sees it: why it stopped, and the effective
+/// output-token cap that attempt ran under.
+pub(crate) type ObservedTermination = (Option<rig::completion::FinishReason>, Option<u64>);
+
+/// Records `ModelTurnFinished`'s normalized termination metadata for every
+/// accepted turn, naming no provider and touching no raw response type.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TurnTerminationProbe {
+    observations: std::sync::Arc<std::sync::Mutex<Vec<ObservedTermination>>>,
+}
+
+impl TurnTerminationProbe {
+    pub(crate) fn observations(&self) -> Vec<ObservedTermination> {
+        self.observations.lock().expect("observations").clone()
+    }
+
+    /// The reason reported for the first accepted turn.
+    pub(crate) fn first_reason(&self) -> Option<rig::completion::FinishReason> {
+        self.observations()
+            .first()
+            .and_then(|(reason, _)| reason.clone())
+    }
+
+    /// The effective cap reported for the first accepted turn.
+    pub(crate) fn first_max_tokens(&self) -> Option<u64> {
+        self.observations().first().and_then(|(_, cap)| *cap)
+    }
+}
+
+impl rig::agent::AgentHook for TurnTerminationProbe {
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        self.observations
+            .lock()
+            .expect("observations")
+            .push((event.finish_reason.cloned(), event.max_tokens));
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
+/// Raises the output-token cap whenever the provider cut a turn short, then
+/// retries it — the policy rig#2184 exists to make portable. It reads only
+/// `FinishReason` and the reported cap, so the same instance drives every
+/// provider.
+///
+/// Register this *before* any hook that may return a non-continue action:
+/// such an action short-circuits the hooks behind it.
+#[derive(Clone, Debug)]
+pub(crate) struct EscalateCapOnTruncation {
+    cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    escalated_to: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    grown_cap: u64,
+    max_retries: u32,
+    retries: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl EscalateCapOnTruncation {
+    /// Start every attempt at `start_cap`; on a truncated, tool-free turn,
+    /// re-run it once at `grown_cap`.
+    pub(crate) fn new(start_cap: u64, grown_cap: u64) -> Self {
+        Self {
+            cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start_cap)),
+            escalated_to: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            grown_cap,
+            max_retries: 1,
+            retries: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// The caps this hook asked for, in order — one entry per escalation.
+    pub(crate) fn escalations(&self) -> Vec<u64> {
+        self.escalated_to.lock().expect("escalated_to").clone()
+    }
+
+    pub(crate) fn retries(&self) -> u32 {
+        self.retries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl rig::agent::AgentHook for EscalateCapOnTruncation {
+    /// Every attempt is prepared afresh, so the current cap is applied here and
+    /// reported back on that attempt's `ModelTurnFinished`.
+    async fn on_completion_call(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        _event: rig::agent::CompletionCallEvent<'_>,
+    ) -> rig::agent::CompletionCallAction {
+        rig::agent::CompletionCallAction::patch(
+            rig::agent::RequestPatch::new()
+                .max_tokens(self.cap.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        let truncated = event
+            .finish_reason
+            .is_some_and(rig::completion::FinishReason::truncated_output);
+        // Retrying a turn carrying tool calls is rejected, so a policy that may
+        // meet one has to check before asking.
+        let has_tool_call = event
+            .content
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)));
+
+        if truncated
+            && !has_tool_call
+            && self.retries.load(std::sync::atomic::Ordering::SeqCst) < self.max_retries
+        {
+            self.retries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cap
+                .store(self.grown_cap, std::sync::atomic::Ordering::SeqCst);
+            self.escalated_to
+                .lock()
+                .expect("escalated_to")
+                .push(self.grown_cap);
+            return rig::agent::ModelTurnAction::repeat();
+        }
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
 pub(crate) async fn collect_stream_final_response(
     stream: &mut StreamingResult,
 ) -> Result<String, StreamingError> {
@@ -657,6 +794,28 @@ pub(crate) async fn collect_stream_observation(stream: &mut StreamingResult) -> 
     }
 
     observation
+}
+
+/// Drive a raw provider stream to exhaustion, keeping both the visible text
+/// and the terminal record.
+///
+/// The observation helpers above drop the terminal record; matrices that are
+/// about what the terminal *carries* (a finish reason, usage) need it.
+pub(crate) async fn collect_text_and_terminal(
+    mut stream: StreamingCompletionResponse,
+) -> (String, Option<rig::streaming::StreamFinal>) {
+    let mut text = String::new();
+    let mut terminal = None;
+
+    while let Some(item) = stream.next().await {
+        match item.expect("stream item should not be an error") {
+            StreamedAssistantContent::Text(chunk) => text.push_str(&chunk.text),
+            StreamedAssistantContent::Final(final_record) => terminal = Some(final_record),
+            _ => {}
+        }
+    }
+
+    (text, terminal)
 }
 
 pub(crate) async fn collect_raw_stream_observation(
@@ -1056,4 +1215,79 @@ pub(crate) fn assert_smoke_structured_output(output: &SmokeStructuredOutput) {
     assert_nonempty_response(&output.title);
     assert_nonempty_response(&output.category);
     assert_nonempty_response(&output.summary);
+}
+
+/// Shared identity-observing hook for the rig#2265 response-identity
+/// cassettes: captures each event's [`rig::completion::ResponseIdentity`]
+/// so provider suites can assert per-attempt identity on every observer
+/// surface.
+#[derive(Clone, Default)]
+pub(crate) struct IdentityProbe {
+    pub(crate) blocking: std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+    pub(crate) stream_finishes:
+        std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+    pub(crate) turns: std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+}
+
+impl IdentityProbe {
+    pub(crate) fn turn_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.turns.lock().expect("turn identities").clone()
+    }
+
+    pub(crate) fn blocking_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.blocking.lock().expect("blocking identities").clone()
+    }
+
+    pub(crate) fn stream_finish_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.stream_finishes
+            .lock()
+            .expect("stream finish identities")
+            .clone()
+    }
+}
+
+impl rig::agent::AgentHook for IdentityProbe {
+    async fn on_completion_response(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::CompletionResponseEvent<'_>,
+    ) -> rig::agent::ObservationAction {
+        self.blocking
+            .lock()
+            .expect("blocking identities")
+            .push(event.identity.clone());
+        rig::agent::ObservationAction::continue_run()
+    }
+
+    async fn on_stream_response_finish(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::StreamResponseFinish<'_>,
+    ) -> rig::agent::ObservationAction {
+        self.stream_finishes
+            .lock()
+            .expect("stream finish identities")
+            .push(event.identity.clone());
+        rig::agent::ObservationAction::continue_run()
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        self.turns
+            .lock()
+            .expect("turn identities")
+            .push(event.identity.clone());
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
+/// Assert a transport request id is populated and non-empty.
+pub(crate) fn assert_transport_request_id(id: Option<&str>, context: &str) {
+    assert!(
+        id.is_some_and(|id| !id.trim().is_empty()),
+        "{context}: provider_request_id must be populated"
+    );
 }

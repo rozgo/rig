@@ -17,8 +17,12 @@
 //! whole run state is `Serialize + Deserialize`: a driver can serialize a run
 //! between steps (for example while tool calls are pending), persist it, and
 //! resume it later in another process. Note that serialized run state embeds
-//! the full conversation accumulated so far — persisting it inherits whatever
-//! sensitivity the conversation content has — and the serialization format
+//! the full conversation accumulated so far *and* every completed call's
+//! provider response ([`CompletionCall::raw`], the value the model's raw
+//! method would have returned, serialized) — persisting it inherits whatever
+//! sensitivity the conversation content has and grows with each provider
+//! body; a driver that does not want the raw payloads persisted clears
+//! `raw` on its own copy before writing — and the serialization format
 //! carries no cross-version stability guarantee yet: resume with the same rig
 //! version that suspended the run.
 //!
@@ -69,6 +73,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use rig_core::completion::{CompletionError, FinishReason};
 use rig_core::message::{
     AssistantContent, ToolCall, ToolChoice, ToolResult, ToolResultContent, UserContent,
 };
@@ -76,9 +81,10 @@ use rig_core::message::{
 use crate::{
     agent::hook::{InvalidToolCallAction, InvalidToolCallContext, RetryRequest},
     agent::prompt_request::{
-        CompletionCall, PromptResponse, TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER,
+        CompletionCall, PromptResponse, ResponseIdentity, TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER,
         assistant_text_from_choice, build_full_history, build_history_for_request,
         invalid_tool_retry_user_message, is_empty_assistant_turn, tool_result_message,
+        turn_delivered_no_answer,
     },
     completion::{Message, PromptError, Usage},
     json_utils,
@@ -175,7 +181,6 @@ pub enum AgentRunStep {
 
 /// One tool call awaiting execution by the driver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct PendingToolCall {
     /// The tool call emitted by the model (with any repaired tool name applied).
     pub tool_call: ToolCall,
@@ -193,10 +198,13 @@ pub struct PendingToolCall {
 
 /// A completed model turn fed back to [`AgentRun::model_response`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct ModelTurn {
     /// Provider-assigned assistant message ID, when available.
     pub message_id: Option<String>,
+    /// Provider-assigned response-scoped ID, when available.
+    pub response_id: Option<String>,
+    /// The provider's transport request id for this attempt, when reported.
+    pub provider_request_id: Option<String>,
     /// The assistant content returned by the model.
     pub choice: Vec<AssistantContent>,
     /// Token usage reported by the provider for this completion request.
@@ -205,6 +213,20 @@ pub struct ModelTurn {
     pub executable_tool_names: BTreeSet<String>,
     /// Tools allowed by the active [`ToolChoice`] for this turn.
     pub allowed_tool_names: BTreeSet<String>,
+    /// Why the model stopped generating on this turn, when the provider
+    /// reported it. Carried so the blocking surface records the same terminal
+    /// reason the streamed surface does (rig#2322).
+    #[serde(default)]
+    pub finish_reason: Option<FinishReason>,
+    /// The provider's own response for this attempt — see
+    /// `CompletionResponse::raw`. Carried so the blocking
+    /// surface records the same payload on its [`CompletionCall`] that the
+    /// streamed surface records via
+    /// [`AgentRun::record_streamed_completion_call`]. `default` because
+    /// persisted run state predates the field; `Value::Null` for a turn built
+    /// without a provider response behind it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub raw: serde_json::Value,
 }
 
 impl ModelTurn {
@@ -219,11 +241,38 @@ impl ModelTurn {
     ) -> Self {
         Self {
             message_id,
+            response_id: None,
+            provider_request_id: None,
             choice,
             usage,
             executable_tool_names,
             allowed_tool_names,
+            finish_reason: None,
+            raw: serde_json::Value::Null,
         }
+    }
+
+    /// Attach the remaining response identity metadata this attempt reported.
+    pub fn with_identity(
+        mut self,
+        response_id: Option<String>,
+        provider_request_id: Option<String>,
+    ) -> Self {
+        self.response_id = response_id;
+        self.provider_request_id = provider_request_id;
+        self
+    }
+
+    /// Attach the terminal finish reason this attempt reported.
+    pub fn with_finish_reason(mut self, finish_reason: Option<FinishReason>) -> Self {
+        self.finish_reason = finish_reason;
+        self
+    }
+
+    /// Attach the provider's own response this attempt produced.
+    pub fn with_raw(mut self, raw: serde_json::Value) -> Self {
+        self.raw = raw;
+        self
     }
 }
 
@@ -809,26 +858,77 @@ impl AgentRun {
                         content: final_items.clone(),
                     });
 
-                    let response = PromptResponse::new(output, self.usage)
-                        .with_messages(self.new_messages.clone())
-                        .with_completion_calls(self.completion_calls.clone())
-                        .with_output_tool_calls(output_tool_calls)
-                        .with_content(final_items);
-                    self.state = RunState::Done(Box::new(response.clone()));
-                    return Ok(AgentRunStep::Done(response));
+                    return Ok(self.finish(output, final_items, output_tool_calls));
                 }
 
-                // An empty turn is not a lost turn. Cancelling here would fail
-                // runs that previously succeeded: with the fabricated empty-text
-                // padding gone, a textless turn — a tool-call-only turn whose
-                // calls were all dropped, a content-filtered turn, a truncated
-                // stream — arrives honestly empty. `is_empty_assistant_turn`
-                // does the right thing: keep the turn out of history and carry on.
+                // An empty turn is not, on its own, a lost turn. Cancelling on
+                // every textless turn would fail runs that previously
+                // succeeded: with the fabricated empty-text padding gone, a
+                // tool-call-only turn whose calls were all dropped arrives
+                // honestly empty. `is_empty_assistant_turn` does the right
+                // thing: keep the turn out of history and carry on.
                 if !is_empty_assistant_turn(&items) {
                     self.new_messages.push(Message::Assistant {
                         id: message_id,
                         content: items.clone(),
                     });
+                }
+
+                // rig#2322 — but an empty turn the provider *cut short* is a
+                // lost turn, and finishing it as a successful empty answer is
+                // how a truncated response reached users as an unexplained
+                // blank. The blocking Gemini path already rejects a
+                // content-less candidate with a `ResponseError` naming the
+                // finish reason; this makes the agent surface agree.
+                //
+                // The predicate is `turn_delivered_no_answer`, **not**
+                // `is_empty_assistant_turn`: they diverge on a reasoning-only
+                // turn, which belongs in history (pushed above) but answered
+                // nothing. That divergence is the common case, not a corner —
+                // Gemini counts thinking tokens against `maxOutputTokens`, so a
+                // truncated thinking turn typically carries reasoning and no
+                // text, and gating on "empty" let exactly that shape finalize
+                // as a successful `""`.
+                //
+                // Deliberately narrow, so it cannot regress the case above:
+                //   - nothing delivered **and** truncated → error;
+                //   - reasoning only **and** truncated → error (nothing was
+                //     answered; the thinking is not the answer);
+                //   - nothing delivered but `Stop`/`ToolCalls`/`Other` →
+                //     unchanged, still a successful empty turn;
+                //   - any real text, or tool calls, **then** truncated →
+                //     unchanged, still valid, and the reason is on the
+                //     `CompletionCall` for a caller that wants to act on it.
+                if turn_delivered_no_answer(&items)
+                    && let Some(reason) = self.truncating_finish_reason()
+                {
+                    // The remedy differs by reason, and giving the wrong one is
+                    // worse than giving none: telling someone to raise
+                    // `max_tokens` after a safety block sends them to change a
+                    // setting that cannot possibly help.
+                    //
+                    // No `PromptResponse` is built on this path — the run ends
+                    // in `Err` — so the message must not send the caller to
+                    // `completion_calls` for the reason. It is named here
+                    // because here is the only place it appears.
+                    let remedy = match reason {
+                        FinishReason::Length => {
+                            "the turn ran out of output budget before producing one — \
+                             raise max_tokens for this request"
+                        }
+                        FinishReason::ContentFilter => {
+                            "the provider filtered the response — the content, not the \
+                             budget, is what it objected to"
+                        }
+                        // `truncating_finish_reason` admits only the two above;
+                        // this arm keeps the match total without inventing advice.
+                        _ => "the turn ended before producing one",
+                    };
+                    return Err(CompletionError::ResponseError(format!(
+                        "the model produced no answer and stopped with \
+                         finish_reason={reason:?}; {remedy}"
+                    ))
+                    .into());
                 }
 
                 if has_tool_calls {
@@ -884,13 +984,7 @@ impl AgentRun {
                         return self.reprompt_for_output();
                     }
 
-                    let response =
-                        PromptResponse::new(assistant_text_from_choice(&items), self.usage)
-                            .with_messages(self.new_messages.clone())
-                            .with_completion_calls(self.completion_calls.clone())
-                            .with_content(items);
-                    self.state = RunState::Done(Box::new(response.clone()));
-                    Ok(AgentRunStep::Done(response))
+                    Ok(self.finish(assistant_text_from_choice(&items), items, 0))
                 }
             }
             RunState::ExecutingTools(calls) => {
@@ -942,7 +1036,16 @@ impl AgentRun {
             ));
         }
 
-        self.record_completion_call(turn.usage);
+        self.record_completion_call(
+            turn.usage,
+            ResponseIdentity {
+                message_id: turn.message_id.clone(),
+                response_id: turn.response_id.clone(),
+                provider_request_id: turn.provider_request_id.clone(),
+            },
+            turn.finish_reason.clone(),
+            turn.raw.clone(),
+        );
 
         let items: Vec<AssistantContent> = turn.choice.clone();
         let has_tool_calls = has_tool_calls(&items);
@@ -969,12 +1072,61 @@ impl AgentRun {
     /// ingestion paths. Callers own the once-per-turn `streamed_completion_call_recorded`
     /// guard/flag; this helper never touches it, so it cannot be mistaken for
     /// "a completion call happened" and re-introduce a double count.
-    fn record_completion_call(&mut self, usage: Usage) -> CompletionCall {
-        let call = CompletionCall::new(self.completion_call_index, usage);
+    /// The most recent completion call's terminal reason, when it describes a
+    /// turn the provider **cut short** rather than one that ended on its own.
+    ///
+    /// [`FinishReason::Length`] and [`FinishReason::ContentFilter`] are
+    /// truncating: the model was stopped with more to say.
+    /// [`FinishReason::Other`] is deliberately excluded — it carries a
+    /// provider's own wire spelling with no normalized meaning, so treating it
+    /// as truncation would fail runs on benign provider-specific stops.
+    ///
+    /// The set is [`FinishReason::truncated_output`]'s, and deliberately so:
+    /// the reasons a provider may hand back an *answerless* turn are exactly
+    /// the reasons this layer has a remedy for. Sharing the predicate keeps a
+    /// normalizer that tolerates an empty turn and an agent that explains one
+    /// from ever disagreeing about which turns those are.
+    fn truncating_finish_reason(&self) -> Option<&FinishReason> {
+        self.completion_calls
+            .last()?
+            .finish_reason
+            .as_ref()
+            .filter(|reason| reason.truncated_output())
+    }
+
+    fn record_completion_call(
+        &mut self,
+        usage: Usage,
+        identity: ResponseIdentity,
+        finish_reason: Option<FinishReason>,
+        raw: serde_json::Value,
+    ) -> CompletionCall {
+        let call = CompletionCall::new(self.completion_call_index, usage)
+            .with_identity(identity)
+            .with_finish_reason(finish_reason)
+            .with_raw(raw);
         self.completion_call_index += 1;
-        self.completion_calls.push(call);
+        self.completion_calls.push(call.clone());
         self.usage += usage;
         call
+    }
+
+    /// Build the run's final [`PromptResponse`], park it in
+    /// [`RunState::Done`], and return the `Done` step. Shared by the
+    /// output-tool and plain-text finalization paths in `next_step`.
+    fn finish(
+        &mut self,
+        output: String,
+        content: Vec<AssistantContent>,
+        output_tool_calls: usize,
+    ) -> AgentRunStep {
+        let response = PromptResponse::new(output, self.usage)
+            .with_messages(self.new_messages.clone())
+            .with_completion_calls(self.completion_calls.clone())
+            .with_output_tool_calls(output_tool_calls)
+            .with_content(content);
+        self.state = RunState::Done(Box::new(response.clone()));
+        AgentRunStep::Done(response)
     }
 
     /// Park an accepted model turn in [`RunState::AwaitingAdvance`]. Both the
@@ -1302,9 +1454,17 @@ impl AgentRun {
     /// or between a turn rollback and the next [`AgentRunStep::CallModel`];
     /// aggregates `usage` into the run total. Zero-valued usage means the
     /// provider reported no usage metrics.
+    ///
+    /// `raw` is the stream's terminal record as carried on `StreamFinal::raw`
+    /// — read off the same terminal the driver reads `identity` and
+    /// `finish_reason` from, so the recorded call carries *this* attempt's
+    /// payload; `Value::Null` when no terminal record arrived.
     pub fn record_streamed_completion_call(
         &mut self,
         usage: Usage,
+        identity: ResponseIdentity,
+        finish_reason: Option<FinishReason>,
+        raw: serde_json::Value,
     ) -> Result<CompletionCall, PromptError> {
         let recordable = matches!(self.state, RunState::AwaitingModel)
             || (matches!(self.state, RunState::PreparingRequest) && self.rollback_pending);
@@ -1320,7 +1480,7 @@ impl AgentRun {
         }
         self.streamed_completion_call_recorded = true;
 
-        Ok(self.record_completion_call(usage))
+        Ok(self.record_completion_call(usage, identity, finish_reason, raw))
     }
 
     /// The recovery-hook context for an invalid tool call surfaced
@@ -1459,7 +1619,21 @@ impl AgentRun {
             // `Usage::new()` is the additive identity for `Usage`'s `AddAssign`,
             // so routing the no-usage fallback through `record_completion_call`
             // leaves the run total unchanged while unifying the accounting.
-            self.record_completion_call(Usage::new());
+            // Identity carries the turn's message id — the same value written
+            // into run history below — so `completion_calls` and `messages()`
+            // agree even for a hand-driven driver that never recorded usage.
+            self.record_completion_call(
+                Usage::new(),
+                ResponseIdentity {
+                    message_id: turn.message_id.clone(),
+                    ..ResponseIdentity::default()
+                },
+                turn.finish_reason.clone(),
+                // A streamed turn's raw lives on the terminal record, which
+                // this fallback never saw; the driver records it via
+                // `record_streamed_completion_call` when it has one.
+                serde_json::Value::Null,
+            );
             self.streamed_completion_call_recorded = true;
         }
 
@@ -2234,8 +2408,13 @@ mod tests {
     fn model_response_rejected_after_streamed_completion_call_record() {
         let mut run = AgentRun::new("hello");
         expect_call_model(&mut run);
-        run.record_streamed_completion_call(Usage::new())
-            .expect("record should succeed");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record should succeed");
 
         let err = run
             .model_response(text_turn("hi"))
@@ -2853,5 +3032,176 @@ mod tests {
             Some(descriptor)
         );
         assert!(restored.deferred_tools().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Raw provider response capture (always on), at the state-machine layer:
+    // the drivers hand `AgentRun` the payload they read off the provider
+    // response (blocking) or the stream terminal (streamed); the run must
+    // record it per call, and persisted run state must carry it across a
+    // suspend/resume boundary — while state written before the field existed
+    // still loads. A `Value::Null` here means the turn was built without a provider
+    // response behind it (hand-built, or persisted before the field existed),
+    // never that capture was declined.
+    // ---------------------------------------------------------------------
+
+    fn raw_payload(attempt: &str) -> serde_json::Value {
+        json!({
+            "id": format!("resp-{attempt}"),
+            "provider_only": attempt,
+        })
+    }
+
+    #[test]
+    fn model_turn_raw_is_recorded_on_the_completion_call() {
+        let first = raw_payload("turn-1");
+        let second = raw_payload("turn-2");
+        let mut run = AgentRun::new("add things").max_turns(2);
+
+        expect_call_model(&mut run);
+        expect_continue(
+            run.model_response(tool_call_turn("call_1", "add").with_raw(first.clone()))
+                .expect("model_response should succeed"),
+        );
+        expect_call_tools(&mut run);
+        run.tool_results(vec![tool_result("call_1", "2")])
+            .expect("tool_results should succeed");
+        expect_call_model(&mut run);
+        expect_continue(
+            run.model_response(text_turn("done").with_raw(second.clone()))
+                .expect("model_response should succeed"),
+        );
+
+        let response = expect_done(&mut run);
+        let raws: Vec<_> = response
+            .completion_calls
+            .iter()
+            .map(|call| call.raw.clone())
+            .collect();
+        assert_eq!(
+            raws,
+            [first, second],
+            "each call carries its own turn's payload"
+        );
+    }
+
+    /// A `ModelTurn` built without `with_raw` has no provider response behind
+    /// it, so its record carries `Value::Null` — the only way a record ends up
+    /// without a payload.
+    #[test]
+    fn model_turn_without_raw_records_null() {
+        let mut run = AgentRun::new("hello");
+        expect_call_model(&mut run);
+        expect_continue(
+            run.model_response(text_turn("hi"))
+                .expect("model_response should succeed"),
+        );
+        assert_eq!(run.completion_calls()[0].raw, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn streamed_completion_call_record_carries_raw() {
+        let raw = raw_payload("streamed");
+        let mut run = AgentRun::new("hello");
+        expect_call_model(&mut run);
+        let call = run
+            .record_streamed_completion_call(
+                usage(3, 4),
+                ResponseIdentity::default(),
+                None,
+                raw.clone(),
+            )
+            .expect("record should succeed");
+        assert_eq!(call.raw, raw);
+        assert_eq!(run.completion_calls()[0].raw, raw);
+
+        let mut run = AgentRun::new("hello");
+        expect_call_model(&mut run);
+        let call = run
+            .record_streamed_completion_call(
+                usage(3, 4),
+                ResponseIdentity::default(),
+                None,
+                serde_json::Value::Null,
+            )
+            .expect("record should succeed");
+        assert_eq!(
+            call.raw,
+            serde_json::Value::Null,
+            "a terminal with no payload behind it records Value::Null"
+        );
+    }
+
+    /// A suspended run's recorded payloads survive the serialize/resume
+    /// boundary intact — a resumed process sees exactly what the live one
+    /// recorded.
+    #[test]
+    fn recorded_raw_survives_serde_round_trip() {
+        let raw = raw_payload("suspended");
+        let mut run = AgentRun::new("add things").max_turns(2);
+        expect_call_model(&mut run);
+        expect_continue(
+            run.model_response(tool_call_turn("call_1", "add").with_raw(raw.clone()))
+                .expect("model_response should succeed"),
+        );
+        expect_call_tools(&mut run);
+
+        let serialized = serde_json::to_string(&run).expect("mid-run state should serialize");
+        let restored: AgentRun =
+            serde_json::from_str(&serialized).expect("mid-run state should deserialize");
+        assert_eq!(restored.completion_calls().len(), 1);
+        assert_eq!(restored.completion_calls()[0].raw, raw);
+        assert_eq!(restored.completion_calls(), run.completion_calls());
+    }
+
+    /// `ModelTurn` carries `raw` through its own serde round trip, and a
+    /// turn serialized before the field existed (no `raw` key) still loads
+    /// with `raw` as `Value::Null`.
+    #[test]
+    fn model_turn_raw_round_trips_and_missing_key_loads_as_null() {
+        let raw = raw_payload("turn");
+        let turn = text_turn("hi").with_raw(raw.clone());
+
+        let value = serde_json::to_value(&turn).expect("turn should serialize");
+        assert_eq!(value["raw"], raw);
+        let restored: ModelTurn =
+            serde_json::from_value(value.clone()).expect("turn should deserialize");
+        assert_eq!(restored.raw, raw);
+
+        let mut without_raw = value;
+        without_raw
+            .as_object_mut()
+            .expect("turn serializes as an object")
+            .remove("raw")
+            .expect("the raw key was present");
+        let legacy: ModelTurn =
+            serde_json::from_value(without_raw).expect("a turn without a raw key still loads");
+        assert_eq!(legacy.raw, serde_json::Value::Null);
+        assert_eq!(legacy.choice, turn.choice);
+    }
+
+    /// The same for a persisted `CompletionCall`: `raw` is skipped when `Value::Null`
+    /// (state written before the field is byte-identical), and a record
+    /// without the key loads with `raw` as `Value::Null`.
+    #[test]
+    fn completion_call_raw_round_trips_and_missing_key_loads_as_null() {
+        let raw = raw_payload("call");
+        let call = CompletionCall::new(0, usage(1, 2)).with_raw(raw.clone());
+
+        let value = serde_json::to_value(&call).expect("call should serialize");
+        assert_eq!(value["raw"], raw);
+        let restored: CompletionCall =
+            serde_json::from_value(value).expect("call should deserialize");
+        assert_eq!(restored, call);
+
+        let unset = serde_json::to_value(CompletionCall::new(0, usage(1, 2)))
+            .expect("call should serialize");
+        assert!(
+            unset.get("raw").is_none(),
+            "a Value::Null raw is not written, so pre-field state is unchanged"
+        );
+        let legacy: CompletionCall =
+            serde_json::from_value(unset).expect("a call without a raw key still loads");
+        assert_eq!(legacy.raw, serde_json::Value::Null);
     }
 }

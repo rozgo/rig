@@ -3,6 +3,7 @@ use crate::{
     http_client::HttpClientExt,
     json_utils,
     message::{self, Reasoning, ToolChoice},
+    providers::internal::{completion_send::send_completion, envelope::DirectPayload},
     telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator},
 };
 use std::collections::HashMap;
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 use super::client::Client;
 use crate::completion::CompletionRequest;
 use serde::{Deserialize, Serialize};
-use tracing::{Instrument, Level, enabled};
+use tracing::Instrument;
 
 /// Stable descriptor name recorded on normalized responses, streams, and
 /// telemetry spans for this provider.
@@ -47,7 +48,6 @@ impl CompletionResponse {
 }
 
 impl crate::telemetry::ProviderResponseExt for CompletionResponse {
-    type OutputMessage = Message;
     type Usage = Usage;
 
     fn get_response_id(&self) -> Option<String> {
@@ -56,10 +56,6 @@ impl crate::telemetry::ProviderResponseExt for CompletionResponse {
 
     fn get_response_model_name(&self) -> Option<String> {
         None
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        vec![self.message.clone()]
     }
 
     fn get_text_response(&self) -> Option<String> {
@@ -233,6 +229,17 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Document {
     pub id: String,
+    /// Document metadata plus its `text`.
+    ///
+    /// Serialized in sorted key order: `HashMap` iteration order is randomized
+    /// per instance, and documents sit inside the `messages` block that Cohere's
+    /// prompt cache keys on. An unsorted map therefore gave every request
+    /// carrying a document a different prefix, so the cache could never hit —
+    /// see [`crate::json_utils::serialize_map_sorted`]. Rig already sorts the
+    /// same metadata deliberately when rendering a document into prompt text
+    /// (`crate::completion::Document`'s `Display`); this makes the native
+    /// document block agree with it.
+    #[serde(serialize_with = "crate::json_utils::serialize_map_sorted")]
     pub data: HashMap<String, serde_json::Value>,
 }
 
@@ -746,12 +753,11 @@ where
                 .system_instructions(system_instructions.as_deref(), record_telemetry_content)
                 .build();
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                "Cohere completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Cohere completion request",
+            &request,
+        );
 
         let req_body = serde_json::to_vec(&request)?;
 
@@ -761,16 +767,17 @@ where
             .body(req_body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
-        async {
-            // Left unboxed so `provider_response_status`/`_body` can read the
-            // status and body straight off `InvalidStatusCodeWithMessage`.
-            let response = self.client.send::<_, bytes::Bytes>(req).await?;
-
-            let status = response.status();
-            let body = response.into_body().into_future().await?.to_owned();
-
-            if status.is_success() {
-                let json_response: CompletionResponse = serde_json::from_slice(&body)?;
+        // Left unboxed so `provider_response_status`/`_body` can read the
+        // status and body straight off the transport error.
+        send_completion::<_, DirectPayload<CompletionResponse>, _>(
+            &self.client,
+            req,
+            "Cohere completion",
+            // Cohere reports no request-id response header (its `x-debug-trace-id`
+            // is a debug trace handle, not a documented request id); the
+            // normalized id is None by design.
+            None,
+            |json_response| {
                 let span = tracing::Span::current();
                 let usage = json_response
                     .usage
@@ -778,26 +785,12 @@ where
                     .map(completion::Usage::from)
                     .unwrap_or_default();
                 span.record_token_usage(&usage);
-                span.record_response_metadata(&json_response);
-
-                if enabled!(Level::TRACE) {
-                    tracing::trace!(
-                        target: "rig::completions",
-                        "Cohere completion response: {}",
-                        serde_json::to_string_pretty(&json_response)?
-                    );
-                }
-
-                Ok(json_response)
-            } else {
-                Err(CompletionError::from_http_response(
-                    status,
-                    String::from_utf8_lossy(&body),
-                ))
-            }
-        }
+                span.record_response_metadata(json_response);
+            },
+        )
         .instrument(llm_span)
         .await
+        .map(|(payload, _)| payload)
     }
 }
 
@@ -809,7 +802,11 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        self.raw_completion(completion_request).await?.try_into()
+        // Capture before `try_into` consumes the raw value.
+        let raw = self.raw_completion(completion_request).await?;
+        let captured = serde_json::to_value(&raw)?;
+        let response: completion::CompletionResponse = raw.try_into()?;
+        Ok(response.with_raw(captured))
     }
 
     async fn stream(

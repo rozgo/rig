@@ -38,10 +38,11 @@ ordered-float = { workspace = true }
 quick-xml = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json", "stream", "multipart"] }
-rig-derive = { version = "0.41.0", path = "../rig-derive", optional = true }
+rig-derive = { version = "0.42.0", path = "../rig-derive", optional = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
@@ -74,6 +75,10 @@ tokio-tungstenite = { workspace = true, optional = true }
 # would be wrong-by-construction on WASI.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures-timer = { workspace = true, features = ["wasm-bindgen"] }
+# `lopdf` pulls `getrandom` through its PDF encryption support. Browser WASM
+# cannot select a randomness backend from the target triple alone, so opt in to
+# lopdf's Web Crypto backend only for Rig's supported browser target.
+lopdf = { workspace = true, optional = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -83,7 +88,8 @@ anyhow = { workspace = true }
 # downstream builds.
 rig-core = { path = ".", features = ["test-utils"] }
 # identity-leak compile-fail tests (tests/identity_leak.rs)
-trybuild = "1.0"
+# 1.0.111: the compiler-output normalization the trybuild cases were written against.
+trybuild = "1.0.111"
 # streaming identity/merge law property tests
 proptest = "1"
 assert_fs = { workspace = true }

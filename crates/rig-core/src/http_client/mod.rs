@@ -19,6 +19,19 @@ pub enum Error {
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
     InvalidStatusCodeWithMessage(StatusCode, String),
+    /// A non-success HTTP response whose headers were preserved alongside the
+    /// body, so provider layers can read transport metadata — e.g. their
+    /// request-id contract — off the failed response (rig#2314). Displays
+    /// identically to [`Self::InvalidStatusCodeWithMessage`].
+    #[error("Invalid status code {status} with message: {body}")]
+    InvalidStatusCodeWithDetails {
+        /// The non-success status.
+        status: StatusCode,
+        /// The raw response body.
+        body: String,
+        /// The failed response's headers, verbatim.
+        headers: Box<http::HeaderMap>,
+    },
     #[error("Header value outside of legal range: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("Request in error state, cannot access headers")]
@@ -42,6 +55,7 @@ impl Error {
             Self::InvalidStatusCode(status) | Self::InvalidStatusCodeWithMessage(status, _) => {
                 Some(*status)
             }
+            Self::InvalidStatusCodeWithDetails { status, .. } => Some(*status),
             _ => None,
         }
     }
@@ -49,6 +63,40 @@ impl Error {
     pub(crate) fn non_success_body(&self) -> Option<&str> {
         match self {
             Self::InvalidStatusCodeWithMessage(_, body) => Some(body.as_str()),
+            Self::InvalidStatusCodeWithDetails { body, .. } => Some(body.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the failed response's headers, when this error preserved them.
+    ///
+    /// Rig's bundled HTTP clients capture the full [`HeaderMap`] whenever a
+    /// non-success status error is built from a live response, so rate-limit
+    /// metadata such as `Retry-After` or `x-ratelimit-*` stays readable
+    /// (rig#2210). This is the accessor a [`retry::RetryPolicy`] uses to honor
+    /// a server-supplied backoff, since it is handed this error directly:
+    ///
+    /// ```
+    /// # use rig_core::http_client::{Error, retry::RetryPolicy};
+    /// # use std::time::Duration;
+    /// fn retry_after(error: &Error) -> Option<Duration> {
+    ///     let seconds = error
+    ///         .non_success_headers()?
+    ///         .get(http::header::RETRY_AFTER)?
+    ///         .to_str()
+    ///         .ok()?
+    ///         .parse()
+    ///         .ok()?;
+    ///     Some(Duration::from_secs(seconds))
+    /// }
+    /// ```
+    ///
+    /// Returns `None` when the error carries no captured headers: transports
+    /// that report a non-success status without them, and errors built from
+    /// only a status and body.
+    pub fn non_success_headers(&self) -> Option<&HeaderMap> {
+        match self {
+            Self::InvalidStatusCodeWithDetails { headers, .. } => Some(headers),
             _ => None,
         }
     }
@@ -68,11 +116,19 @@ fn instance_error<E: std::error::Error + 'static>(error: E) -> Error {
 
 async fn non_success_status_error(response: reqwest::Response) -> Error {
     let status = response.status();
-    let message = response
+    // Preserve the failed response's headers: provider layers read their
+    // request-id contract off them (rig#2314). The Display is identical to
+    // the header-less variant, so surfaced error text is unchanged.
+    let headers = Box::new(response.headers().clone());
+    let body = response
         .text()
         .await
         .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-    Error::InvalidStatusCodeWithMessage(status, message)
+    Error::InvalidStatusCodeWithDetails {
+        status,
+        body,
+        headers,
+    }
 }
 
 pub type LazyBytes = WasmBoxedFuture<'static, Result<Bytes>>;
@@ -113,12 +169,6 @@ pub fn bearer_auth_header(headers: &mut HeaderMap, key: impl AsRef<str>) -> Resu
     headers.insert(k, v);
 
     Ok(())
-}
-
-pub fn with_bearer_auth(mut req: Builder, auth: &str) -> Result<Builder> {
-    bearer_auth_header(req.headers_mut().ok_or(Error::NoHeaders)?, auth)?;
-
-    Ok(req)
 }
 
 /// A helper trait to make generic requests (both regular and SSE) possible.
@@ -281,3 +331,68 @@ impl_http_client_ext!(
     #[cfg_attr(docsrs, doc(cfg(feature = "reqwest-middleware")))]
     reqwest_middleware::ClientWithMiddleware
 );
+
+#[cfg(test)]
+mod non_success_header_tests {
+    use super::*;
+
+    /// rig#2210: the bundled transport's own error constructor is where the
+    /// headers are captured, so drive it with a real `reqwest::Response`.
+    #[tokio::test]
+    async fn non_success_status_error_preserves_response_headers() {
+        let response = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", "20")
+            .header("x-ratelimit-remaining", "0")
+            .body(r#"{"error":{"message":"rate limited"}}"#)
+            .expect("valid response");
+
+        let error = non_success_status_error(reqwest::Response::from(response)).await;
+
+        assert_eq!(
+            error.non_success_status(),
+            Some(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(
+            error.non_success_body(),
+            Some(r#"{"error":{"message":"rate limited"}}"#)
+        );
+        let headers = error
+            .non_success_headers()
+            .expect("headers captured at error construction");
+        assert_eq!(
+            headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("20")
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
+    }
+
+    /// `None` means "not captured" and must not be confused with an empty map:
+    /// every other shape of this error reports it.
+    #[test]
+    fn non_success_headers_absent_when_not_captured() {
+        for error in [
+            Error::InvalidStatusCodeWithMessage(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limited".to_string(),
+            ),
+            Error::InvalidStatusCode(StatusCode::TOO_MANY_REQUESTS),
+            Error::StreamEnded,
+        ] {
+            assert!(error.non_success_headers().is_none());
+        }
+
+        // A captured-but-empty map is `Some`, not `None`.
+        let error = Error::InvalidStatusCodeWithDetails {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: "rate limited".to_string(),
+            headers: Box::new(HeaderMap::new()),
+        };
+        assert!(error.non_success_headers().is_some_and(HeaderMap::is_empty));
+    }
+}

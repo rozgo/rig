@@ -1,10 +1,10 @@
-use super::{Client, client::ApiResponse};
-use crate::http_client::HttpClientExt;
+use super::{OpenAICompletionsExt, OpenAIResponsesExt};
 use crate::image_generation;
 use crate::image_generation::{ImageGenerationError, ImageGenerationRequest};
 use crate::json_utils::merge_inplace;
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use crate::providers::internal::image_generation::{
+    GenericImageGenerationModel, JsonImageGenerationProvider, decode_base64_image,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -34,84 +34,90 @@ impl TryFrom<ImageGenerationResponse>
     type Error = ImageGenerationError;
 
     fn try_from(value: ImageGenerationResponse) -> Result<Self, Self::Error> {
-        let b64_json = value
-            .data
-            .first()
-            .ok_or_else(|| ImageGenerationError::ResponseError("missing image data".into()))?
-            .b64_json
-            .clone();
-
-        let bytes = BASE64_STANDARD
-            .decode(&b64_json)
-            .map_err(|err| ImageGenerationError::ResponseError(err.to_string()))?;
-
-        Ok(image_generation::ImageGenerationResponse {
-            image: bytes,
-            response: value,
-        })
+        decode_base64_image(
+            value,
+            |response| response.data.first().map(|image| image.b64_json.as_str()),
+            "missing image data",
+            None,
+        )
     }
 }
 
-#[derive(Clone)]
-pub struct ImageGenerationModel<T = reqwest::Client> {
-    client: Client<T>,
-    /// Name of the model (e.g.: dall-e-2)
-    pub model: String,
-}
+/// OpenAI image generation model.
+pub type ImageGenerationModel<T = reqwest::Client> =
+    GenericImageGenerationModel<OpenAIResponsesExt, T>;
 
-impl<T> ImageGenerationModel<T> {
-    pub(crate) fn new(client: Client<T>, model: impl Into<String>) -> Self {
-        Self {
-            client,
-            model: model.into(),
-        }
+/// OpenAI image generation model for a client using Chat Completions.
+pub type CompletionsImageGenerationModel<T = reqwest::Client> =
+    GenericImageGenerationModel<OpenAICompletionsExt, T>;
+
+/// Build the `/v1/images/generations` body.
+///
+/// `response_format` is deliberately absent: it is no longer part of this
+/// endpoint's request schema, which rejects it before it even looks at the
+/// model — a request naming a model that does not exist still fails on
+/// `400 Unknown parameter: 'response_format'` first. Rig used to add it for
+/// every model outside a hardcoded `gpt-image-1`/`1.5`/`2` allowlist, so every
+/// other image model — `gpt-image-1-mini`, `chatgpt-image-latest`, and any
+/// dated snapshot of an allowlisted model such as `gpt-image-2-2026-04-21` —
+/// could not generate an image at all. The models this endpoint currently
+/// serves answer with `data[].b64_json`, which is what
+/// [`decode_base64_image`] reads.
+///
+/// This is a statement about *this* endpoint. An OpenAI-**compatible** images
+/// endpoint reached through the same client may still take the field, and may
+/// need it to answer with base64 rather than a URL; such a caller passes it
+/// explicitly through `additional_params`, which the merge below now honors.
+fn build_request(
+    model: &str,
+    generation_request: ImageGenerationRequest,
+) -> Result<serde_json::Value, ImageGenerationError> {
+    let mut request = json!({
+        "model": model,
+        "prompt": generation_request.prompt,
+        "size": format!("{}x{}", generation_request.width, generation_request.height),
+    });
+
+    // Last, so a caller can reach the endpoint's other parameters (`quality`,
+    // `background`, `output_format`, `user`, …) and override what is derived
+    // above. xAI's and Gemini's image bodies already honor this field;
+    // dropping it here made `ImageGenerationRequestBuilder::additional_params`
+    // silently inert for OpenAI.
+    //
+    // Azure OpenAI's image body (`providers::azure`) has both defects and in a
+    // worse combination: it hardcodes `response_format` *and* drops
+    // `additional_params`, so an Azure caller cannot even work around the
+    // former. Left alone here because a fix that cannot be recorded against
+    // Azure would be a guess, which is what this change set is trying not to
+    // ship.
+    if let Some(additional_params) = generation_request.additional_params {
+        merge_inplace(&mut request, additional_params);
     }
+
+    Ok(request)
 }
 
-impl<T> image_generation::ImageGenerationModel for ImageGenerationModel<T>
-where
-    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
-{
+impl JsonImageGenerationProvider for OpenAIResponsesExt {
+    const IMAGE_GENERATION_PATH: &'static str = "/images/generations";
     type Response = ImageGenerationResponse;
 
-    type Client = Client<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
+    fn image_generation_request_body(
+        model: &str,
+        request: ImageGenerationRequest,
+    ) -> Result<serde_json::Value, ImageGenerationError> {
+        build_request(model, request)
     }
+}
 
-    async fn image_generation(
-        &self,
-        generation_request: ImageGenerationRequest,
-    ) -> Result<image_generation::ImageGenerationResponse<Self::Response>, ImageGenerationError>
-    {
-        let mut request = json!({
-            "model": self.model,
-            "prompt": generation_request.prompt,
-            "size": format!("{}x{}", generation_request.width, generation_request.height),
-        });
+impl JsonImageGenerationProvider for OpenAICompletionsExt {
+    const IMAGE_GENERATION_PATH: &'static str = "/images/generations";
+    type Response = ImageGenerationResponse;
 
-        if !matches!(
-            self.model.as_str(),
-            GPT_IMAGE_1 | GPT_IMAGE_1_5 | GPT_IMAGE_2
-        ) {
-            merge_inplace(
-                &mut request,
-                json!({
-                    "response_format": "b64_json"
-                }),
-            );
-        }
-
-        crate::providers::internal::image_generation::send_image_generation::<
-            _,
-            ApiResponse<ImageGenerationResponse>,
-        >(
-            &self.client,
-            self.client.post("/images/generations")?,
-            request,
-        )
-        .await
+    fn image_generation_request_body(
+        model: &str,
+        request: ImageGenerationRequest,
+    ) -> Result<serde_json::Value, ImageGenerationError> {
+        build_request(model, request)
     }
 }
 
@@ -120,6 +126,7 @@ mod tests {
     use super::*;
     use crate::client::image_generation::ImageGenerationClient;
     use crate::image_generation::ImageGenerationModel as _;
+    use crate::providers::openai::Client;
     use crate::test_utils::RecordingHttpClient;
 
     fn request() -> ImageGenerationRequest {
@@ -129,6 +136,109 @@ mod tests {
             height: 256,
             additional_params: None,
         }
+    }
+
+    fn body(model: &str, additional_params: Option<serde_json::Value>) -> serde_json::Value {
+        build_request(
+            model,
+            ImageGenerationRequest {
+                additional_params,
+                ..request()
+            },
+        )
+        .expect("body should build")
+    }
+
+    /// The field is not in the endpoint's request schema, so no model may be
+    /// sent it — including the ones the old hardcoded allowlist happened to
+    /// cover, and the retired `dall-e` names rig still exports.
+    #[test]
+    fn build_request_never_sends_response_format() {
+        for model in [
+            DALL_E_2,
+            DALL_E_3,
+            GPT_IMAGE_1,
+            GPT_IMAGE_1_5,
+            GPT_IMAGE_2,
+            "gpt-image-1-mini",
+            "gpt-image-2-2026-04-21",
+            "chatgpt-image-latest",
+        ] {
+            assert!(
+                body(model, None).get("response_format").is_none(),
+                "{model} must not be sent a field outside the endpoint's schema"
+            );
+        }
+    }
+
+    /// Allowlisted and unlisted models now build the *same* body — the split
+    /// the allowlist created is what made unlisted models unusable.
+    #[test]
+    fn build_request_is_model_independent_apart_from_the_model_field() {
+        let listed = body(GPT_IMAGE_1, None);
+        let unlisted = body("gpt-image-1-mini", None);
+
+        assert_eq!(listed["model"], json!(GPT_IMAGE_1));
+        assert_eq!(unlisted["model"], json!("gpt-image-1-mini"));
+        assert_eq!(
+            listed.as_object().map(|body| body.len()),
+            unlisted.as_object().map(|body| body.len())
+        );
+        assert_eq!(listed["prompt"], unlisted["prompt"]);
+        assert_eq!(listed["size"], unlisted["size"]);
+    }
+
+    #[test]
+    fn build_request_derives_prompt_and_size() {
+        let body = body(GPT_IMAGE_1, None);
+
+        assert_eq!(body["prompt"], json!("draw a cat"));
+        assert_eq!(body["size"], json!("256x256"));
+    }
+
+    #[test]
+    fn build_request_merges_additional_params() {
+        let body = body(
+            GPT_IMAGE_1,
+            Some(json!({ "quality": "low", "background": "opaque" })),
+        );
+
+        assert_eq!(body["quality"], json!("low"));
+        assert_eq!(body["background"], json!("opaque"));
+    }
+
+    /// Merged last, so a caller can override each derived key.
+    #[test]
+    fn build_request_lets_additional_params_override_derived_keys() {
+        let body = body(
+            GPT_IMAGE_1,
+            Some(json!({ "model": "other", "prompt": "other prompt", "size": "1024x1024" })),
+        );
+
+        assert_eq!(body["model"], json!("other"));
+        assert_eq!(body["prompt"], json!("other prompt"));
+        assert_eq!(body["size"], json!("1024x1024"));
+    }
+
+    /// The escape hatch: a compatible endpoint that still wants
+    /// `response_format` can be handed it explicitly.
+    #[test]
+    fn build_request_lets_a_caller_reinstate_response_format() {
+        let body = body(GPT_IMAGE_1, Some(json!({ "response_format": "b64_json" })));
+
+        assert_eq!(body["response_format"], json!("b64_json"));
+    }
+
+    #[test]
+    fn build_request_ignores_non_object_additional_params() {
+        assert_eq!(
+            body(GPT_IMAGE_1, Some(json!("not-an-object"))),
+            body(GPT_IMAGE_1, None)
+        );
+        assert_eq!(
+            body(GPT_IMAGE_1, Some(json!(null))),
+            body(GPT_IMAGE_1, None)
+        );
     }
 
     #[tokio::test]

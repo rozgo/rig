@@ -295,6 +295,21 @@ where
     }
 }
 
+/// Normalize one erased invocation's outcome into the canonical [`ToolResult`].
+///
+/// Output conversion happens here rather than in each [`ErasedTool::execute`] so
+/// a conversion failure and an execution failure reach the runtime as the same
+/// kind of failed result.
+fn tool_result_from<O>(outcome: Result<O, ToolExecutionError>) -> ToolResult
+where
+    O: IntoToolOutput,
+{
+    match outcome.and_then(IntoToolOutput::into_tool_output) {
+        Ok(output) => ToolResult::success(output),
+        Err(error) => ToolResult::failed(error),
+    }
+}
+
 /// Crate-private, object-safe dispatch boundary.
 pub(crate) trait ErasedTool: WasmCompatSend + WasmCompatSync {
     fn name(&self) -> String;
@@ -341,14 +356,11 @@ where
                 Ok(args) => args,
                 Err(error) => return ToolExecution::complete(ToolResult::failed(error)),
             };
-            let result = match Tool::call(self, context, args).await {
-                Ok(output) => match output.into_tool_output() {
-                    Ok(output) => ToolResult::success(output),
-                    Err(error) => ToolResult::failed(error),
-                },
-                Err(error) => ToolResult::failed(Tool::map_error(self, error)),
-            };
-            ToolExecution::complete(result)
+            ToolExecution::complete(tool_result_from(
+                Tool::call(self, context, args)
+                    .await
+                    .map_err(|error| Tool::map_error(self, error)),
+            ))
         })
     }
 }
@@ -467,25 +479,11 @@ impl ErasedTool for DynamicTool {
         context: &'a mut ToolContext,
     ) -> WasmBoxedFuture<'a, ToolExecution> {
         Box::pin(async move {
-            let args = match serde_json::from_str(&args) {
+            let args = match parse_tool_args::<serde_json::Value>(&args) {
                 Ok(args) => args,
-                Err(error) => {
-                    return ToolExecution::complete(ToolResult::failed(
-                        ToolExecutionError::invalid_args(format!(
-                            "failed to parse tool arguments: {error}"
-                        ))
-                        .with_source(error),
-                    ));
-                }
+                Err(error) => return ToolExecution::complete(ToolResult::failed(error)),
             };
-            let result = match (self.callback)(context, args).await {
-                Ok(output) => match output.into_tool_output() {
-                    Ok(output) => ToolResult::success(output),
-                    Err(error) => ToolResult::failed(error),
-                },
-                Err(error) => ToolResult::failed(error),
-            };
-            ToolExecution::complete(result)
+            ToolExecution::complete(tool_result_from((self.callback)(context, args).await))
         })
     }
 }
@@ -646,11 +644,6 @@ impl ToolSet {
         set
     }
 
-    /// Create a builder.
-    pub fn builder() -> ToolSetBuilder {
-        ToolSetBuilder::default()
-    }
-
     /// Whether the name is registered.
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
@@ -672,6 +665,17 @@ impl ToolSet {
     /// Register a context-free dynamic tool without rewriting its callback.
     pub fn add_portable_dynamic_tool(&mut self, tool: PortableDynamicTool) -> String {
         self.add_dynamic_tool(DynamicTool::from_portable(tool))
+    }
+
+    /// Register a tool that is retrieved from an embedding index at prompt time.
+    ///
+    /// The registration keeps the tool's embedding context and documents, so
+    /// [`ToolSet::schemas`] can hand them to a vector store.
+    pub fn add_retrieved_tool<T>(&mut self, tool: T) -> String
+    where
+        T: ToolEmbedding + 'static,
+    {
+        self.insert(RegisteredTool::Embedding(Arc::new(tool)))
     }
 
     #[cfg(any(test, all(feature = "rmcp", not(target_family = "wasm"))))]
@@ -810,55 +814,6 @@ impl ToolSet {
                 RegisteredTool::Static(_) => None,
             })
             .collect()
-    }
-}
-
-/// Builder for static, runtime-defined, and embedding tools.
-#[derive(Default)]
-pub struct ToolSetBuilder {
-    tools: Vec<RegisteredTool>,
-}
-
-impl ToolSetBuilder {
-    /// Add a typed static tool.
-    pub fn static_tool<T>(mut self, tool: T) -> Self
-    where
-        T: Tool + 'static,
-    {
-        self.tools.push(RegisteredTool::Static(Arc::new(tool)));
-        self
-    }
-
-    /// Add a runtime-defined tool.
-    pub fn dynamic_tool(mut self, tool: DynamicTool) -> Self {
-        self.tools.push(RegisteredTool::Static(Arc::new(tool)));
-        self
-    }
-
-    /// Add a context-free dynamic tool through the classic adapter.
-    pub fn portable_dynamic_tool(mut self, tool: PortableDynamicTool) -> Self {
-        self.tools.push(RegisteredTool::Static(Arc::new(
-            DynamicTool::from_portable(tool),
-        )));
-        self
-    }
-
-    /// Add a tool that is retrieved from an embedding index at prompt time.
-    pub fn retrieved_tool<T>(mut self, tool: T) -> Self
-    where
-        T: ToolEmbedding + 'static,
-    {
-        self.tools.push(RegisteredTool::Embedding(Arc::new(tool)));
-        self
-    }
-
-    /// Build the set.
-    pub fn build(self) -> ToolSet {
-        let mut set = ToolSet::default();
-        for tool in self.tools {
-            set.insert(tool);
-        }
-        set
     }
 }
 
@@ -1628,7 +1583,8 @@ mod migrated_tests {
             }
         }
 
-        let toolset = ToolSet::builder().retrieved_tool(RetrievedTool).build();
+        let mut toolset = ToolSet::default();
+        toolset.add_retrieved_tool(RetrievedTool);
 
         let schemas = toolset.schemas().unwrap();
         assert_eq!(schemas.len(), 1);
@@ -1640,7 +1596,8 @@ mod migrated_tests {
     async fn portable_embedding_tool_uses_classic_retrieval_without_schema_drift() {
         let tool = PortableEmbeddingFixture::new("shared");
         let portable_schema = ToolSchema::try_from(&tool).unwrap();
-        let toolset = ToolSet::builder().retrieved_tool(tool).build();
+        let mut toolset = ToolSet::default();
+        toolset.add_retrieved_tool(tool);
 
         let schemas = toolset.schemas().unwrap();
         assert_eq!(schemas.len(), 1);

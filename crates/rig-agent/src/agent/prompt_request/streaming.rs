@@ -1,5 +1,6 @@
 use rig_core::{
     message::{AssistantContent, UserContent},
+    telemetry::SpanCombinator,
     wasm_compat::{WasmBoxedFuture, WasmCompatSend},
 };
 
@@ -51,7 +52,6 @@ pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<MultiTurnStreamItem,
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
-#[non_exhaustive]
 pub enum MultiTurnStreamItem {
     /// A streamed assistant content item — the content the **model emitted**:
     /// text/reasoning deltas, tool-call deltas, and, when the model turn is
@@ -165,6 +165,10 @@ impl MultiTurnStreamItem {
         Self::StreamAssistantItem(item)
     }
 
+    /// Build a `FinalResponse` item from final-turn content, applying the
+    /// run-finalization shaping of `final_response_from_content` (#1928).
+    /// The one public entry point to that shaping, for mocks and adapters
+    /// that synthesize final items outside the drive loop.
     pub fn final_response(
         content: Vec<AssistantContent>,
         aggregated_usage: crate::completion::Usage,
@@ -208,24 +212,6 @@ async fn drain_stream_usage(
     }
 
     Ok(crate::completion::Usage::new())
-}
-
-pub(crate) fn record_usage_on_span(span: &tracing::Span, usage: crate::completion::Usage) {
-    span.record("gen_ai.usage.input_tokens", usage.input_tokens);
-    span.record("gen_ai.usage.output_tokens", usage.output_tokens);
-    span.record(
-        "gen_ai.usage.cache_read.input_tokens",
-        usage.cached_input_tokens,
-    );
-    span.record(
-        "gen_ai.usage.cache_creation.input_tokens",
-        usage.cache_creation_input_tokens,
-    );
-    span.record(
-        "gen_ai.usage.tool_use_prompt_tokens",
-        usage.tool_use_prompt_tokens,
-    );
-    span.record("gen_ai.usage.reasoning_tokens", usage.reasoning_tokens);
 }
 
 /// Build the final streamed content for a finished run (#1928).
@@ -482,7 +468,7 @@ where
         // Run-scoped hook context: minted once, shared by every hook event on
         // both surfaces. `is_streaming` records which surface is driving; the
         // per-turn index is advanced on each `CallModel` step below.
-        let hook_ctx = HookContext::new(is_streaming, runner.agent_name.clone());
+        let hook_ctx = HookContext::new(is_streaming, runner.config.name.clone());
         // Set only after a model turn commits successfully and consumed by its
         // immediately following CallTools step. This keeps the sans-IO run state
         // serializable while pinning execution to the definitions sent that turn.
@@ -493,6 +479,32 @@ where
         // is invoked, so a completion-call stop, selection stop, or preparation
         // failure leaves it unchanged while a provider error still counts.
         let mut previous_model: Option<ModelHandle> = None;
+
+        // Drive one medium-specific step stream: forward its items, and on the
+        // first error store error usage, surface it, and end the run. A macro
+        // because `yield`/`break 'outer` cannot cross a fn boundary; the loop
+        // label is passed in because labels are hygienic across the macro edge.
+        macro_rules! drive_step {
+            ($label:lifetime, $step_stream:expr) => {{
+                let mut step_stream = $step_stream;
+                let mut step_error = None;
+                while let Some(item) = step_stream.next().await {
+                    match item {
+                        Ok(item) => yield Ok(DriveItem::Item(item)),
+                        Err(err) => {
+                            step_error = Some(err);
+                            break;
+                        }
+                    }
+                }
+                drop(step_stream);
+                if let Some(err) = step_error {
+                    store_error_usage(&runner, &run);
+                    yield Err(err);
+                    break $label;
+                }
+            }};
+        }
 
         'outer: loop {
             let step = match run.next_step() {
@@ -507,8 +519,8 @@ where
             match step {
                 AgentRunStep::CallModel { prompt, history, turn } => {
                     drop(pending_tool_snapshot.take());
-                    if runner.max_turns > 1 {
-                        tracing::info!("Current conversation Turns: {}/{}", turn, runner.max_turns);
+                    if runner.config.max_turns > 1 {
+                        tracing::info!("Current conversation Turns: {}/{}", turn, runner.config.max_turns);
                     }
                     hook_ctx.set_turn(turn);
 
@@ -516,7 +528,7 @@ where
                     // model selection entirely, and their merged `RequestPatch`
                     // is handed to the selection hooks below.
                     let request_patch =
-                        match resolve_completion_call(&runner.hooks, &hook_ctx, &prompt, &history, turn).await {
+                        match resolve_completion_call(&runner.config.hooks, &hook_ctx, &prompt, &history, turn).await {
                             CompletionCallOutcome::Terminate(reason) => {
                                 store_error_usage(&runner, &run);
                                 yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
@@ -530,18 +542,18 @@ where
                     // cloned into the prepared attempt, so request preparation
                     // inspects the *selected* model's captured capabilities and
                     // the same handle executes the request.
-                    let selected_model = match runner.hooks.on_model_select(
+                    let selected_model = match runner.config.hooks.on_model_select(
                         &hook_ctx,
                         ModelSelection {
                             prompt: &prompt,
                             history: &history,
                             request_patch: request_patch.as_ref(),
                             previous_model: previous_model.as_ref(),
-                            default_model: &runner.model,
-                            selected_model: &runner.model,
+                            default_model: &runner.config.model,
+                            selected_model: &runner.config.model,
                         },
                     ) {
-                        ModelSelectionAction::Continue => runner.model.clone(),
+                        ModelSelectionAction::Continue => runner.config.model.clone(),
                         ModelSelectionAction::Select(model) => model,
                         ModelSelectionAction::Stop(reason) => {
                             store_error_usage(&runner, &run);
@@ -557,7 +569,7 @@ where
                     let effective_preamble = request_patch
                         .as_ref()
                         .and_then(|o| o.preamble.as_deref())
-                        .or(runner.preamble.as_deref());
+                        .or(runner.config.preamble.as_deref());
 
                     let chat_span = source.open_chat_span(&runner, effective_preamble);
 
@@ -583,7 +595,7 @@ where
                     };
                     run.set_output_tool_name(prepared.output_tool_name.clone());
                     let turn_tool_snapshot = prepared.tool_snapshot.clone();
-                    if runner.record_telemetry_content {
+                    if runner.config.record_telemetry_content {
                         let input_messages = prepared.builder.messages_for_telemetry();
                         rig_core::telemetry::record_model_input(&chat_span, &input_messages, true);
                         prepared.builder = prepared.builder.record_content_telemetry(false);
@@ -597,7 +609,7 @@ where
                     // above left `previous_model` untouched.
                     previous_model = Some(selected_model);
 
-                    let mut turn_stream = source.run_model_turn(
+                    drive_step!('outer, source.run_model_turn(
                         &runner,
                         &hook_ctx,
                         &mut run,
@@ -605,23 +617,7 @@ where
                         chat_span,
                         &agent_span,
                         prompt,
-                    );
-                    let mut turn_error = None;
-                    while let Some(item) = turn_stream.next().await {
-                        match item {
-                            Ok(item) => yield Ok(DriveItem::Item(item)),
-                            Err(err) => {
-                                turn_error = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                    drop(turn_stream);
-                    if let Some(err) = turn_error {
-                        store_error_usage(&runner, &run);
-                        yield Err(err);
-                        break 'outer;
-                    }
+                    ));
                     pending_tool_snapshot = Some(turn_tool_snapshot);
                 }
                 AgentRunStep::CallTools { calls } => {
@@ -633,36 +629,20 @@ where
                         )));
                         break 'outer;
                     };
-                    let mut tool_stream = source.run_tool_calls(
+                    drive_step!('outer, source.run_tool_calls(
                         &runner,
                         &hook_ctx,
                         &mut run,
                         calls,
                         tool_snapshot,
-                    );
-                    let mut tool_error = None;
-                    while let Some(item) = tool_stream.next().await {
-                        match item {
-                            Ok(item) => yield Ok(DriveItem::Item(item)),
-                            Err(err) => {
-                                tool_error = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                    drop(tool_stream);
-                    if let Some(err) = tool_error {
-                        store_error_usage(&runner, &run);
-                        yield Err(err);
-                        break 'outer;
-                    }
+                    ));
                 }
                 AgentRunStep::Done(response) => {
                     // Run-completion marker, unifying the blocking and streaming
                     // drivers' run-finished logs into one shared event.
                     tracing::info!(
                         turn = run.turn(),
-                        max_turns = runner.max_turns,
+                        max_turns = runner.config.max_turns,
                         "Agent run finished"
                     );
                     source.record_run_level_telemetry(&agent_span, &response, created_agent_span);
@@ -795,57 +775,9 @@ where
             (0..call_count).map(|_| None).collect();
         let mut first_error: Option<(usize, PromptError)> = None;
 
-        if runner.concurrency <= 1 {
-            // Sequential: run in call order, fail-fast on the first terminating
-            // error so the remaining tools never start.
-            for (index, call) in prepared.into_iter().enumerate() {
-                let PreparedToolCall { tool_call, preresolved_result, internal_call_id, span } = call;
-                if let Some(result) = preresolved_result {
-                    if let Some(slot) = collected.get_mut(index) {
-                        *slot = Some(CollectedToolResult {
-                            content: result,
-                            internal_call_id,
-                            surface: ToolSurface::Preresolved,
-                            deferred_events: None,
-                        });
-                    }
-                    continue;
-                }
-                let outcome = run_single_tool(
-                    runner,
-                    hook_ctx,
-                    &tool_snapshot,
-                    &tool_call,
-                    &internal_call_id,
-                    &full_history_for_errors,
-                )
-                .instrument(span)
-                .await;
-                match outcome {
-                    Ok(outcome) => {
-                        let surface = match outcome.execution {
-                            ToolCallExecution::Executed(effective) => {
-                                ToolSurface::Executed(effective)
-                            }
-                            ToolCallExecution::Skipped => ToolSurface::Skipped,
-                        };
-                        if let Some(slot) = collected.get_mut(index) {
-                            *slot = Some(CollectedToolResult {
-                                content: outcome.content,
-                                internal_call_id,
-                                surface,
-                                deferred_events: outcome.deferred_events,
-                            });
-                        }
-                    }
-                    Err(err) => {
-                        first_error = Some((index, err));
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Concurrent: bounded by `tool_concurrency`. A shared `terminating`
+        {
+            // Bounded by `tool_concurrency` (`0`/`1` poll strictly in call
+            // order, giving sequential fail-fast). A shared `terminating`
             // flag makes a not-yet-started sibling skip (its side effect never
             // runs) once any sibling terminates — avoiding the Semantic-Kernel
             // fail-open — while already-in-flight siblings are drained so the
@@ -900,7 +832,7 @@ where
                     }
                     .instrument(span)
                 })
-                .buffer_unordered(runner.concurrency);
+                .buffer_unordered(runner.concurrency.max(1));
             futures::pin_mut!(unordered);
 
             while let Some((index, outcome)) = unordered.next().await {
@@ -1099,6 +1031,12 @@ impl TurnSource for StreamingTurnSource {
         current_prompt: Message,
     ) -> DriveStream<'a> {
         Box::pin(async_stream::stream! {
+            // Bound before the builder is consumed, exactly as the blocking
+            // surface does: the cap this attempt was prepared with, patches
+            // included. Both surfaces read it from the same carrier, so they
+            // cannot report different numbers for the same attempt.
+            let attempt_max_tokens = prepared.max_tokens;
+
             let mut stream = match prepared
                 .builder
                 .stream()
@@ -1137,13 +1075,35 @@ impl TurnSource for StreamingTurnSource {
             // the terminal error to surface.
             macro_rules! emit_completion_call {
                 ($usage:expr) => {{
+                    // Same source as identity below: the provider's terminal
+                    // record. A path that never saw one yields `None`, which is
+                    // "the provider reported no reason" — not "the turn stopped
+                    // normally".
+                    let reason = stream
+                        .response
+                        .as_ref()
+                        .and_then(|response| response.finish_reason.clone());
+                    emit_completion_call!($usage, reason)
+                }};
+                ($usage:expr, $finish_reason:expr) => {{
                     let usage = $usage;
                     last_usage = usage;
                     if !completion_call_emitted {
-                        if usage.has_values() {
-                            record_usage_on_span(&chat_span, usage);
-                        }
-                        match run.record_streamed_completion_call(usage) {
+                        chat_span.record_token_usage(&usage);
+                        // The terminal record (when the provider delivered
+                        // one) carries this attempt's identity metadata — and
+                        // its captured raw payload, read from the same
+                        // terminal so the recorded call carries *this*
+                        // attempt's response, never a previous attempt's.
+                        match run.record_streamed_completion_call(
+                            usage,
+                            stream.identity(),
+                            $finish_reason,
+                            stream
+                                .response
+                                .as_ref()
+                                .map_or(serde_json::Value::Null, |response| response.raw.clone()),
+                        ) {
                             Ok(call) => {
                                 completion_call_emitted = true;
                                 Ok(Some(MultiTurnStreamItem::CompletionCall(call)))
@@ -1190,7 +1150,7 @@ impl TurnSource for StreamingTurnSource {
                                     item_slot.as_ref()
                                 && let Some(reason) = observe_action(
                                     runner
-                                        .hooks
+                                        .config.hooks
                                         .on_text_delta(
                                             hook_ctx,
                                             TextDelta {
@@ -1222,7 +1182,7 @@ impl TurnSource for StreamingTurnSource {
                                 };
                                 if let Some(reason) = observe_action(
                                     runner
-                                        .hooks
+                                        .config.hooks
                                         .on_reasoning_delta(
                                             hook_ctx,
                                             ReasoningDelta {
@@ -1255,7 +1215,7 @@ impl TurnSource for StreamingTurnSource {
                                 };
                                 if let Some(reason) = observe_action(
                                     runner
-                                        .hooks
+                                        .config.hooks
                                         .on_tool_call_delta(
                                             hook_ctx,
                                             ToolCallDelta {
@@ -1280,8 +1240,12 @@ impl TurnSource for StreamingTurnSource {
                                 },
                             ));
                         }
-                        StreamedTurnEvent::Completed { usage, emit_final } => {
-                            match emit_completion_call!(usage) {
+                        StreamedTurnEvent::Completed {
+                            usage,
+                            emit_final,
+                            finish_reason,
+                        } => {
+                            match emit_completion_call!(usage, finish_reason) {
                                 Ok(Some(item)) => yield Ok(item),
                                 Ok(None) => {}
                                 Err(err) => {
@@ -1309,7 +1273,7 @@ impl TurnSource for StreamingTurnSource {
                                 let context =
                                     run.streamed_invalid_tool_call_context(&partial, &invalid);
                                 runner
-                                    .hooks
+                                    .config.hooks
                                     .on_invalid_tool_call(hook_ctx, &context)
                                     .await
                                     .unwrap_or_else(InvalidToolCallAction::fail)
@@ -1400,11 +1364,26 @@ impl TurnSource for StreamingTurnSource {
             }
 
             // Final fallback: no usage was ever learned, so there is nothing to
-            // record onto the span and this is the last read of the flag — kept
-            // inline (not `emit_completion_call!`) so it doesn't emit a dead
-            // `completion_call_emitted = true` write.
+            // record onto the span (zero usage is the missing-metrics sentinel)
+            // and this is the last read of the flag — kept inline (not
+            // `emit_completion_call!`) so it doesn't emit a dead
+            // `completion_call_emitted = true` write, which `unused_assignments`
+            // rejects. Identity comes from the same accessor the macro uses, so
+            // `completion_calls` and hook observations agree on this path too.
             if !completion_call_emitted {
-                match run.record_streamed_completion_call(crate::completion::Usage::new()) {
+                let fallback_finish_reason = stream
+                    .response
+                    .as_ref()
+                    .and_then(|response| response.finish_reason.clone());
+                match run.record_streamed_completion_call(
+                    crate::completion::Usage::new(),
+                    stream.identity(),
+                    fallback_finish_reason,
+                    stream
+                        .response
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |response| response.raw.clone()),
+                ) {
                     Ok(call) => yield Ok(MultiTurnStreamItem::CompletionCall(call)),
                     Err(err) => {
                         yield Err(Box::new(err).into());
@@ -1415,11 +1394,27 @@ impl TurnSource for StreamingTurnSource {
 
             let final_turn_content = stream.choice.clone();
             let streamed_turn = assembler.finish(stream.message_id.clone(), &final_turn_content);
+            // This attempt's identity, read from *this* stream's terminal
+            // record (each attempt — including a retry — opens its own
+            // stream, so a previous attempt's ids can never leak in). The
+            // message id prefers the assembled turn's, which folds in an
+            // explicit `MessageId` event; the terminal's ids fill the rest.
+            let identity = rig_core::completion::ResponseIdentity {
+                message_id: streamed_turn.message_id.clone(),
+                ..stream.identity()
+            };
+            // This attempt's raw payload, from the same terminal record as the
+            // identity above — so a retry never observes a previous attempt's
+            // response. `Null` when no terminal record arrived.
+            let attempt_raw = stream
+                .response
+                .as_ref()
+                .map_or(&serde_json::Value::Null, |response| &response.raw);
             if pending_final.is_some()
                 && !turn_recovered
                 && let Some(reason) = observe_action(
                     runner
-                        .hooks
+                        .config.hooks
                         .on_stream_response_finish(
                             hook_ctx,
                             StreamResponseFinish {
@@ -1427,6 +1422,8 @@ impl TurnSource for StreamingTurnSource {
                                 content: &streamed_turn.choice,
                                 usage: last_usage,
                                 message_id: streamed_turn.message_id.as_deref(),
+                                identity: &identity,
+                                raw: attempt_raw,
                             },
                         )
                         .await,
@@ -1443,6 +1440,11 @@ impl TurnSource for StreamingTurnSource {
             // history; the raw `stream.choice` is kept in `last_final_choice` for
             // the raw/final streaming behavior.
             let canonical_choice = streamed_turn.choice.clone();
+            // Captured for the same reason as the choice above: `streamed_turn`
+            // is moved into run state on the next line, and the per-turn hook
+            // fires after that. `FinishReason::Other` carries a `String`, so
+            // this is a clone rather than a copy.
+            let attempt_finish_reason = streamed_turn.finish_reason.clone();
             if let Err(err) = run.streamed_turn(streamed_turn) {
                 yield Err(Box::new(err).into());
                 return;
@@ -1454,13 +1456,17 @@ impl TurnSource for StreamingTurnSource {
             // `Continue` arm.
             if !turn_recovered {
                 let action = runner
-                    .hooks
+                    .config.hooks
                     .on_model_turn_finished(
                         hook_ctx,
                         ModelTurnFinished {
                             turn: hook_ctx.turn(),
                             content: &canonical_choice,
                             usage: last_usage,
+                            identity: &identity,
+                            finish_reason: attempt_finish_reason.as_ref(),
+                            max_tokens: attempt_max_tokens,
+                            raw: attempt_raw,
                         },
                     )
                     .await;
@@ -1482,7 +1488,7 @@ impl TurnSource for StreamingTurnSource {
                             agent_span,
                             &chat_span,
                             &canonical_choice,
-                            runner.record_telemetry_content,
+                            runner.config.record_telemetry_content,
                         );
                         if let Some(item) = pending_final.take() {
                             yield Ok(MultiTurnStreamItem::stream_item(item));
@@ -1503,7 +1509,7 @@ impl TurnSource for StreamingTurnSource {
                 agent_span,
                 &chat_span,
                 &canonical_choice,
-                runner.record_telemetry_content,
+                runner.config.record_telemetry_content,
             );
 
             if let Some(item) = pending_final {
@@ -1541,7 +1547,7 @@ impl TurnSource for StreamingTurnSource {
         created_agent_span: bool,
     ) {
         if created_agent_span {
-            record_usage_on_span(agent_span, response.usage);
+            agent_span.record_token_usage(&response.usage);
         }
     }
 
@@ -1599,10 +1605,10 @@ impl AgentRunner {
 
         let run = self.build_run(history_override);
         let source = StreamingTurnSource::new(
-            &self.hooks,
+            &self.config.hooks,
             self.agent_name_or_default().to_string(),
             created_agent_span,
-            self.record_telemetry_content,
+            self.config.record_telemetry_content,
         );
 
         // The blocking surface folds this same engine; the streaming surface
@@ -1698,12 +1704,14 @@ mod migrated_tests {
     use crate::agent::hook::{AgentHook, HookContext};
     use crate::agent::prompt_request::{TOOL_NOT_EXECUTED_DUE_TO_INVALID_PEER, tool_result_output};
     use crate::client::AgentClientExt;
-    use crate::completion::{CompletionRequest, Prompt, PromptError, ToolDefinition, Usage};
+    use crate::completion::{
+        CompletionRequest, FinishReason, Prompt, PromptError, ToolDefinition, Usage,
+    };
     use crate::streaming::{StreamingPrompt, ToolCallDeltaContent};
     use crate::test_utils::{
         AppendFailingMemory, FailingMemory, MockAddTool, MockBarrierTool, MockCompletionModel,
         MockContextProbeTool, MockStreamEvent, MockSubtractTool, MockToolError, MockTurn,
-        SessionId,
+        SessionId, mock_final,
     };
     use crate::tool::{Tool, ToolContext};
     use futures::{StreamExt, TryStreamExt};
@@ -1770,20 +1778,32 @@ mod migrated_tests {
 
         let mut stream = StreamingPromptRequest::new(agent, "go").await;
         let mut saw_error = false;
+        let mut saw_completion_call = false;
         while let Some(item) = stream.next().await {
-            if let Err(error) = item {
-                assert!(
-                    error.to_string().contains("terminal record"),
-                    "truncation should surface as a terminal-record error, got: {error}"
-                );
-                saw_error = true;
-                break;
+            match item {
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("terminal record"),
+                        "truncation should surface as a terminal-record error, got: {error}"
+                    );
+                    saw_error = true;
+                    break;
+                }
+                Ok(MultiTurnStreamItem::CompletionCall(_)) => saw_completion_call = true,
+                Ok(_) => {}
             }
         }
         assert!(
             saw_error,
             "a stream ending without a terminal record must be rejected, not \
              treated as a successful completion"
+        );
+        // The rejection happens before any usage fallback records the call, so
+        // the runner never produces a `CompletionCall` whose `raw` is `Null`:
+        // a `Null` payload can only come from a hand-driven `AgentRun`.
+        assert!(
+            !saw_completion_call,
+            "no completion call may be recorded for a truncated stream"
         );
     }
 
@@ -2258,6 +2278,17 @@ mod migrated_tests {
         ])
     }
 
+    /// The record a streamed mock turn scripted with
+    /// `MockStreamEvent::final_response(usage)` leaves on `completion_calls`:
+    /// index, usage, and the mock's terminal record serialized onto `raw` —
+    /// the terminal is always captured, so an expected call without it never
+    /// matches.
+    fn streamed_call(call_index: usize, usage: Usage) -> CompletionCall {
+        let terminal = mock_final(usage);
+        CompletionCall::new(call_index, usage)
+            .with_raw(serde_json::to_value(&terminal).expect("mock terminal serializes"))
+    }
+
     fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
         Usage {
             input_tokens,
@@ -2508,8 +2539,10 @@ mod migrated_tests {
         max_turns: usize,
         expected_usages: &[Usage],
     ) {
-        // Scoped-subscriber tests must not run concurrently; the warm-up
-        // below explains the callsite-interest hazard this guards against.
+        // Scoped-subscriber tests must not run concurrently; the warm-up below
+        // explains the callsite-interest hazard this guards against. The
+        // guard's own docs carry that recipe plus the rule it cannot enforce:
+        // an absence assertion needs a positive anchor, or it passes vacuously.
         let _isolation = crate::test_utils::scoped_tracing_subscriber_guard().await;
         let spans = CapturedSpans::default();
         let subscriber = Registry::default().with(SpanCaptureLayer {
@@ -4225,8 +4258,8 @@ mod migrated_tests {
         let mut second_usage = Usage::new();
         second_usage.total_tokens = 6;
         let expected_completion_calls = vec![
-            CompletionCall::new(0, first_usage),
-            CompletionCall::new(1, second_usage),
+            streamed_call(0, first_usage),
+            streamed_call(1, second_usage),
         ];
         assert_eq!(completion_call_events, expected_completion_calls);
         assert_eq!(final_completion_calls, expected_completion_calls);
@@ -4639,8 +4672,8 @@ mod migrated_tests {
         let mut second_usage = Usage::new();
         second_usage.total_tokens = 6;
         let expected_completion_calls = vec![
-            CompletionCall::new(0, first_usage),
-            CompletionCall::new(1, second_usage),
+            streamed_call(0, first_usage),
+            streamed_call(1, second_usage),
         ];
         assert_eq!(completion_call_events, expected_completion_calls);
         assert_eq!(final_completion_calls, expected_completion_calls);
@@ -6393,8 +6426,8 @@ mod migrated_tests {
         assert_eq!(
             completion_calls_events,
             vec![
-                CompletionCall::new(0, first_call_usage),
-                CompletionCall::new(1, second_call_usage)
+                streamed_call(0, first_call_usage),
+                streamed_call(1, second_call_usage)
             ]
         );
 
@@ -6414,8 +6447,8 @@ mod migrated_tests {
         assert_eq!(
             final_response.completion_calls(),
             &[
-                CompletionCall::new(0, first_call_usage),
-                CompletionCall::new(1, second_call_usage)
+                streamed_call(0, first_call_usage),
+                streamed_call(1, second_call_usage)
             ]
         );
     }
@@ -6494,7 +6527,7 @@ mod migrated_tests {
             }
         }
 
-        assert_eq!(completion_calls, vec![CompletionCall::new(0, call_usage)]);
+        assert_eq!(completion_calls, vec![streamed_call(0, call_usage)]);
         assert!(saw_error);
     }
 
@@ -6545,8 +6578,8 @@ mod migrated_tests {
         }
 
         let expected_usage = vec![
-            CompletionCall::new(0, Usage::new()),
-            CompletionCall::new(1, second_call_usage),
+            streamed_call(0, Usage::new()),
+            streamed_call(1, second_call_usage),
         ];
         assert_eq!(completion_calls_events, expected_usage);
 
@@ -6712,6 +6745,388 @@ mod migrated_tests {
 
         assert!(streamed_text.is_empty());
         assert_eq!(final_response_text.as_deref(), Some(""));
+    }
+
+    /// rig#2322 — a turn that produced **nothing** and was cut short at the
+    /// output-token limit must not finalize as a successful empty answer.
+    ///
+    /// Not a cassette test: a provider cannot be made to emit an exactly-empty
+    /// `MAX_TOKENS` turn on demand, so the wire shape is scripted. The Gemini
+    /// cassette suite pins the *request* side of rig#2322; this pins what the
+    /// agent does with the response.
+    ///
+    /// This is the failure users actually saw. The 4096 cap truncated the turn,
+    /// the assembler dropped `FinishReason::Length`, and the run finished as a
+    /// successful `""` — a blank answer with no error and nothing to inspect.
+    #[tokio::test]
+    async fn empty_turn_truncated_at_max_tokens_is_an_error_not_an_empty_answer() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::FinalResponse(
+            mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("write a long essay").await;
+        let mut error = None;
+        let mut final_response_text = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    final_response_text = Some(res.output().to_owned());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            final_response_text.is_none(),
+            "a truncated, content-less turn must not finalize as a successful \
+             answer — it did, yielding {final_response_text:?}"
+        );
+        let error = error.expect("the truncated turn should surface an error");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("Length"),
+            "the error must name the terminal reason so the cause is diagnosable, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("max_tokens"),
+            "a budget truncation must point at the setting that fixes it: {rendered}"
+        );
+    }
+
+    /// rig#2322 — the guard against over-correcting the test above: a turn that
+    /// streamed **real output** before hitting the limit stays valid.
+    ///
+    /// Truncation after partial output is a normal, useful result — the caller
+    /// gets the prefix the model produced. Only a turn that delivered nothing
+    /// is an error. Scripted for the same reason as above.
+    #[tokio::test]
+    async fn partial_output_truncated_at_max_tokens_stays_a_valid_answer() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::Text("a partial ans".to_string()),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("write a long essay").await;
+        let mut final_response = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    final_response = Some(res);
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("a truncated turn that produced text must not error: {err:?}"),
+            }
+        }
+
+        let final_response =
+            final_response.expect("a turn with partial output should still finalize");
+        assert_eq!(final_response.output(), "a partial ans");
+
+        // ...and the reason is preserved, so a caller can tell this answer was
+        // cut short rather than complete.
+        let truncated = final_response
+            .completion_calls
+            .iter()
+            .any(|call| call.finish_reason == Some(FinishReason::Length));
+        assert!(
+            truncated,
+            "the terminal reason must reach the caller on completion_calls; \
+             without it a truncated answer is indistinguishable from a complete \
+             one — calls: {:?}",
+            final_response.completion_calls
+        );
+    }
+
+    /// rig#2322 — a content-filtered turn that delivered nothing gets the same
+    /// treatment as a truncated one: it is not a successful empty answer.
+    ///
+    /// Scripted rather than recorded because a safety filter cannot be
+    /// provoked reliably or ethically on demand.
+    #[tokio::test]
+    async fn empty_content_filtered_turn_is_an_error_not_an_empty_answer() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::FinalResponse(
+            mock_final(Usage::new()).with_finish_reason(FinishReason::ContentFilter),
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("something the filter rejects").await;
+        let mut errored = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => panic!(
+                    "a content-filtered, content-less turn must not finalize as a \
+                     successful answer, got {:?}",
+                    res.output()
+                ),
+                Ok(_) => {}
+                Err(err) => {
+                    errored = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let rendered = format!("{:?}", errored.expect("the filtered turn should error"));
+        assert!(
+            rendered.contains("ContentFilter"),
+            "the error must name the terminal reason, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("max_tokens"),
+            "a safety block must not advise raising max_tokens — that setting \
+             cannot fix a filtered response: {rendered}"
+        );
+    }
+
+    /// rig#2322 — the narrowing that keeps the rule from failing benign runs:
+    /// a provider-specific `Other` reason is **not** treated as truncation.
+    ///
+    /// `Other` carries a provider's own wire spelling with no normalized
+    /// meaning, so erroring on it would fail runs on stops rig does not model.
+    #[tokio::test]
+    async fn empty_turn_with_unmodeled_finish_reason_still_finalizes() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::FinalResponse(
+            mock_final(Usage::new())
+                .with_finish_reason(FinishReason::Other("PROVIDER_SPECIFIC".to_string())),
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("say nothing").await;
+        let mut final_response_text = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    final_response_text = Some(res.output().to_owned());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("an unmodeled finish reason must not error: {err:?}"),
+            }
+        }
+
+        assert_eq!(final_response_text.as_deref(), Some(""));
+    }
+
+    /// rig#2322 — a turn that spent its whole budget **thinking** and was cut
+    /// off before answering must error, not report success with `""`.
+    ///
+    /// This is the common shape of the bug, not a corner of it: Gemini counts
+    /// thinking tokens against `maxOutputTokens` (the committed cassettes show
+    /// `thoughtsTokenCount` of 176–307 on ordinary prompts), so a truncated
+    /// thinking turn *typically* carries reasoning and no text.
+    ///
+    /// The first version of this guard keyed on `is_empty_assistant_turn`,
+    /// which is false for a reasoning-only turn — so the headline scenario
+    /// still finalized as a successful empty answer. The predicate is now
+    /// `turn_delivered_no_answer`.
+    ///
+    /// Synthetic: a provider cannot be made to truncate mid-thought on demand.
+    #[tokio::test]
+    async fn reasoning_only_turn_truncated_at_max_tokens_is_an_error() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning("thinking hard and never reaching an answer"),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("solve this carefully").await;
+        let mut error = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => panic!(
+                    "a turn that only produced reasoning before being truncated must \
+                     not finalize as a successful answer, got {:?}",
+                    res.output()
+                ),
+                Ok(_) => {}
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let rendered = format!("{:?}", error.expect("the truncated turn should error"));
+        assert!(
+            rendered.contains("Length"),
+            "the error must name the terminal reason, got: {rendered}"
+        );
+    }
+
+    /// rig#2322 — the same shape under a content filter takes the same path.
+    ///
+    /// Synthetic for the same reason, plus: a safety filter cannot be provoked
+    /// reliably or ethically on demand.
+    #[tokio::test]
+    async fn reasoning_only_turn_content_filtered_is_an_error() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning("considering something the filter rejects"),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::ContentFilter),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("something borderline").await;
+        let mut errored = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => panic!(
+                    "a reasoning-only filtered turn must not finalize successfully, \
+                     got {:?}",
+                    res.output()
+                ),
+                Ok(_) => {}
+                Err(err) => {
+                    errored = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let rendered = format!(
+            "{:?}",
+            errored.expect("the filtered reasoning-only turn should error")
+        );
+        assert!(
+            rendered.contains("ContentFilter") && !rendered.contains("max_tokens"),
+            "a filtered turn must name its reason and must not advise raising \
+             max_tokens: {rendered}"
+        );
+    }
+
+    /// rig#2322 — the guard against over-correcting into "reasoning present
+    /// means failure": a turn that thought **and then answered** before being
+    /// truncated is a valid answer.
+    ///
+    /// Synthetic: same reason as above.
+    #[tokio::test]
+    async fn reasoning_then_text_truncated_stays_a_valid_answer() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning("weighing the options"),
+            MockStreamEvent::Text("the answer so f".to_string()),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("solve this").await;
+        let mut final_response = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    final_response = Some(res);
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("a truncated turn that produced text must not error: {err:?}"),
+            }
+        }
+
+        let final_response = final_response.expect("a turn with text should finalize");
+        assert_eq!(final_response.output(), "the answer so f");
+        assert!(
+            final_response
+                .completion_calls
+                .iter()
+                .any(|call| call.finish_reason == Some(FinishReason::Length)),
+            "the terminal reason must still reach the caller on a valid truncated turn"
+        );
+    }
+
+    /// rig#2322 — a model that thought and legitimately had nothing to add is
+    /// not an error. Only a *truncating* reason makes a reasoning-only turn a
+    /// failure; a natural stop leaves it exactly as it was.
+    ///
+    /// Synthetic: same reason as above.
+    #[tokio::test]
+    async fn reasoning_only_turn_that_stopped_naturally_still_finalizes() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning("thought about it, nothing to add"),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::Stop),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("say nothing").await;
+        let mut final_response_text = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    final_response_text = Some(res.output().to_owned());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("a naturally-stopped reasoning turn must not error: {err:?}"),
+            }
+        }
+
+        assert_eq!(final_response_text.as_deref(), Some(""));
+    }
+
+    /// rig#2322 — what happens to the partial reasoning when the turn errors.
+    ///
+    /// A caller debugging a truncated thinking turn wants to see how far the
+    /// model got, so the reasoning must not vanish: the history push runs on
+    /// `is_empty_assistant_turn` (false for a reasoning-only turn) *before* the
+    /// truncation guard, so the turn is recorded and then the error is raised.
+    /// This pins that ordering — swapping the two would trade one invisible
+    /// failure for another.
+    #[tokio::test]
+    async fn reasoning_survives_into_history_when_the_truncated_turn_errors() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning("partial thinking worth keeping"),
+            MockStreamEvent::FinalResponse(
+                mock_final(Usage::new()).with_finish_reason(FinishReason::Length),
+            ),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent.stream_prompt("solve this").await;
+        let mut streamed_reasoning = String::new();
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning { reasoning, .. },
+                )) => {
+                    streamed_reasoning.push_str(&reasoning.display_text());
+                }
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                    panic!("the truncated reasoning-only turn should error")
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            streamed_reasoning.contains("partial thinking worth keeping"),
+            "the partial reasoning must reach the consumer before the error, so a \
+             truncated thinking turn is debuggable — got {streamed_reasoning:?}"
+        );
     }
 
     /// Background task that logs periodically to detect span leakage.

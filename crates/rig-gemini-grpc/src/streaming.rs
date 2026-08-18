@@ -3,43 +3,60 @@
 // ================================================================
 
 use async_stream::stream;
-use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::{Map, Value};
 
 use rig_core::completion::{CompletionError, CompletionRequest};
-use rig_core::providers::internal::adapter::{AdapterOutput, WireAdapter, run_wire_stream};
+use rig_core::providers::internal::adapter::{
+    AdapterOutput, WireAdapter, run_wire_stream, warn_unmodeled,
+};
+use rig_core::providers::internal::chunk_lifecycle::{ChunkParts, MintedReasoningLifecycle};
 use rig_core::providers::internal::wire::{self, TypedEvent, WireEvent};
 use rig_core::streaming;
 use rig_core::wasm_compat::WasmCompatSend;
 
 use super::Client;
 use super::GenerateContentResponse;
+use super::completion::{encode_optional_base64 as encode_signature, prost_struct_to_json};
 use super::proto;
 
 pub type StreamingCompletionResponse = GenerateContentResponse;
 
 /// The Gemini gRPC typed wire as a [`WireAdapter`]: the chunk carrying a
-/// finish reason is the terminal, and the only per-stream state is the open
-/// thinking block's accumulated text (for signed restatement).
-#[derive(Default)]
+/// finish reason is the terminal, and the per-stream state is the thought
+/// block's lifecycle plus the tool-key minter.
 struct GrpcAdapter {
-    /// Thought text since the last boundary (signed emission, visible text,
-    /// or tool call). The grammar requires a full `Reasoning` block to be
-    /// the block's *completed* form, but Gemini attaches
-    /// `thought_signature` to a single part — so the adapter restates the
-    /// accumulated text, mirroring the REST wire's `thoughtSignature`
-    /// handling. Reset on non-thought output to mirror the accumulator's
-    /// minted-id boundary.
-    /// Whether a thought block is open — the one bit needed to synthesize
-    /// the lifecycle ends this wire never announces.
-    reasoning_open: bool,
+    /// Owns the constant-key thought lifecycle. Thought parts carry no wire id
+    /// and this wire announces no block boundaries, so the shared derivation
+    /// emits the signed close and the synthesized boundary end — the same
+    /// helper the REST wire uses, so both Gemini surfaces agree.
+    reasoning: MintedReasoningLifecycle,
+    /// Per-stream minter for id-less tool-call keys — a fresh key per call, so
+    /// two id-less calls in one turn never collide on one identity.
+    tool_ids: streaming::SyntheticIds,
     /// A tool-protocol finish reason ended the turn; later frames are dead —
     /// the provider aborted, and interpreting more output (or a terminal)
     /// would dress the failure up as a completed turn. Mirrors the REST
     /// adapter's identically named latch.
     failed: bool,
 }
+
+impl Default for GrpcAdapter {
+    fn default() -> Self {
+        Self {
+            reasoning: MintedReasoningLifecycle::new(REASONING_ID),
+            tool_ids: streaming::SyntheticIds::tool(),
+            failed: false,
+        }
+    }
+}
+
+/// Gemini thought parts carry no id or block boundaries; a per-stream constant
+/// minted identity keeps every thought delta merging into one item, and the
+/// core accumulator's minted-id boundary splits items around other output.
+/// Minted, so it can never reach a request.
+const REASONING_ID: streaming::StreamPartId =
+    streaming::StreamPartId::minted(streaming::MintKind::Reasoning, 0);
 
 impl WireAdapter for GrpcAdapter {
     type Frame = proto::GenerateContentResponse;
@@ -82,126 +99,8 @@ impl WireAdapter for GrpcAdapter {
 
             if let Some(content) = candidate.content.as_ref() {
                 for part in &content.parts {
-                    match &part.data {
-                        Some(proto::part::Data::Text(text)) => {
-                            const REASONING_ID: rig_core::streaming::StreamPartId =
-                                rig_core::streaming::StreamPartId::minted(
-                                    rig_core::streaming::MintKind::Reasoning,
-                                    0,
-                                );
-                            if part.thought {
-                                if !text.is_empty() {
-                                    self.reasoning_open = true;
-                                    out.push(Ok(streaming::RawStreamingChoice::ReasoningDelta {
-                                        // Thought parts carry no wire id or
-                                        // block boundaries; a per-stream
-                                        // constant minted key merges them
-                                        // into one part.
-                                        id: REASONING_ID,
-                                        provider_id: None,
-                                        reasoning: text.clone(),
-                                    }));
-                                }
-                                if let Some(signature) = encode_signature(&part.thought_signature) {
-                                    // The signature closes the thinking
-                                    // block; the shared accumulator signs
-                                    // the accumulated deltas (same base64
-                                    // encoding as the unary path).
-                                    self.reasoning_open = false;
-                                    out.push(Ok(streaming::RawStreamingChoice::ReasoningEnd {
-                                        id: REASONING_ID,
-                                        reasoning: None,
-                                        signature: Some(signature),
-                                        wire_sent: false,
-                                    }));
-                                }
-                            } else {
-                                // A trailing non-thought part can carry the
-                                // signature of the already-closed thought
-                                // block: one lifecycle end signs the right
-                                // part in every case (#2258 B4).
-                                if let Some(signature) = encode_signature(&part.thought_signature) {
-                                    self.reasoning_open = false;
-                                    out.push(Ok(streaming::RawStreamingChoice::ReasoningEnd {
-                                        id: REASONING_ID,
-                                        reasoning: None,
-                                        signature: Some(signature),
-                                        wire_sent: false,
-                                    }));
-                                }
-                                if !text.is_empty() {
-                                    // Interleaving output ends an open
-                                    // thought block — the boundary this wire
-                                    // never announces, synthesized here.
-                                    if self.reasoning_open {
-                                        self.reasoning_open = false;
-                                        out.push(Ok(streaming::RawStreamingChoice::ReasoningEnd {
-                                            id: REASONING_ID,
-                                            reasoning: None,
-                                            signature: None,
-                                            wire_sent: false,
-                                        }));
-                                    }
-                                    out.push(Ok(streaming::RawStreamingChoice::Message(
-                                        text.clone(),
-                                    )));
-                                }
-                            }
-                        }
-                        Some(proto::part::Data::FunctionCall(function_call)) => {
-                            // Interleaving output ends an open thought block.
-                            if self.reasoning_open {
-                                self.reasoning_open = false;
-                                out.push(Ok(streaming::RawStreamingChoice::ReasoningEnd {
-                                    id: rig_core::streaming::StreamPartId::minted(
-                                        rig_core::streaming::MintKind::Reasoning,
-                                        0,
-                                    ),
-                                    reasoning: None,
-                                    signature: None,
-                                    wire_sent: false,
-                                }));
-                            }
-                            let args_json = function_call
-                                .args
-                                .as_ref()
-                                .map(prost_struct_to_json)
-                                .unwrap_or_else(|| Value::Object(Map::new()));
-
-                            // The wire's id when present; never the tool
-                            // name — a name-as-id would collide two calls to
-                            // the same tool in one turn. An id-less call
-                            // keys the stream by a minted identity and its
-                            // durable id stays absent.
-                            let tool_id = if function_call.id.is_empty() {
-                                rig_core::streaming::MintKind::Tool.for_wire_index(0)
-                            } else {
-                                rig_core::streaming::StreamPartId::wire(function_call.id.clone())
-                            };
-
-                            // Gemini is a single-identifier wire: the id
-                            // above travels as the part identity (`tool_id`)
-                            // and `call_id` stays unset — setting both from
-                            // one id would take the dual-wire arm downstream
-                            // and fabricate an item id the wire never issued.
-                            let tool_call = streaming::RawStreamingToolCall::new(
-                                tool_id,
-                                function_call.name.clone(),
-                                args_json,
-                            )
-                            .with_signature(encode_signature(&part.thought_signature));
-
-                            out.push(Ok(streaming::RawStreamingChoice::ToolCall(tool_call)));
-                        }
-                        None => {
-                            // A oneof decoding to `None` is prost's
-                            // unknown-variant signal: a part kind this client
-                            // does not model. Warn-and-skip, mirroring the
-                            // driver's `Unknown` policy at part granularity.
-                            tracing::warn!("skipping unrecognized gRPC content part");
-                        }
-                        Some(_) => {}
-                    }
+                    let parts = self.interpret_part(part);
+                    self.reasoning.emit_chunk(parts, out);
                 }
             }
         }
@@ -226,6 +125,77 @@ impl WireAdapter for GrpcAdapter {
         // `failed`, so the driver must stop reading rather than drain the
         // rest of the transport.
         self.failed
+    }
+}
+
+impl GrpcAdapter {
+    /// Declare what one protobuf part carried; the shared lifecycle derives
+    /// the event sequence, so this adapter holds no boundary bookkeeping of
+    /// its own (the REST wire's `interpret_part` has the same shape).
+    fn interpret_part(&mut self, part: &proto::Part) -> ChunkParts<StreamingCompletionResponse> {
+        match &part.data {
+            // A thought part's signature closes the thinking block: the shared
+            // accumulator signs the accumulated deltas, using the same base64
+            // encoding as the unary path.
+            Some(proto::part::Data::Text(text)) if part.thought => ChunkParts {
+                reasoning: Some(text.clone()),
+                reasoning_signature: encode_signature(&part.thought_signature),
+                ..ChunkParts::default()
+            },
+            // A trailing non-thought part can carry the signature of the
+            // already-closed thought block, and one lifecycle end signs the
+            // right part in every case (#2258 B4); the text after it closes a
+            // still-open block through the derived boundary end.
+            Some(proto::part::Data::Text(text)) => ChunkParts {
+                reasoning_signature: encode_signature(&part.thought_signature),
+                text: Some(text.clone()),
+                ..ChunkParts::default()
+            },
+            Some(proto::part::Data::FunctionCall(function_call)) => {
+                let args_json = function_call
+                    .args
+                    .as_ref()
+                    .map(prost_struct_to_json)
+                    .unwrap_or_else(|| Value::Object(Map::new()));
+
+                // The wire's id when present; never the tool name — a
+                // name-as-id would collide two calls to the same tool in one
+                // turn. An id-less call keys the stream by a minted identity,
+                // counted up per stream so two id-less calls stay distinct,
+                // and its durable id stays absent.
+                let key = match streaming::WireId::new(function_call.id.clone()) {
+                    Some(wire_id) => streaming::StreamPartId::wire(wire_id.into_string()),
+                    None => self.tool_ids.mint(),
+                };
+
+                // Gemini is a single-identifier wire: the id above travels as
+                // the part identity and `call_id` stays unset — setting both
+                // from one id would take the dual-wire arm downstream and
+                // fabricate an item id the wire never issued.
+                let tool_call = streaming::RawStreamingToolCall::new(
+                    key,
+                    function_call.name.clone(),
+                    args_json,
+                )
+                // A signature on a function-call part belongs to the
+                // call, not to the thought block.
+                .with_signature(encode_signature(&part.thought_signature));
+
+                ChunkParts {
+                    tool_events: vec![streaming::RawStreamingChoice::ToolCall(tool_call)],
+                    ..ChunkParts::default()
+                }
+            }
+            None => {
+                // A oneof decoding to `None` is prost's unknown-variant
+                // signal: a part kind this client does not model. Warn-and-skip
+                // through the shared redaction policy, mirroring the driver's
+                // `Unknown` policy at part granularity.
+                warn_unmodeled("gemini_grpc_part", part);
+                ChunkParts::default()
+            }
+            Some(_) => ChunkParts::default(),
+        }
     }
 }
 
@@ -304,19 +274,7 @@ fn normalize_grpc_stream(
     raw: streaming::RawStreamingResult<StreamingCompletionResponse>,
 ) -> streaming::StreamingResult {
     streaming::normalize_stream(raw, |response| {
-        let usage = response
-            .usage_metadata
-            .as_ref()
-            .map(|usage| rig_core::completion::Usage {
-                input_tokens: usage.prompt_token_count as u64,
-                output_tokens: usage.candidates_token_count as u64,
-                total_tokens: usage.total_token_count as u64,
-                cached_input_tokens: usage.cached_content_token_count as u64,
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
-            .unwrap_or_default();
+        let usage = super::completion::map_usage(response.usage_metadata.as_ref());
         let finish_reason = response
             .candidates
             .first()
@@ -335,41 +293,11 @@ fn normalize_grpc_stream(
     })
 }
 
-fn encode_signature(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        None
-    } else {
-        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-    }
-}
-
-fn prost_struct_to_json(st: &proto::Struct) -> Value {
-    let mut out = Map::with_capacity(st.fields.len());
-    for (k, v) in &st.fields {
-        out.insert(k.clone(), prost_value_to_json(v));
-    }
-    Value::Object(out)
-}
-
-fn prost_value_to_json(v: &proto::Value) -> Value {
-    match &v.kind {
-        None | Some(proto::value::Kind::NullValue(_)) => Value::Null,
-        Some(proto::value::Kind::BoolValue(b)) => Value::Bool(*b),
-        Some(proto::value::Kind::NumberValue(n)) => serde_json::Number::from_f64(*n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        Some(proto::value::Kind::StringValue(s)) => Value::String(s.clone()),
-        Some(proto::value::Kind::StructValue(st)) => prost_struct_to_json(st),
-        Some(proto::value::Kind::ListValue(list)) => {
-            Value::Array(list.values.iter().map(prost_value_to_json).collect())
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use rig_core::message::{Reasoning, ReasoningContent};
     use rig_core::streaming::StreamedAssistantContent;
 
@@ -488,6 +416,58 @@ mod tests {
                 text: String::new(),
                 signature: Some(base64::engine::general_purpose::STANDARD.encode(signature_bytes)),
             }]
+        );
+    }
+
+    fn function_call_part(name: &str, id: &str) -> proto::Part {
+        proto::Part {
+            data: Some(proto::part::Data::FunctionCall(proto::FunctionCall {
+                name: name.to_string(),
+                args: None,
+                id: id.to_string(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    // Two id-less calls to the same tool in one turn are two distinct calls,
+    // correlated by order rather than by the tool name.
+    //
+    // That is all this pins. The per-stream minter also gives each call its own
+    // stream key now, where the fixed `Tool.for_wire_index(0)` key gave both the
+    // same one — but no assertion here can tell the two apart: a whole tool call
+    // is emitted immediately with a freshly generated `internal_call_id`, so the
+    // shared key never collided anything downstream. It was a latent identity
+    // bug, not an observable one, and pinning it would mean asserting on
+    // internal keys.
+    #[tokio::test]
+    async fn two_id_less_function_calls_stay_distinct() {
+        let events = vec![response(
+            vec![
+                function_call_part("get_weather", ""),
+                function_call_part("get_weather", ""),
+            ],
+            proto::candidate::FinishReason::Stop as i32,
+        )];
+
+        let mut stream = stream_from_events(futures::stream::iter(events.into_iter().map(Ok)));
+        let mut correlators = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::ToolCall {
+                tool_call,
+                internal_call_id,
+            } = item.expect("stream item should be ok")
+            {
+                assert_eq!(tool_call.function.name, "get_weather");
+                correlators.push(internal_call_id);
+            }
+        }
+
+        assert_eq!(correlators.len(), 2, "correlators: {correlators:?}");
+        assert_ne!(
+            correlators.first(),
+            correlators.last(),
+            "each call needs its own correlator"
         );
     }
 
@@ -651,5 +631,138 @@ mod tests {
 
         assert_eq!(err.provider_response_body(), Some(expected.as_str()));
         assert_eq!(err.provider_response_status(), None);
+    }
+
+    fn text_part(text: &str) -> proto::Part {
+        proto::Part {
+            data: Some(proto::part::Data::Text(text.to_string())),
+            ..Default::default()
+        }
+    }
+
+    /// The terminal frame of a stream: the last `GenerateContentResponse`,
+    /// carrying usage, a finish reason and the response id, so the stream
+    /// ends with a fully populated terminal record.
+    fn terminal_frame() -> proto::GenerateContentResponse {
+        proto::GenerateContentResponse {
+            candidates: vec![proto::Candidate {
+                content: Some(proto::Content {
+                    parts: vec![proto::Part {
+                        data: Some(proto::part::Data::Text("!".to_string())),
+                        ..Default::default()
+                    }],
+                    role: "model".to_string(),
+                }),
+                finish_reason: proto::candidate::FinishReason::Stop as i32,
+                ..Default::default()
+            }],
+            usage_metadata: Some(proto::UsageMetadata {
+                prompt_token_count: 3,
+                candidates_token_count: 2,
+                total_token_count: 5,
+                cached_content_token_count: 0,
+            }),
+            model_version: "gemini-2.5-flash".to_string(),
+            response_id: "resp-grpc-stream".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Drive protobuf events through the pipeline the `CompletionModel` seam
+    /// uses, returning the terminal record.
+    async fn normalized_terminal(
+        events: Vec<proto::GenerateContentResponse>,
+    ) -> streaming::StreamFinal {
+        let raw = run_wire_stream(
+            futures::stream::iter(events.into_iter().map(Ok)),
+            GrpcAdapter::default(),
+        );
+        collect_terminal(normalize_grpc_stream(Box::pin(raw))).await
+    }
+
+    async fn collect_terminal(normalized: streaming::StreamingResult) -> streaming::StreamFinal {
+        let mut stream = streaming::StreamingCompletionResponse::stream(
+            super::super::completion::PROVIDER_NAME,
+            normalized,
+        );
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+        }
+        stream
+            .response
+            .expect("the stream must end with a terminal record")
+    }
+
+    /// The events-first seam captures like the request-driven one: its
+    /// terminal `raw` is the same terminal `GenerateContentResponse` the
+    /// model's `stream()` would attach, because both funnel through
+    /// `normalize_grpc_stream`.
+    #[tokio::test]
+    async fn stream_from_events_terminal_carries_raw() {
+        let mut stream = stream_from_events(futures::stream::iter(
+            vec![response(vec![text_part("hi")], 0), terminal_frame()]
+                .into_iter()
+                .map(Ok),
+        ));
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+        }
+        let terminal = stream.response.expect("terminal record");
+
+        let raw = &terminal.raw;
+        let typed: proto::GenerateContentResponse =
+            serde_json::from_value(raw.clone()).expect("raw must deserialize");
+        assert_eq!(typed, terminal_frame());
+        assert_eq!(terminal.usage.total_tokens, 5);
+    }
+
+    /// The load-bearing streaming capture property at the seam
+    /// `CompletionModel::stream` routes through: the terminal's `raw` is
+    /// Gemini's own terminal `GenerateContentResponse` — it deserializes back
+    /// into that prost message and re-serializes identically — and
+    /// re-normalizing that capture reproduces every normalized field. The
+    /// raw `finish_reason` number and the last frame's text are only readable
+    /// off the capture.
+    #[tokio::test]
+    async fn terminal_raw_round_trips_into_the_terminal_type() {
+        let terminal =
+            normalized_terminal(vec![response(vec![text_part("hi")], 0), terminal_frame()]).await;
+
+        let raw = &terminal.raw;
+        let typed: proto::GenerateContentResponse =
+            serde_json::from_value(raw.clone()).expect("raw must deserialize");
+        assert_eq!(
+            serde_json::to_value(&typed).expect("re-serialize"),
+            *raw,
+            "the capture must be exactly what the terminal type serializes to"
+        );
+        assert_eq!(typed, terminal_frame());
+        assert_eq!(
+            raw.pointer("/candidates/0/finish_reason"),
+            Some(&serde_json::json!(
+                proto::candidate::FinishReason::Stop as i32
+            ))
+        );
+
+        // Feeding the capture back through the same pipeline tells the same
+        // story as the terminal the stream produced.
+        let renormalized =
+            collect_terminal(normalize_grpc_stream(Box::pin(futures::stream::iter(
+                vec![Ok(streaming::RawStreamingChoice::FinalResponse(typed))],
+            ))))
+            .await;
+        assert_eq!(terminal.identity(), renormalized.identity());
+        assert_eq!(terminal.finish_reason, renormalized.finish_reason);
+        assert_eq!(terminal.model, renormalized.model);
+        assert_eq!(terminal.usage, renormalized.usage);
+        assert_eq!(
+            terminal.finish_reason,
+            Some(rig_core::completion::FinishReason::Stop)
+        );
+        assert_eq!(terminal.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(
+            terminal.identity().response_id.as_deref(),
+            Some("resp-grpc-stream")
+        );
     }
 }

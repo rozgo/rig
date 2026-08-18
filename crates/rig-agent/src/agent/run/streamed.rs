@@ -37,6 +37,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use rig_core::completion::FinishReason;
 use rig_core::message::{
     AssistantContent, Reasoning, ToolCall, ToolFunction, ToolResult, non_empty,
 };
@@ -135,7 +136,6 @@ pub(crate) fn assistant_text_items_from_choice(
 /// One invalid tool call surfaced mid-stream, awaiting a resolution from
 /// [`AgentRun::resolve_streamed_invalid_tool_call`](super::AgentRun::resolve_streamed_invalid_tool_call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct StreamedInvalidToolCall {
     /// The rejected tool call. For a name delta this is a diagnostic call
     /// assembled from the streamed name and any buffered argument deltas.
@@ -154,7 +154,6 @@ pub struct StreamedInvalidToolCall {
 /// Used by the machine to build diagnostics and rollback messages from
 /// exactly what the model has produced so far.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct PartialStreamedTurn {
     /// Provider-assigned assistant message ID, when already known.
     pub message_id: Option<String>,
@@ -244,7 +243,6 @@ impl PartialStreamedTurn {
 /// The assembled streamed turn, fed to
 /// [`AgentRun::streamed_turn`](super::AgentRun::streamed_turn).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct StreamedTurn {
     /// Provider-assigned assistant message ID, when available.
     pub message_id: Option<String>,
@@ -261,6 +259,14 @@ pub struct StreamedTurn {
     /// keeps the IDs consumers already saw in tool-call deltas.
     #[serde(default)]
     pub internal_call_ids: Vec<(String, String)>,
+    /// Why the provider stopped generating this turn, when it reported a
+    /// reason — the streamed analogue of [`ModelTurn::finish_reason`], so a
+    /// driver that feeds turns through `streamed_turn` records the same
+    /// terminal reason the blocking surface does (rig#2322).
+    ///
+    /// [`ModelTurn::finish_reason`]: super::ModelTurn::finish_reason
+    #[serde(default)]
+    pub finish_reason: Option<FinishReason>,
 }
 
 /// What the machine decided about a mid-stream invalid tool call.
@@ -321,6 +327,13 @@ pub enum StreamedTurnEvent {
         /// Whether the ingested final item should be forwarded to the
         /// consumer (set when the turn streamed text).
         emit_final: bool,
+        /// Why the provider stopped generating, when it reported a reason.
+        ///
+        /// Previously dropped here: the assembler read `usage` and `saw_text`
+        /// off the terminal record and discarded the rest, so a turn truncated
+        /// at the output-token limit reached the driver indistinguishable from
+        /// one that simply stopped (rig#2322).
+        finish_reason: Option<FinishReason>,
     },
 }
 
@@ -389,6 +402,9 @@ pub struct StreamedTurnAssembler {
     pending_tool_calls: Vec<(ToolCall, String)>,
     delta_states: HashMap<String, ToolCallDeltaState>,
     pending_invalid: Option<PendingInvalid>,
+    /// Terminal reason from this turn's provider final record, retained so
+    /// [`Self::finish`] can carry it onto the [`StreamedTurn`] (rig#2322).
+    finish_reason: Option<FinishReason>,
     /// Replayed assistant blocks excluded from assembly this turn (see
     /// [`unknown_payload_loses_assistant_content`]): counted per item,
     /// surfaced as one warning when the guard drops.
@@ -435,6 +451,7 @@ impl StreamedTurnAssembler {
             pending_tool_calls: Vec::new(),
             delta_states: HashMap::new(),
             pending_invalid: None,
+            finish_reason: None,
             excluded_assistant_content: ExclusionCount::default(),
         }
     }
@@ -719,7 +736,16 @@ impl StreamedTurnAssembler {
                 let usage = final_response.usage;
                 let emit_final = self.saw_text;
                 self.saw_text = false;
-                Ok(vec![StreamedTurnEvent::Completed { usage, emit_final }])
+                // `normalize_stream` has already reconciled this against the
+                // tool calls actually seen (see `StreamFinal::finish_reason`),
+                // so it is consumed as-is and never re-reconciled here.
+                let finish_reason = final_response.finish_reason.clone();
+                self.finish_reason = finish_reason.clone();
+                Ok(vec![StreamedTurnEvent::Completed {
+                    usage,
+                    emit_final,
+                    finish_reason,
+                }])
             }
             StreamedAssistantContent::Unknown(payload) => {
                 // Unmodeled provider item (e.g. a hosted-tool result): forward it
@@ -843,6 +869,7 @@ impl StreamedTurnAssembler {
             executable_tool_names: self.executable_tool_names,
             allowed_tool_names: self.allowed_tool_names,
             internal_call_ids,
+            finish_reason: self.finish_reason.take(),
         }
     }
 
@@ -1612,8 +1639,13 @@ mod tests {
             total_tokens: 12,
             ..Usage::new()
         };
-        run.record_streamed_completion_call(usage)
-            .expect("record should succeed");
+        run.record_streamed_completion_call(
+            usage,
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record should succeed");
         let final_choice = vec![AssistantContent::ToolCall(tool_call("tc_1", "add"))];
         run.streamed_turn(asm.finish(Some("msg_1".to_string()), &final_choice))
             .expect("streamed_turn should succeed");
@@ -1635,8 +1667,13 @@ mod tests {
             panic!("expected CallModel");
         };
         let asm = assembler();
-        run.record_streamed_completion_call(Usage::new())
-            .expect("record should succeed");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record should succeed");
         let final_choice = vec![AssistantContent::text("done")];
         run.streamed_turn(asm.finish(None, &final_choice))
             .expect("streamed_turn should succeed");
@@ -1696,8 +1733,13 @@ mod tests {
         asm.resolve_pending_invalid(&resolution);
 
         // Usage from the drained stream is recorded after the rollback.
-        run.record_streamed_completion_call(Usage::new())
-            .expect("record after rollback should succeed");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record after rollback should succeed");
 
         // The rollback appended the partial assistant turn and feedback.
         assert_eq!(run.messages().len(), 3);
@@ -1767,8 +1809,13 @@ mod tests {
                 skipped_tool_result: None
             }
         ));
-        run.record_streamed_completion_call(Usage::new())
-            .expect("completion call should be recorded");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("completion call should be recorded");
         assert_eq!(run.completion_calls().len(), 1);
 
         let err = run
@@ -1864,6 +1911,7 @@ mod tests {
             executable_tool_names: tool_names(&["add"]),
             allowed_tool_names: tool_names(&["add"]),
             internal_call_ids: Vec::new(),
+            finish_reason: None,
         };
         let err = run
             .streamed_turn(turn)
@@ -1880,14 +1928,24 @@ mod tests {
         // even though the machine is in its initial PreparingRequest state.
         let mut run = AgentRun::new("hello");
         let err = run
-            .record_streamed_completion_call(Usage::new())
+            .record_streamed_completion_call(
+                Usage::new(),
+                rig_core::completion::ResponseIdentity::default(),
+                None,
+                serde_json::Value::Null,
+            )
             .expect_err("recording before any model call must be rejected");
         assert!(matches!(err, PromptError::PromptCancelled { .. }));
 
         // The run stays drivable.
         run.next_step().expect("next_step should still succeed");
-        run.record_streamed_completion_call(Usage::new())
-            .expect("recording during a pending model call succeeds");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("recording during a pending model call succeeds");
     }
 
     #[test]
@@ -1906,8 +1964,13 @@ mod tests {
             internal_call_id: "internal_b".to_string(),
         })
         .expect("ingest should succeed");
-        run.record_streamed_completion_call(Usage::new())
-            .expect("record should succeed");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record should succeed");
 
         let final_choice = vec![
             AssistantContent::ToolCall(tool_call("tc_1", "add")),
@@ -1949,10 +2012,20 @@ mod tests {
         let mut run = AgentRun::new("hello");
         run.next_step().expect("next_step");
 
-        run.record_streamed_completion_call(Usage::new())
-            .expect("first record succeeds");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("first record succeeds");
         let err = run
-            .record_streamed_completion_call(Usage::new())
+            .record_streamed_completion_call(
+                Usage::new(),
+                rig_core::completion::ResponseIdentity::default(),
+                None,
+                serde_json::Value::Null,
+            )
             .expect_err("second record for the same turn must be rejected");
         assert!(matches!(err, PromptError::PromptCancelled { .. }));
         assert_eq!(run.completion_calls().len(), 1);
@@ -1966,8 +2039,13 @@ mod tests {
         let mut asm = assembler();
         asm.ingest(&tool_call_item("tc_1", "add"))
             .expect("ingest should succeed");
-        run.record_streamed_completion_call(Usage::new())
-            .expect("record should succeed");
+        run.record_streamed_completion_call(
+            Usage::new(),
+            rig_core::completion::ResponseIdentity::default(),
+            None,
+            serde_json::Value::Null,
+        )
+        .expect("record should succeed");
         let final_choice = vec![AssistantContent::ToolCall(tool_call("tc_1", "add"))];
         run.streamed_turn(asm.finish(None, &final_choice))
             .expect("streamed_turn should succeed");

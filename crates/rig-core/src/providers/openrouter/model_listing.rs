@@ -1,20 +1,31 @@
 use crate::{
-    client::ModelLister,
-    http_client::HttpClientExt,
-    model::{Model, ModelList, ModelListingError},
+    model::Model,
     providers::{internal, openrouter::Client},
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use serde::Deserialize;
 
+/// An OpenRouter listing entry.
+///
+/// No `rename_all`: OpenRouter's listing is snake_case. A `camelCase` rule
+/// here made serde look for `contextLength`, which the wire never sends, so
+/// every model's context window decoded as `None` while the response said
+/// otherwise (the recorded fixture reports 262144 for the first entry).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ModelEntry {
     id: String,
     name: String,
     description: Option<String>,
     created: u64,
     context_length: Option<u32>,
+    /// OpenRouter reports the output ceiling one level down.
+    #[serde(default)]
+    top_provider: Option<TopProvider>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopProvider {
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
 }
 
 impl From<ModelEntry> for Model {
@@ -27,31 +38,24 @@ impl From<ModelEntry> for Model {
             created_at: Some(value.created),
             owned_by: None,
             context_length: value.context_length,
+            // OpenRouter reports the output ceiling under
+            // `top_provider.max_completion_tokens`. Reading it is not a guess,
+            // and `max_output_tokens` exists precisely so a provider-reported
+            // ceiling is not dropped (rig#2322). `None` stays `None`: some
+            // entries genuinely omit it.
+            max_output_tokens: value
+                .top_provider
+                .and_then(|provider| provider.max_completion_tokens),
         }
     }
 }
 
-#[derive(Clone)]
-pub struct OpenRouterModelLister<H = reqwest::Client> {
-    client: Client<H>,
-}
-
-impl<H> ModelLister<H> for OpenRouterModelLister<H>
-where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
-{
-    type Client = Client<H>;
-
-    fn new(client: Self::Client) -> Self {
-        Self { client }
-    }
-
-    async fn list_all(&self) -> Result<ModelList, ModelListingError> {
-        internal::model_listing::list_models::<ModelEntry, _, _>(
-            &self.client,
-            "OpenRouter",
-            "/models",
-        )
-        .await
-    }
-}
+internal::model_listing::impl_model_lister!(
+    /// [`ModelLister`](crate::client::ModelLister) implementation for the
+    /// OpenRouter API (`GET /models`).
+    OpenRouterModelLister,
+    Client<H>,
+    ModelEntry,
+    "OpenRouter",
+    "/models"
+);

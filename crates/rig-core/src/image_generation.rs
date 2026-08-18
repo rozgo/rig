@@ -1,43 +1,16 @@
 //! Everything related to core image generation abstractions in Rig.
 //! Rig allows calling a number of different providers (that support image generation) using the [ImageGenerationModel] trait.
 use crate::markers::{Missing, Provided};
-use crate::{http_client, provider_response};
+use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use serde_json::Value;
-use thiserror::Error;
 
-/// Errors returned by image generation models.
-///
-/// Inspect provider failures with [`Self::provider_response_body`],
-/// [`Self::provider_response_json`], and [`Self::provider_response_status`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum ImageGenerationError {
-    /// Http error (e.g.: connection error, timeout, etc.)
-    #[error("HttpError: {0}")]
-    HttpError(#[from] http_client::Error),
-
-    /// Json error (e.g.: serialization, deserialization)
-    #[error("JsonError: {0}")]
-    JsonError(#[from] serde_json::Error),
-
-    /// Error building the image generation request
-    #[error("RequestError: {0}")]
-    RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-
-    /// Error parsing the image generation response
-    #[error("ResponseError: {0}")]
-    ResponseError(String),
-
-    /// Error returned by the image generation model provider
-    #[error("ProviderError: {0}")]
-    ProviderError(String),
-
-    /// Raw error response preserved from the image generation model provider
-    #[error("ProviderResponseError: {0}")]
-    ProviderResponse(provider_response::ProviderResponseError),
-}
-
-crate::provider_response::impl_provider_response_helpers!(ImageGenerationError);
+crate::provider_response::provider_error_enum!(
+    ImageGenerationError, "image generation" {
+        /// Error building the image generation request
+        #[error("RequestError: {0}")]
+        RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+    }
+);
 
 /// A unified response for a model image generation, returning both the image and the raw response.
 #[derive(Debug)]
@@ -46,8 +19,8 @@ pub struct ImageGenerationResponse<T> {
     pub response: T,
 }
 
-pub trait ImageGenerationModel: Clone + Send + Sync {
-    type Response: Send + Sync;
+pub trait ImageGenerationModel: Clone + WasmCompatSend + WasmCompatSync {
+    type Response: WasmCompatSend + WasmCompatSync;
 
     type Client;
 
@@ -58,14 +31,13 @@ pub trait ImageGenerationModel: Clone + Send + Sync {
         request: ImageGenerationRequest,
     ) -> impl std::future::Future<
         Output = Result<ImageGenerationResponse<Self::Response>, ImageGenerationError>,
-    > + Send;
+    > + WasmCompatSend;
 
     fn image_generation_request(&self) -> ImageGenerationRequestBuilder<Self, Missing> {
         ImageGenerationRequestBuilder::new(self.clone())
     }
 }
 /// An image generation request.
-#[non_exhaustive]
 pub struct ImageGenerationRequest {
     pub prompt: String,
     pub width: u32,
@@ -75,7 +47,6 @@ pub struct ImageGenerationRequest {
 
 /// A builder for `ImageGenerationRequest`.
 /// Can be sent to a model provider.
-#[non_exhaustive]
 pub struct ImageGenerationRequestBuilder<M, P = Missing>
 where
     M: ImageGenerationModel,
@@ -159,16 +130,15 @@ where
 #[cfg(test)]
 mod provider_response_tests {
     use super::*;
+    use crate::{http_client, provider_response};
     use http::StatusCode;
 
     #[test]
     fn image_generation_error_provider_response_helpers_with_preserved_json_body() {
         let body = r#"{"error":{"message":"content policy"}}"#;
-        let error =
-            ImageGenerationError::ProviderResponse(provider_response::ProviderResponseError {
-                status: None,
-                body: body.to_string(),
-            });
+        let error = ImageGenerationError::ProviderResponse(
+            provider_response::ProviderResponseError::without_status(body.to_string()),
+        );
 
         assert_eq!(error.provider_response_body(), Some(body));
         assert_eq!(error.provider_response_status(), None);

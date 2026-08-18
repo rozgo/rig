@@ -32,6 +32,19 @@ pub(crate) struct PreparedCompletionRequest {
     /// When Tool output mode is active, the name of the synthetic output tool
     /// advertised to the model (allowed but not executable). See #1928.
     pub(crate) output_tool_name: Option<String>,
+    /// The output-token cap this exact attempt was prepared with — the agent's
+    /// configured value after the runner/request overrides and after the merged
+    /// completion-call [`RequestPatch`](crate::agent::hook::RequestPatch), i.e.
+    /// the structured cap that reaches the provider. A cap smuggled through
+    /// `additional_params` passthrough is not reflected here, by design: this
+    /// reports the field the request actually set.
+    ///
+    /// Carried here rather than read back off the builder because the builder is
+    /// consumed by `send`/`stream` before a turn's hooks fire, and because
+    /// provenance matters: this is the same binding applied to the request, so
+    /// it cannot drift from what was sent. Both surfaces receive this struct, so
+    /// neither can report a different number for the same attempt.
+    pub(crate) max_tokens: Option<u64>,
 }
 
 /// Base name of the synthetic output tool used by [`OutputMode::Tool`].
@@ -229,16 +242,16 @@ pub(crate) async fn build_prepared_completion_request(
     committed_output_tool: Option<&str>,
     request_patch: Option<&RequestPatch>,
 ) -> Result<PreparedCompletionRequest, CompletionError> {
-    let preamble = runner.preamble.as_deref();
-    let static_context = &runner.static_context;
-    let temperature = runner.temperature;
-    let max_tokens = runner.max_tokens;
-    let additional_params = runner.additional_params.as_ref();
-    let record_telemetry_content = runner.record_telemetry_content;
-    let tool_choice = runner.tool_choice.as_ref();
+    let preamble = runner.config.preamble.as_deref();
+    let static_context = &runner.config.static_context;
+    let temperature = runner.config.temperature;
+    let max_tokens = runner.config.max_tokens;
+    let additional_params = runner.config.additional_params.as_ref();
+    let record_telemetry_content = runner.config.record_telemetry_content;
+    let tool_choice = runner.config.tool_choice.as_ref();
     let tool_server_handle = &runner.tool_server_handle;
-    let output_schema = runner.output_schema.as_ref();
-    let output_mode = &runner.output_mode;
+    let output_schema = runner.config.output_schema.as_ref();
+    let output_mode = &runner.config.output_mode;
     let output_tool_description = runner.output_tool_description.as_deref();
     let augment_output_preamble = runner.augment_output_preamble;
     // Apply a per-turn request patch (the merged patch from every `CompletionCall`
@@ -525,6 +538,9 @@ pub(crate) async fn build_prepared_completion_request(
         executable_tool_names,
         allowed_tool_names,
         output_tool_name,
+        // The post-patch binding from above — the one `.max_tokens_opt(..)`
+        // put on the request.
+        max_tokens,
     })
 }
 
@@ -554,8 +570,19 @@ pub(crate) async fn build_prepared_completion_request(
 /// # }
 /// ```
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct Agent {
+    pub(crate) config: AgentConfig,
+    pub(crate) tool_server_handle: ToolServerHandle,
+}
+
+/// Everything an [`AgentBuilder`](crate::agent::AgentBuilder) configures and the
+/// built [`Agent`] carries unchanged.
+///
+/// Building only moves this across and resolves the tool state into a
+/// [`ToolServerHandle`], so a new setting is declared once here instead of in
+/// two parallel field lists.
+#[derive(Clone)]
+pub(crate) struct AgentConfig {
     /// Name of the agent used for logging and debugging
     pub(crate) name: Option<String>,
     /// Agent description. Primarily useful when using sub-agents as part of an agent workflow and converting agents to other formats.
@@ -566,10 +593,6 @@ pub struct Agent {
     pub(crate) preamble: Option<String>,
     /// Context documents always available to the agent
     pub(crate) static_context: Vec<Document>,
-    /// Temperature of the model
-    pub(crate) temperature: Option<f64>,
-    /// Maximum number of tokens for the completion
-    pub(crate) max_tokens: Option<u64>,
     /// Additional parameters to be passed to the model
     pub(crate) additional_params: Option<serde_json::Value>,
     /// Whether to record sensitive request, response, and tool content on GenAI spans.
@@ -579,12 +602,15 @@ pub struct Agent {
     /// through OpenTelemetry span attributes, which can increase observability
     /// backend storage and query costs.
     pub(crate) record_telemetry_content: bool,
-    pub(crate) tool_server_handle: ToolServerHandle,
+    /// Maximum number of tokens for the completion
+    pub(crate) max_tokens: Option<u64>,
+    /// Temperature of the model
+    pub(crate) temperature: Option<f64>,
     /// Whether or not the underlying LLM should be forced to use a tool before providing a response.
     pub(crate) tool_choice: Option<ToolChoice>,
-    /// Default total model-call budget, including the initial call and every
-    /// retry or continuation. `None` uses the implicit budget of one.
-    pub(crate) default_max_turns: Option<usize>,
+    /// Total model-call budget, including the initial call and every retry or
+    /// continuation. Defaults to `1` (the initial call only).
+    pub(crate) max_turns: usize,
     /// Default hook stack applied to every prompt request and runner created
     /// from this agent. Empty by default.
     pub(crate) hooks: HookStack,
@@ -596,23 +622,47 @@ pub struct Agent {
     pub(crate) output_mode: OutputMode,
     /// Optional conversation memory backend that loads/saves history per conversation id.
     pub(crate) memory: Option<Arc<dyn rig_core::memory::ConversationMemory>>,
-    /// Optional default conversation id used when none is set per-request.
-    pub(crate) default_conversation_id: Option<String>,
+    /// Optional conversation id used when none is set per-request.
+    pub(crate) conversation_id: Option<String>,
+}
+
+impl AgentConfig {
+    /// The unconfigured starting point for a builder over `model`.
+    pub(crate) fn new(model: ModelHandle) -> Self {
+        Self {
+            name: None,
+            description: None,
+            model,
+            preamble: None,
+            static_context: vec![],
+            additional_params: None,
+            record_telemetry_content: false,
+            max_tokens: None,
+            temperature: None,
+            tool_choice: None,
+            max_turns: 1,
+            hooks: HookStack::new(),
+            output_schema: None,
+            output_mode: OutputMode::default(),
+            memory: None,
+            conversation_id: None,
+        }
+    }
 }
 
 impl Agent {
     /// Returns the configured agent name.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.config.name.as_deref()
     }
 
     /// Returns the configured agent description.
     pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+        self.config.description.as_deref()
     }
 
     pub(crate) fn name_or_default(&self) -> &str {
-        self.name.as_deref().unwrap_or(UNKNOWN_AGENT_NAME)
+        self.name().unwrap_or(UNKNOWN_AGENT_NAME)
     }
 
     /// Build a hook-aware [`AgentRunner`] for this agent, seeded with the
@@ -624,7 +674,7 @@ impl Agent {
 
     /// Returns the agent's current default model handle.
     pub fn model_handle(&self) -> &ModelHandle {
-        &self.model
+        &self.config.model
     }
 
     /// Replace the default model used by runners created after this call.
@@ -633,7 +683,7 @@ impl Agent {
     /// agent does not mutate another clone. Model-selection hooks may replace
     /// the captured default at each model-call boundary.
     pub fn set_model_handle(&mut self, model: ModelHandle) {
-        self.model = model;
+        self.config.model = model;
     }
 
     /// Erase and install a typed completion model as this agent's new default.

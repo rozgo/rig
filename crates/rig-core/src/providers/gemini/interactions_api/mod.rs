@@ -4,10 +4,11 @@
 use crate::completion::{self, CompletionError, CompletionRequest};
 use crate::http_client::HttpClientExt;
 use crate::message::{self, MimeType, Reasoning};
+use crate::providers::internal::completion_send::send_completion;
+use crate::providers::internal::envelope::DirectPayload;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use serde_json::{Map, Value};
-use tracing::{Level, enabled};
 use tracing_futures::Instrument;
 use url::form_urlencoded;
 
@@ -140,13 +141,11 @@ where
 
         let request = self.create_completion_request(completion_request, Some(false))?;
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "Gemini interactions completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "Gemini interactions completion request",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
         let request = self
@@ -155,56 +154,23 @@ where
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
-        async move {
-            let response = self.client.send::<_, Vec<u8>>(request).await?;
-
-            if response.status().is_success() {
-                let response_body = response
-                    .into_body()
-                    .await
-                    .map_err(CompletionError::HttpError)?;
-
-                let response_text = String::from_utf8_lossy(&response_body).to_string();
-
-                let response: Interaction =
-                    serde_json::from_slice(&response_body).map_err(|err| {
-                        tracing::error!(
-                            error = %err,
-                            body = %response_text,
-                            "Failed to deserialize Gemini interactions response"
-                        );
-                        CompletionError::JsonError(err)
-                    })?;
-
+        send_completion::<_, DirectPayload<Interaction>, _>(
+            &self.client,
+            request,
+            "Gemini interactions completion",
+            // Gemini reports no transport request-id response header (verified
+            // against the live API); the normalized id is None by design.
+            None,
+            |response| {
                 let span = tracing::Span::current();
-                span.record_response_metadata(&response);
-                let usage = crate::completion::Usage::from(&response);
+                span.record_response_metadata(response);
+                let usage = crate::completion::Usage::from(response);
                 span.record_token_usage(&usage);
-
-                if enabled!(Level::TRACE) {
-                    tracing::trace!(
-                        target: "rig::completions",
-                        "Gemini interactions completion response: {}",
-                        serde_json::to_string_pretty(&response)?
-                    );
-                }
-
-                Ok(response)
-            } else {
-                let status = response.status();
-                let body = response
-                    .into_body()
-                    .await
-                    .map_err(CompletionError::HttpError)?;
-
-                Err(CompletionError::from_http_response(
-                    status,
-                    String::from_utf8_lossy(&body),
-                ))
-            }
-        }
+            },
+        )
         .instrument(span)
         .await
+        .map(|(payload, _)| payload)
     }
 }
 
@@ -216,7 +182,11 @@ where
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        self.raw_completion(completion_request).await?.try_into()
+        // Capture before `try_into` consumes the raw value.
+        let raw = self.raw_completion(completion_request).await?;
+        let captured = serde_json::to_value(&raw)?;
+        let response: completion::CompletionResponse = raw.try_into()?;
+        Ok(response.with_raw(captured))
     }
 
     async fn stream(
@@ -783,7 +753,6 @@ pub mod interactions_api_types {
     }
 
     impl ProviderResponseExt for Interaction {
-        type OutputMessage = Content;
         type Usage = InteractionUsage;
 
         fn get_response_id(&self) -> Option<String> {
@@ -796,10 +765,6 @@ pub mod interactions_api_types {
 
         fn get_response_model_name(&self) -> Option<String> {
             self.model.clone()
-        }
-
-        fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-            self.output_contents()
         }
 
         fn get_text_response(&self) -> Option<String> {
@@ -959,26 +924,22 @@ pub mod interactions_api_types {
     impl GoogleSearchExchange {
         /// Collects all queries from the stored Google Search tool calls.
         pub fn queries(&self) -> Vec<String> {
-            let mut queries = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(call_queries) = &args.queries
-                {
-                    queries.extend(call_queries.clone());
-                }
-            }
-            queries
+            self.calls
+                .iter()
+                .filter_map(|call| call.arguments.as_ref()?.queries.as_ref())
+                .flatten()
+                .cloned()
+                .collect()
         }
 
         /// Collects all Google Search result entries from tool results.
         pub fn result_items(&self) -> Vec<GoogleSearchResult> {
-            let mut items = Vec::new();
-            for result in &self.results {
-                if let Some(entries) = &result.result {
-                    items.extend(entries.clone());
-                }
-            }
-            items
+            self.results
+                .iter()
+                .filter_map(|result| result.result.as_ref())
+                .flatten()
+                .cloned()
+                .collect()
         }
     }
 
@@ -988,26 +949,22 @@ pub mod interactions_api_types {
     impl UrlContextExchange {
         /// Collects all URLs from the stored URL context tool calls.
         pub fn urls(&self) -> Vec<String> {
-            let mut urls = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(call_urls) = &args.urls
-                {
-                    urls.extend(call_urls.clone());
-                }
-            }
-            urls
+            self.calls
+                .iter()
+                .filter_map(|call| call.arguments.as_ref()?.urls.as_ref())
+                .flatten()
+                .cloned()
+                .collect()
         }
 
         /// Collects all URL context result entries from tool results.
         pub fn result_items(&self) -> Vec<UrlContextResult> {
-            let mut items = Vec::new();
-            for result in &self.results {
-                if let Some(entries) = &result.result {
-                    items.extend(entries.clone());
-                }
-            }
-            items
+            self.results
+                .iter()
+                .filter_map(|result| result.result.as_ref())
+                .flatten()
+                .cloned()
+                .collect()
         }
     }
 
@@ -1017,27 +974,75 @@ pub mod interactions_api_types {
     impl CodeExecutionExchange {
         /// Collects all code snippets from the stored code execution tool calls.
         pub fn code_snippets(&self) -> Vec<String> {
-            let mut snippets = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(code) = &args.code
-                {
-                    snippets.push(code.clone());
-                }
-            }
-            snippets
+            self.calls
+                .iter()
+                .filter_map(|call| call.arguments.as_ref()?.code.clone())
+                .collect()
         }
 
         /// Collects all code execution outputs from tool results.
         pub fn outputs(&self) -> Vec<String> {
-            let mut outputs = Vec::new();
-            for result in &self.results {
-                if let Some(output) = &result.result {
-                    outputs.push(output.clone());
-                }
-            }
-            outputs
+            self.results
+                .iter()
+                .filter_map(|result| result.result.clone())
+                .collect()
         }
+    }
+
+    /// Generates the `Interaction` accessor family for one built-in tool:
+    /// the call_id-grouped exchanges plus flattened views over their calls,
+    /// results, and per-exchange collector methods.
+    macro_rules! interaction_exchange_accessors {
+        (
+            $tool:literal, $exchange:ty, $call_variant:ident, $result_variant:ident,
+            $exchanges_fn:ident, $call_contents_fn:ident -> $call_ty:ty,
+            $result_contents_fn:ident -> $result_ty:ty,
+            $($flat_doc:literal $flat_fn:ident => $method:ident -> $flat_ty:ty),* $(,)?
+        ) => {
+            #[doc = concat!("Groups ", $tool, " tool calls and results by call_id.")]
+            ///
+            /// When a call_id is missing, results are grouped with the most recent
+            /// call (identified or not) as a best-effort fallback.
+            pub fn $exchanges_fn(&self) -> Vec<$exchange> {
+                pair_exchanges(
+                    &self.output_contents(),
+                    |content| match content {
+                        Content::$call_variant(call) => Some(call),
+                        _ => None,
+                    },
+                    |content| match content {
+                        Content::$result_variant(result) => Some(result),
+                        _ => None,
+                    },
+                )
+            }
+
+            #[doc = concat!("Collects ", $tool, " tool call contents from the interaction outputs.")]
+            pub fn $call_contents_fn(&self) -> Vec<$call_ty> {
+                self.$exchanges_fn()
+                    .into_iter()
+                    .flat_map(|exchange| exchange.calls)
+                    .collect()
+            }
+
+            #[doc = concat!("Collects ", $tool, " result contents from the interaction outputs.")]
+            pub fn $result_contents_fn(&self) -> Vec<$result_ty> {
+                self.$exchanges_fn()
+                    .into_iter()
+                    .flat_map(|exchange| exchange.results)
+                    .collect()
+            }
+
+            $(
+                #[doc = $flat_doc]
+                pub fn $flat_fn(&self) -> Vec<$flat_ty> {
+                    self.$exchanges_fn()
+                        .into_iter()
+                        .flat_map(|exchange| exchange.$method())
+                        .collect()
+                }
+            )*
+        };
     }
 
     impl Interaction {
@@ -1045,155 +1050,38 @@ pub mod interactions_api_types {
             self.steps.iter().flat_map(Step::output_contents).collect()
         }
 
-        /// Groups Google Search tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn google_search_exchanges(&self) -> Vec<GoogleSearchExchange> {
-            pair_exchanges(
-                &self.output_contents(),
-                |content| match content {
-                    Content::GoogleSearchCall(call) => Some(call),
-                    _ => None,
-                },
-                |content| match content {
-                    Content::GoogleSearchResult(result) => Some(result),
-                    _ => None,
-                },
-            )
-        }
+        interaction_exchange_accessors!(
+            "Google Search", GoogleSearchExchange, GoogleSearchCall, GoogleSearchResult,
+            google_search_exchanges,
+            google_search_call_contents -> GoogleSearchCallContent,
+            google_search_result_contents -> GoogleSearchResultContent,
+            "Collects all Google Search queries from tool calls in the outputs."
+                google_search_queries => queries -> String,
+            "Collects all Google Search result entries from tool results in the outputs."
+                google_search_results => result_items -> GoogleSearchResult,
+        );
 
-        /// Collects Google Search tool call contents from the interaction outputs.
-        pub fn google_search_call_contents(&self) -> Vec<GoogleSearchCallContent> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
+        interaction_exchange_accessors!(
+            "URL context", UrlContextExchange, UrlContextCall, UrlContextResult,
+            url_context_exchanges,
+            url_context_call_contents -> UrlContextCallContent,
+            url_context_result_contents -> UrlContextResultContent,
+            "Collects all URLs from URL context tool calls in the outputs."
+                url_context_urls => urls -> String,
+            "Collects all URL context result entries from tool results in the outputs."
+                url_context_results => result_items -> UrlContextResult,
+        );
 
-        /// Collects Google Search result contents from the interaction outputs.
-        pub fn google_search_result_contents(&self) -> Vec<GoogleSearchResultContent> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all Google Search queries from tool calls in the outputs.
-        pub fn google_search_queries(&self) -> Vec<String> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.queries())
-                .collect()
-        }
-
-        /// Collects all Google Search result entries from tool results in the outputs.
-        pub fn google_search_results(&self) -> Vec<GoogleSearchResult> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.result_items())
-                .collect()
-        }
-
-        /// Groups URL context tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn url_context_exchanges(&self) -> Vec<UrlContextExchange> {
-            pair_exchanges(
-                &self.output_contents(),
-                |content| match content {
-                    Content::UrlContextCall(call) => Some(call),
-                    _ => None,
-                },
-                |content| match content {
-                    Content::UrlContextResult(result) => Some(result),
-                    _ => None,
-                },
-            )
-        }
-
-        /// Collects URL context tool call contents from the interaction outputs.
-        pub fn url_context_call_contents(&self) -> Vec<UrlContextCallContent> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
-
-        /// Collects URL context result contents from the interaction outputs.
-        pub fn url_context_result_contents(&self) -> Vec<UrlContextResultContent> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all URLs from URL context tool calls in the outputs.
-        pub fn url_context_urls(&self) -> Vec<String> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.urls())
-                .collect()
-        }
-
-        /// Collects all URL context result entries from tool results in the outputs.
-        pub fn url_context_results(&self) -> Vec<UrlContextResult> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.result_items())
-                .collect()
-        }
-
-        /// Groups code execution tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn code_execution_exchanges(&self) -> Vec<CodeExecutionExchange> {
-            pair_exchanges(
-                &self.output_contents(),
-                |content| match content {
-                    Content::CodeExecutionCall(call) => Some(call),
-                    _ => None,
-                },
-                |content| match content {
-                    Content::CodeExecutionResult(result) => Some(result),
-                    _ => None,
-                },
-            )
-        }
-
-        /// Collects code execution tool call contents from the interaction outputs.
-        pub fn code_execution_call_contents(&self) -> Vec<CodeExecutionCallContent> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
-
-        /// Collects code execution result contents from the interaction outputs.
-        pub fn code_execution_result_contents(&self) -> Vec<CodeExecutionResultContent> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all code snippets from code execution calls in the outputs.
-        pub fn code_execution_snippets(&self) -> Vec<String> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.code_snippets())
-                .collect()
-        }
-
-        /// Collects all code execution outputs from tool results in the outputs.
-        pub fn code_execution_outputs(&self) -> Vec<String> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.outputs())
-                .collect()
-        }
+        interaction_exchange_accessors!(
+            "code execution", CodeExecutionExchange, CodeExecutionCall, CodeExecutionResult,
+            code_execution_exchanges,
+            code_execution_call_contents -> CodeExecutionCallContent,
+            code_execution_result_contents -> CodeExecutionResultContent,
+            "Collects all code snippets from code execution calls in the outputs."
+                code_execution_snippets => code_snippets -> String,
+            "Collects all code execution outputs from tool results in the outputs."
+                code_execution_outputs => outputs -> String,
+        );
 
         /// Returns concatenated text outputs with inline citations appended.
         pub fn text_with_inline_citations(&self) -> Option<String> {
@@ -2366,28 +2254,35 @@ pub mod interactions_api_types {
     }
 
     /// Content delta item in streaming events.
+    ///
+    /// Most deltas repeat a whole [`Content`] payload rather than a fragment of
+    /// one, so they reuse the `*Content` types directly; the wire tags come
+    /// from this enum's own `type` tagging. Only the variants whose payloads
+    /// genuinely differ from their `Content` counterpart — a partial text run,
+    /// a raw arguments fragment, and the identity-less thought deltas — carry
+    /// their own struct.
     #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum ContentDelta {
         Text(TextDelta),
-        Image(ImageDelta),
-        Audio(AudioDelta),
-        Document(DocumentDelta),
-        Video(VideoDelta),
+        Image(ImageContent),
+        Audio(AudioContent),
+        Document(DocumentContent),
+        Video(VideoContent),
         ThoughtSummary(ThoughtSummaryDelta),
         ThoughtSignature(ThoughtSignatureDelta),
-        FunctionCall(FunctionCallDelta),
+        FunctionCall(FunctionCallContent),
         ArgumentsDelta(ArgumentsDelta),
-        FunctionResult(FunctionResultDelta),
-        CodeExecutionCall(CodeExecutionCallDelta),
-        CodeExecutionResult(CodeExecutionResultDelta),
-        UrlContextCall(UrlContextCallDelta),
-        UrlContextResult(UrlContextResultDelta),
-        GoogleSearchCall(GoogleSearchCallDelta),
-        GoogleSearchResult(GoogleSearchResultDelta),
-        McpServerToolCall(McpServerToolCallDelta),
-        McpServerToolResult(McpServerToolResultDelta),
-        FileSearchResult(FileSearchResultDelta),
+        FunctionResult(FunctionResultContent),
+        CodeExecutionCall(CodeExecutionCallContent),
+        CodeExecutionResult(CodeExecutionResultContent),
+        UrlContextCall(UrlContextCallContent),
+        UrlContextResult(UrlContextResultContent),
+        GoogleSearchCall(GoogleSearchCallContent),
+        GoogleSearchResult(GoogleSearchResultContent),
+        McpServerToolCall(McpServerToolCallContent),
+        McpServerToolResult(McpServerToolResultContent),
+        FileSearchResult(FileSearchResultContent),
     }
 
     /// Streaming function-call arguments fragment: the wire fragments a
@@ -2411,54 +2306,6 @@ pub mod interactions_api_types {
         pub annotations: Option<Vec<Annotation>>,
     }
 
-    /// Streaming image delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ImageDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
-    /// Streaming audio delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct AudioDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Streaming document delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct DocumentDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Streaming video delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct VideoDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
     /// Streaming thought summary delta.
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct ThoughtSummaryDelta {
@@ -2469,129 +2316,6 @@ pub mod interactions_api_types {
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct ThoughtSignatureDelta {
         pub signature: String,
-    }
-
-    /// Streaming function call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming function result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-    }
-
-    /// Streaming code execution call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<CodeExecutionCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming code execution result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming URL context call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<UrlContextCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming URL context result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<UrlContextResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming Google Search call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<GoogleSearchCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming Google Search result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<GoogleSearchResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming MCP server tool call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming MCP server tool result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming file search result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FileSearchResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<FileSearchResult>>,
     }
 }
 

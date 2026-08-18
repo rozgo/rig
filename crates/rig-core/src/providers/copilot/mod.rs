@@ -30,12 +30,12 @@ use crate::completion::{self, CompletionError};
 use crate::embeddings::{self, EmbeddingError};
 use crate::http_client::{self, HttpClientExt};
 use crate::model::{Model, ModelList, ModelListingError};
+use crate::providers::internal::completion_send::send_completion;
+use crate::providers::internal::envelope::DirectPayload;
 use crate::providers::openai;
 use crate::providers::openai::responses_api::{self, CompletionRequest as ResponsesRequest};
 use crate::streaming::StreamingCompletionResponse;
-use crate::telemetry::{
-    CompletionOperation, CompletionSpanBuilder, ProviderResponseExt, SpanCombinator,
-};
+use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use futures::StreamExt;
 use http::Request;
@@ -545,6 +545,26 @@ fn request_has_vision(request: &completion::CompletionRequest) -> bool {
     })
 }
 
+/// Per-request inputs shared by every Copilot route, read off the incoming
+/// request before a route-specific conversion consumes it.
+struct RequestFacts {
+    initiator: &'static str,
+    has_vision: bool,
+    system_instructions: Option<String>,
+    record_telemetry_content: bool,
+}
+
+impl RequestFacts {
+    fn capture(request: &completion::CompletionRequest) -> Self {
+        Self {
+            initiator: request_initiator(request),
+            has_vision: request_has_vision(request),
+            system_instructions: request.preamble.clone(),
+            record_telemetry_content: request.record_telemetry_content,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionRoute {
     ChatCompletions,
@@ -562,8 +582,22 @@ fn route_for_model(model: &str) -> CompletionRoute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "api", rename_all = "snake_case")]
 pub enum CopilotCompletionResponse {
-    Chat(Box<ChatCompletionResponse>),
+    Chat(Box<openai::completion::CompletionResponse>),
     Responses(Box<responses_api::CompletionResponse>),
+}
+
+/// The forward direction for the route-tagged raw type, so
+/// [`CompletionModel::raw_completion`] followed by `normalize` is a complete
+/// typed route regardless of which route answered — each variant delegates to
+/// its wire type's own conversion. This is also what
+/// [`completion::CompletionModel::completion`] uses, so the two cannot drift.
+impl NormalizeCompletionResponse for CopilotCompletionResponse {
+    fn normalize(self, provider: &str) -> Result<completion::CompletionResponse, CompletionError> {
+        match self {
+            Self::Chat(response) => response.normalize(provider),
+            Self::Responses(response) => response.normalize(provider),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -593,107 +627,8 @@ impl From<(&str, CopilotStreamingResponse)> for crate::streaming::StreamFinal {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    #[serde(default)]
-    pub object: Option<String>,
-    #[serde(default)]
-    pub created: Option<u64>,
-    pub model: String,
-    pub system_fingerprint: Option<String>,
-    pub choices: Vec<ChatChoice>,
-    pub usage: Option<openai::completion::Usage>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatChoice {
-    #[serde(default)]
-    pub index: usize,
-    pub message: openai::completion::Message,
-    pub logprobs: Option<serde_json::Value>,
-    #[serde(default)]
-    pub finish_reason: Option<String>,
-}
-
 /// Stable descriptor name reported on normalized Copilot responses.
 pub const PROVIDER_NAME: &str = "copilot";
-
-impl From<ChatChoice> for openai::completion::Choice {
-    fn from(choice: ChatChoice) -> Self {
-        Self {
-            index: choice.index,
-            message: choice.message,
-            logprobs: choice.logprobs,
-            // OpenAI's normalization treats an empty `finish_reason` as
-            // absent, so Copilot's optional field folds onto it losslessly.
-            finish_reason: choice.finish_reason.unwrap_or_default(),
-        }
-    }
-}
-
-impl From<ChatCompletionResponse> for openai::completion::CompletionResponse {
-    fn from(response: ChatCompletionResponse) -> Self {
-        Self {
-            id: response.id,
-            object: response.object.unwrap_or_default(),
-            created: response.created.unwrap_or_default(),
-            model: response.model,
-            system_fingerprint: response.system_fingerprint,
-            choices: response.choices.into_iter().map(Into::into).collect(),
-            usage: response.usage,
-        }
-    }
-}
-
-impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse {
-    type Error = CompletionError;
-
-    fn try_from(response: ChatCompletionResponse) -> Result<Self, Self::Error> {
-        // Copilot's chat route speaks OpenAI's chat-completions wire (with a
-        // few fields optional), so normalization is OpenAI's, under Copilot's
-        // own provider name.
-        openai::completion::CompletionResponse::from(response).normalize(PROVIDER_NAME)
-    }
-}
-
-impl ProviderResponseExt for ChatCompletionResponse {
-    type OutputMessage = ChatChoice;
-    type Usage = openai::completion::Usage;
-
-    fn get_response_id(&self) -> Option<String> {
-        Some(self.id.clone())
-    }
-
-    fn get_response_model_name(&self) -> Option<String> {
-        Some(self.model.clone())
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.choices.clone()
-    }
-
-    fn get_text_response(&self) -> Option<String> {
-        let response = self
-            .choices
-            .iter()
-            .filter_map(|choice| {
-                openai::completion::assistant_message_text_response(&choice.message)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if response.is_empty() {
-            None
-        } else {
-            Some(response)
-        }
-    }
-
-    fn get_usage(&self) -> Option<Self::Usage> {
-        self.usage.clone()
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ChatApiErrorResponse {
@@ -717,6 +652,17 @@ impl ChatApiErrorResponse {
 enum ChatApiResponse<T> {
     Ok(T),
     Err(ChatApiErrorResponse),
+}
+
+impl<T> crate::providers::internal::envelope::ProviderEnvelope for ChatApiResponse<T> {
+    type Payload = T;
+
+    fn into_payload(self) -> Result<T, String> {
+        match self {
+            Self::Ok(payload) => Ok(payload),
+            Self::Err(error) => Err(error.error_message().to_owned()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -817,62 +763,85 @@ where
         Ok(request)
     }
 
-    async fn raw_completion_chat(
+    /// Authenticates, signs a POST to `path`, and opens the route's completion
+    /// span.
+    ///
+    /// Call this only *after* the route's request conversion: auth happens
+    /// inside, so calling it earlier would report an auth failure ahead of a
+    /// malformed request and invert the routes' error precedence.
+    async fn signed_request(
         &self,
-        completion_request: completion::CompletionRequest,
-    ) -> Result<ChatCompletionResponse, CompletionError> {
-        let initiator = request_initiator(&completion_request);
-        let has_vision = request_has_vision(&completion_request);
-        let system_instructions = completion_request.preamble.clone();
-        let record_telemetry_content = completion_request.record_telemetry_content;
-        let request = self.chat_request(completion_request)?;
-        let body = serde_json::to_vec(&request)?;
+        facts: &RequestFacts,
+        path: &str,
+        transport: Transport,
+        model: &str,
+        operation: CompletionOperation,
+        body: Vec<u8>,
+    ) -> Result<(Request<Vec<u8>>, tracing::Span), CompletionError> {
         let auth = self.auth_context().await?;
 
-        let headers = default_headers(&auth.api_key, initiator, has_vision, self.intent);
+        let headers = default_headers(
+            &auth.api_key,
+            facts.initiator,
+            facts.has_vision,
+            self.intent,
+        );
         let req = apply_headers(
-            post_with_auth_base(&self.client, &auth, "/chat/completions", Transport::Http)?,
+            post_with_auth_base(&self.client, &auth, path, transport)?,
             &headers,
         )
         .body(body)
         .map_err(|err| CompletionError::HttpError(err.into()))?;
 
-        let span = CompletionSpanBuilder::new("copilot", &request.model, CompletionOperation::Chat)
-            .system_instructions(system_instructions.as_deref(), record_telemetry_content)
+        let span = CompletionSpanBuilder::new("copilot", model, operation)
+            .system_instructions(
+                facts.system_instructions.as_deref(),
+                facts.record_telemetry_content,
+            )
             .build();
 
-        async move {
-            let response = self.client.send(req).await?;
+        Ok((req, span))
+    }
 
-            let status = response.status();
-            if status.is_success() {
-                let body = http_client::text(response).await?;
-                match serde_json::from_str::<ChatApiResponse<ChatCompletionResponse>>(&body)? {
-                    ChatApiResponse::Ok(response) => {
-                        let span = tracing::Span::current();
-                        span.record_response_metadata(&response);
-                        let usage = response
-                            .usage
-                            .as_ref()
-                            .map(|usage| usage.to_normalized())
-                            .unwrap_or_default();
-                        span.record_token_usage(&usage);
+    /// The chat wire type has no transport-metadata slot, so the captured
+    /// request id rides alongside; `completion()` stamps it onto the
+    /// normalized response.
+    async fn raw_completion_chat(
+        &self,
+        completion_request: completion::CompletionRequest,
+    ) -> Result<(openai::completion::CompletionResponse, Option<String>), CompletionError> {
+        let facts = RequestFacts::capture(&completion_request);
+        let request = self.chat_request(completion_request)?;
+        let (req, span) = self
+            .signed_request(
+                &facts,
+                "/chat/completions",
+                Transport::Http,
+                &request.model,
+                CompletionOperation::Chat,
+                serde_json::to_vec(&request)?,
+            )
+            .await?;
 
-                        Ok(response)
-                    }
-                    ChatApiResponse::Err(err) => {
-                        tracing::warn!(
-                            message = %err.error_message(),
-                            "provider returned an error response"
-                        );
-                        Err(CompletionError::from_http_response(status, body))
-                    }
-                }
-            } else {
-                let body = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, body))
-            }
-        }
+        send_completion::<_, ChatApiResponse<openai::completion::CompletionResponse>, _>(
+            &self.client,
+            req,
+            "Copilot chat completion",
+            // The OpenAI-compatible default; a gateway that omits the header
+            // yields None. Matches the streaming path, which goes through the
+            // shared OpenAI wrapper and captures the same header.
+            Some("x-request-id"),
+            |response| {
+                let span = tracing::Span::current();
+                span.record_response_metadata(response);
+                let usage = response
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.to_normalized())
+                    .unwrap_or_default();
+                span.record_token_usage(&usage);
+            },
+        )
         .instrument(span)
         .await
     }
@@ -881,46 +850,40 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<responses_api::CompletionResponse, CompletionError> {
-        let initiator = request_initiator(&completion_request);
-        let has_vision = request_has_vision(&completion_request);
-        let system_instructions = completion_request.preamble.clone();
-        let record_telemetry_content = completion_request.record_telemetry_content;
+        let facts = RequestFacts::capture(&completion_request);
         let request = self.responses_request(completion_request)?;
-        let auth = self.auth_context().await?;
+        let (req, span) = self
+            .signed_request(
+                &facts,
+                "/responses",
+                Transport::Http,
+                &request.model,
+                CompletionOperation::Chat,
+                serde_json::to_vec(&request)?,
+            )
+            .await?;
 
-        let headers = default_headers(&auth.api_key, initiator, has_vision, self.intent);
-        let req = apply_headers(
-            post_with_auth_base(&self.client, &auth, "/responses", Transport::Http)?,
-            &headers,
-        )
-        .body(serde_json::to_vec(&request)?)
-        .map_err(|err| CompletionError::HttpError(err.into()))?;
-
-        let span = CompletionSpanBuilder::new("copilot", &request.model, CompletionOperation::Chat)
-            .system_instructions(system_instructions.as_deref(), record_telemetry_content)
-            .build();
-
-        async move {
-            let response = self.client.send(req).await?;
-            let status = response.status();
-            if status.is_success() {
-                let body = http_client::text(response).await?;
-                let response = serde_json::from_str::<responses_api::CompletionResponse>(&body)?;
+        send_completion::<_, DirectPayload<responses_api::CompletionResponse>, _>(
+            &self.client,
+            req,
+            "Copilot responses completion",
+            // See the chat path: the OpenAI-compatible default header.
+            Some("x-request-id"),
+            |response| {
                 let span = tracing::Span::current();
                 span.record("gen_ai.response.id", response.id.as_str());
                 span.record("gen_ai.response.model", response.model.as_str());
                 if let Some(usage) = &response.usage {
                     span.record_token_usage(&usage.into());
                 }
-
-                Ok(response)
-            } else {
-                let body = http_client::text(response).await?;
-                Err(CompletionError::from_http_response(status, body))
-            }
-        }
+            },
+        )
         .instrument(span)
         .await
+        .map(|(mut payload, provider_request_id)| {
+            payload.provider_request_id = provider_request_id;
+            payload
+        })
     }
 
     async fn raw_stream_chat(
@@ -928,13 +891,8 @@ where
         completion_request: completion::CompletionRequest,
     ) -> Result<crate::streaming::RawStreamingResult<CopilotStreamingResponse>, CompletionError>
     {
-        let initiator = request_initiator(&completion_request);
-        let has_vision = request_has_vision(&completion_request);
-        let system_instructions = completion_request.preamble.clone();
-        let record_telemetry_content = completion_request.record_telemetry_content;
+        let facts = RequestFacts::capture(&completion_request);
         let request = self.chat_request(completion_request)?;
-        let auth = self.auth_context().await?;
-        let headers = default_headers(&auth.api_key, initiator, has_vision, self.intent);
         let mut request_json = serde_json::to_value(&request)?;
         let request_object = request_json.as_object_mut().ok_or_else(|| {
             CompletionError::ResponseError("copilot request body must be a JSON object".into())
@@ -945,20 +903,16 @@ where
             json!({ "include_usage": true }),
         );
 
-        let req = apply_headers(
-            post_with_auth_base(&self.client, &auth, "/chat/completions", Transport::Sse)?,
-            &headers,
-        )
-        .body(serde_json::to_vec(&request_json)?)
-        .map_err(|err| CompletionError::HttpError(err.into()))?;
-
-        let span = CompletionSpanBuilder::new(
-            "copilot",
-            &request.model,
-            CompletionOperation::ChatStreaming,
-        )
-        .system_instructions(system_instructions.as_deref(), record_telemetry_content)
-        .build();
+        let (req, span) = self
+            .signed_request(
+                &facts,
+                "/chat/completions",
+                Transport::Sse,
+                &request.model,
+                CompletionOperation::ChatStreaming,
+                serde_json::to_vec(&request_json)?,
+            )
+            .await?;
 
         tracing::Instrument::instrument(
             send_copilot_chat_raw_streaming_request(self.client.clone(), req),
@@ -972,38 +926,37 @@ where
         completion_request: completion::CompletionRequest,
     ) -> Result<crate::streaming::RawStreamingResult<CopilotStreamingResponse>, CompletionError>
     {
-        let initiator = request_initiator(&completion_request);
-        let has_vision = request_has_vision(&completion_request);
-        let system_instructions = completion_request.preamble.clone();
-        let record_telemetry_content = completion_request.record_telemetry_content;
+        let facts = RequestFacts::capture(&completion_request);
         let mut request = self.responses_request(completion_request)?;
         request.stream = Some(true);
-        let auth = self.auth_context().await?;
-
-        let headers = default_headers(&auth.api_key, initiator, has_vision, self.intent);
-        let req = apply_headers(
-            post_with_auth_base(&self.client, &auth, "/responses", Transport::Sse)?,
-            &headers,
-        )
-        .body(serde_json::to_vec(&request)?)
-        .map_err(|err| CompletionError::HttpError(err.into()))?;
-
-        let span = CompletionSpanBuilder::new(
-            "copilot",
-            &request.model,
-            CompletionOperation::ChatStreaming,
-        )
-        .system_instructions(system_instructions.as_deref(), record_telemetry_content)
-        .build();
+        let (req, span) = self
+            .signed_request(
+                &facts,
+                "/responses",
+                Transport::Sse,
+                &request.model,
+                CompletionOperation::ChatStreaming,
+                serde_json::to_vec(&request)?,
+            )
+            .await?;
 
         let client = self.client.clone();
-        let event_source = crate::http_client::sse::GenericEventSource::new(client, req);
+        // The OpenAI-compatible default header, matching the chat route.
+        let (event_source, request_id_slot) =
+            crate::http_client::sse::GenericEventSource::new(client, req)
+                .capture_request_id("x-request-id");
 
         // Copilot's `/responses` route relays OpenAI's Responses SSE wire
         // verbatim, so the shared classify + `RawChoiceAccumulator` machinery
         // is the event interpreter — only the auth/transport above and the
         // route-carrying terminal wrapper below are Copilot-specific.
         let raw = responses_api::streaming::raw_stream_from_event_source(event_source, span);
+        let raw = crate::providers::internal::sse_transport::stamp_terminal_request_id(
+            raw,
+            Some(request_id_slot),
+            Some("x-request-id"),
+            |response, id| response.provider_request_id = Some(id),
+        );
         let stream = raw.map(|item| {
             item.and_then(|choice| {
                 choice.try_map_final(|response| Ok(CopilotStreamingResponse::Responses(response)))
@@ -1019,19 +972,50 @@ where
     /// This is the escape hatch for fields rig does not normalize;
     /// [`completion::CompletionModel::completion`] shares the same request,
     /// transport, telemetry and error path.
+    ///
+    /// On the chat route the transport request id (`x-request-id`) is not on
+    /// the wire type and is dropped here; use
+    /// [`Self::raw_completion_with_request_id`] when the typed route must
+    /// reproduce everything `completion` returns.
     pub async fn raw_completion(
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<CopilotCompletionResponse, CompletionError> {
+        self.raw_completion_with_request_id(completion_request)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::raw_completion`] plus the transport request id from the
+    /// `x-request-id` response header.
+    ///
+    /// The pair exists because the chat route's wire type
+    /// ([`openai::completion::CompletionResponse`]) has no slot for a
+    /// transport id — it is the shared OpenAI-compatible shape — while the
+    /// normalized [`completion::CompletionResponse`] carries one. Without this
+    /// method, `raw_completion(..)` followed by
+    /// [`NormalizeCompletionResponse::normalize`] would silently lack the
+    /// `provider_request_id` that [`completion::CompletionModel::completion`]
+    /// reports. Reassemble with
+    /// [`with_optional_provider_request_id`](completion::CompletionResponse::with_optional_provider_request_id).
+    /// On the responses route the wire type carries the id itself; the pair's
+    /// second element is that same value, so reassembly is a no-op there.
+    pub async fn raw_completion_with_request_id(
+        &self,
+        completion_request: completion::CompletionRequest,
+    ) -> Result<(CopilotCompletionResponse, Option<String>), CompletionError> {
         match self.route() {
             CompletionRoute::ChatCompletions => self
                 .raw_completion_chat(completion_request)
                 .await
-                .map(|response| CopilotCompletionResponse::Chat(Box::new(response))),
+                .map(|(response, id)| (CopilotCompletionResponse::Chat(Box::new(response)), id)),
             CompletionRoute::Responses => self
                 .raw_completion_responses(completion_request)
                 .await
-                .map(|response| CopilotCompletionResponse::Responses(Box::new(response))),
+                .map(|response| {
+                    let id = response.provider_request_id.clone();
+                    (CopilotCompletionResponse::Responses(Box::new(response)), id)
+                }),
         }
     }
 
@@ -1085,16 +1069,17 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, CompletionError> {
-        match self.route() {
-            CompletionRoute::ChatCompletions => self
-                .raw_completion_chat(completion_request)
-                .await?
-                .try_into(),
-            CompletionRoute::Responses => self
-                .raw_completion_responses(completion_request)
-                .await?
-                .normalize(PROVIDER_NAME),
-        }
+        // The captured value is the route-tagged `CopilotCompletionResponse` —
+        // what `raw_completion` returns — not the inner route type, so it
+        // round-trips into the same type the typed escape hatch yields.
+        let (response, provider_request_id) = self
+            .raw_completion_with_request_id(completion_request)
+            .await?;
+        let captured = serde_json::to_value(&response)?;
+        Ok(response
+            .normalize(PROVIDER_NAME)?
+            .with_optional_provider_request_id(provider_request_id)
+            .with_raw(captured))
     }
 
     async fn stream(
@@ -1403,9 +1388,9 @@ use crate::providers::internal::auth::config_dir;
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatApiErrorResponse, ChatCompletionResponse, Client, CompletionRoute, CopilotIntent,
-        TEXT_EMBEDDING_3_SMALL, base_url_from_token, default_headers, env_api_key, env_base_url,
-        env_github_access_token, route_for_model,
+        ChatApiErrorResponse, Client, CompletionRoute, CopilotIntent, TEXT_EMBEDDING_3_SMALL,
+        base_url_from_token, default_headers, env_api_key, env_base_url, env_github_access_token,
+        route_for_model,
     };
     use crate::client::CompletionClient;
     use crate::completion::CompletionModel;
@@ -1413,6 +1398,7 @@ mod tests {
     use crate::providers::internal::openai_chat_completions_compatible::test_support::{
         sse_bytes_from_data_lines, sse_bytes_from_json_events,
     };
+    use crate::providers::openai;
     use crate::streaming::StreamedAssistantContent;
     use crate::test_utils::MockStreamingClient;
     use crate::test_utils::{RecordingHttpClient, SequencedStreamingHttpClient};
@@ -1516,24 +1502,25 @@ mod tests {
             }
         }"#;
 
-        let response: ChatCompletionResponse =
+        let response: openai::completion::CompletionResponse =
             serde_json::from_str(json).expect("standard OpenAI response should deserialize");
         assert_eq!(response.id, "chatcmpl-abc123");
-        assert_eq!(response.object.as_deref(), Some("chat.completion"));
-        assert_eq!(response.created, Some(1700000000));
+        assert_eq!(response.object, "chat.completion");
+        assert_eq!(response.created, 1700000000);
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(response.choices[0].finish_reason, "stop");
     }
 
     #[test]
     fn deserialize_copilot_response_without_object_and_created() {
-        let response: ChatCompletionResponse = serde_json::from_str(minimal_chat_response())
-            .expect("Copilot response should deserialize");
+        let response: openai::completion::CompletionResponse =
+            serde_json::from_str(minimal_chat_response())
+                .expect("Copilot response should deserialize");
 
         assert_eq!(response.id, "chatcmpl-123");
-        assert_eq!(response.object, None);
-        assert_eq!(response.created, None);
+        assert_eq!(response.object, "");
+        assert_eq!(response.created, 0);
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.choices.len(), 1);
     }
@@ -1555,11 +1542,11 @@ mod tests {
             }
         }"#;
 
-        let response: ChatCompletionResponse =
+        let response: openai::completion::CompletionResponse =
             serde_json::from_str(json).expect("Claude-via-Copilot response should deserialize");
 
         assert_eq!(response.model, "claude-3.5-sonnet");
-        assert_eq!(response.choices[0].finish_reason, None);
+        assert_eq!(response.choices[0].finish_reason, "");
         assert_eq!(response.choices[0].index, 0);
     }
 
@@ -2372,5 +2359,397 @@ mod tests {
             env_github_access_token(&get).as_deref(),
             Some("bootstrap-token")
         );
+    }
+}
+
+#[cfg(test)]
+mod response_identity_tests {
+    use super::*;
+
+    /// Both Copilot routes' streaming terminals carry the transport request id
+    /// (stamped by the shared SSE capture) into the normalized `StreamFinal`.
+    /// Deterministic and credential-free: the transport halves — the shared
+    /// OpenAI chat wrapper's capture and `stamp_terminal_request_id` on the
+    /// Responses route — are covered by the shared-path tests; this locks the
+    /// Copilot-specific conversion layer.
+    #[test]
+    fn streaming_terminals_carry_request_id_into_stream_final() {
+        let mut chat_terminal = openai::completion::streaming::StreamingCompletionResponse::<
+            openai::completion::Usage,
+        >::new(openai::completion::Usage::default());
+        chat_terminal.provider_request_id = Some("req-chat".to_string());
+        let chat_final: crate::streaming::StreamFinal =
+            (PROVIDER_NAME, CopilotStreamingResponse::Chat(chat_terminal)).into();
+        assert_eq!(chat_final.provider_request_id.as_deref(), Some("req-chat"));
+
+        let mut responses_terminal = responses_api::streaming::StreamingCompletionResponse::new(
+            serde_json::from_value(
+                serde_json::json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+            )
+            .expect("usage should parse"),
+        );
+        responses_terminal.provider_request_id = Some("req-responses".to_string());
+        let responses_final: crate::streaming::StreamFinal = (
+            PROVIDER_NAME,
+            CopilotStreamingResponse::Responses(responses_terminal),
+        )
+            .into();
+        assert_eq!(
+            responses_final.provider_request_id.as_deref(),
+            Some("req-responses")
+        );
+    }
+
+    /// The Responses-route unary wire type carries the stamped id through
+    /// `normalize` into the core response; the chat route has no wire slot,
+    /// so `completion()` stamps the normalized response from the returned
+    /// pair — asserted here at the conversion layer for the responses half.
+    #[test]
+    fn responses_unary_wire_id_survives_normalize() {
+        use crate::completion::NormalizeCompletionResponse;
+
+        let payload = serde_json::json!({
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-test",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+            }]
+        });
+        let mut response: responses_api::CompletionResponse =
+            serde_json::from_value(payload).expect("wire response should parse");
+        response.provider_request_id = Some("req-unary".to_string());
+
+        let normalized = response
+            .normalize(PROVIDER_NAME)
+            .expect("response should normalize");
+        assert_eq!(normalized.provider_request_id.as_deref(), Some("req-unary"));
+        assert_eq!(normalized.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(normalized.provider, PROVIDER_NAME);
+    }
+}
+
+/// Raw-capture and Part A parity, unit form, for both Copilot routes over the
+/// recording mock transport. `with_error_response_headers` with `200 OK` is
+/// the one unary double that carries response headers, which is what lets a
+/// unit test exercise the `x-request-id` half of the contract: on the chat
+/// route the id lives only on the header (the shared OpenAI chat wire type has
+/// no slot), on the responses route the driver stamps it onto the wire type.
+/// The captured value is the route-tagged [`CopilotCompletionResponse`] — what
+/// `raw_completion` returns — so it must round-trip through the
+/// `#[serde(tag = "api")]` enum, including the responses variant whose inner
+/// type has a hand-written `Serialize`.
+#[cfg(test)]
+mod raw_capture_tests {
+    use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel as _;
+    use crate::test_utils::RecordingHttpClient;
+
+    const REQUEST_ID: &str = "req_unit_copilot_0001";
+
+    /// A chat-completions body carrying `system_fingerprint`, which the
+    /// normalized response provably lacks.
+    const CHAT_BODY: &str = r#"{
+        "id": "chatcmpl-copilot-raw",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-4o-2024-11-20",
+        "system_fingerprint": "fp_copilot_chat",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hello"},
+            "logprobs": null,
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}
+    }"#;
+
+    /// A Responses body carrying `service_tier`, which the normalized
+    /// response provably lacks.
+    const RESPONSES_BODY: &str = r#"{
+        "id": "resp_copilot_raw",
+        "object": "response",
+        "created_at": 1700000000,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.3-codex",
+        "service_tier": "default",
+        "usage": {
+            "input_tokens": 4,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 3,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 7
+        },
+        "output": [{
+            "type": "message",
+            "id": "msg_copilot_raw",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }],
+        "tools": []
+    }"#;
+
+    fn model(model: &str, body: &'static str) -> CompletionModel<RecordingHttpClient> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-request-id", http::HeaderValue::from_static(REQUEST_ID));
+        let http_client =
+            RecordingHttpClient::with_error_response_headers(http::StatusCode::OK, body, headers);
+        let client = Client::builder()
+            .api_key("copilot-token")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        client.completion_model(model)
+    }
+
+    /// Run one completion for a route and check the shared capture contract:
+    /// `raw` deserializes into [`CopilotCompletionResponse`] under the
+    /// expected route tag and re-serializes identically; re-normalizing the
+    /// capture (with the header id reattached, exactly as `completion()`
+    /// does) reproduces every normalized field; and the response reports the
+    /// header's id.
+    async fn assert_capture_contract(
+        model: &CompletionModel<RecordingHttpClient>,
+        expected_api_tag: &str,
+    ) -> (completion::CompletionResponse, CopilotCompletionResponse) {
+        let response = model
+            .completion(model.completion_request("hello").build())
+            .await
+            .expect("completion");
+        let raw = &response.raw;
+        assert_eq!(raw["api"], expected_api_tag);
+        let typed: CopilotCompletionResponse =
+            serde_json::from_value(raw.clone()).expect("raw must deserialize");
+        assert_eq!(
+            serde_json::to_value(&typed).expect("re-serialize"),
+            *raw,
+            "the capture must be exactly what the route-tagged raw type serializes to"
+        );
+
+        let renormalized = typed
+            .clone()
+            .normalize(PROVIDER_NAME)
+            .expect("re-normalize the capture")
+            .with_optional_provider_request_id(Some(REQUEST_ID.to_string()));
+        assert_eq!(response.identity(), renormalized.identity());
+        assert_eq!(response.finish_reason(), renormalized.finish_reason());
+        assert_eq!(response.model, renormalized.model);
+        assert_eq!(response.usage, renormalized.usage);
+        assert_eq!(response.choice, renormalized.choice);
+        assert_eq!(response.provider_request_id.as_deref(), Some(REQUEST_ID));
+        (response, typed)
+    }
+
+    /// Part A parity for one route: `raw_completion_with_request_id` →
+    /// `normalize` → `with_optional_provider_request_id` reproduces
+    /// `completion()` on identity, finish reason, model and usage, and the
+    /// id is the header on both.
+    async fn assert_parity_contract(model: &CompletionModel<RecordingHttpClient>) {
+        let (raw, id) = model
+            .raw_completion_with_request_id(model.completion_request("hello").build())
+            .await
+            .expect("typed route");
+        assert_eq!(id.as_deref(), Some(REQUEST_ID));
+        let reassembled = raw
+            .normalize(PROVIDER_NAME)
+            .expect("normalize")
+            .with_optional_provider_request_id(id);
+
+        let normalized = model
+            .completion(model.completion_request("hello").build())
+            .await
+            .expect("normalized route");
+
+        assert_eq!(reassembled.identity(), normalized.identity());
+        assert_eq!(reassembled.finish_reason(), normalized.finish_reason());
+        assert_eq!(reassembled.model, normalized.model);
+        assert_eq!(reassembled.usage, normalized.usage);
+        assert_eq!(reassembled.provider_request_id.as_deref(), Some(REQUEST_ID));
+        assert_eq!(normalized.provider_request_id.as_deref(), Some(REQUEST_ID));
+        assert_eq!(normalized.provider, PROVIDER_NAME);
+    }
+
+    /// Chat route: the capture is tagged `api: chat`, wraps the shared OpenAI
+    /// chat wire type, and keeps `system_fingerprint`.
+    #[tokio::test]
+    async fn chat_route_raw_round_trips_into_the_route_tagged_type() {
+        let model = model("gpt-4o", CHAT_BODY);
+
+        let (response, typed) = assert_capture_contract(&model, "chat").await;
+
+        let CopilotCompletionResponse::Chat(chat) = typed else {
+            panic!("the chat route must capture the chat variant");
+        };
+        assert_eq!(chat.system_fingerprint.as_deref(), Some("fp_copilot_chat"));
+        assert_eq!(
+            response.finish_reason(),
+            Some(completion::FinishReason::Stop)
+        );
+        assert_eq!(
+            response.identity().response_id.as_deref(),
+            Some("chatcmpl-copilot-raw")
+        );
+    }
+
+    /// Chat route Part A: the wire type has no id slot, so only the pair
+    /// reproduces `completion()` — this is the case the method exists for.
+    #[tokio::test]
+    async fn chat_route_raw_completion_with_request_id_reproduces_completion() {
+        let model = model("gpt-4o", CHAT_BODY);
+
+        assert_parity_contract(&model).await;
+
+        // And plain `raw_completion` → `normalize` provably lacks the id:
+        // the reason the pair is public.
+        let raw = model
+            .raw_completion(model.completion_request("hello").build())
+            .await
+            .expect("typed route");
+        let normalized = raw.normalize(PROVIDER_NAME).expect("normalize");
+        assert_eq!(normalized.provider_request_id, None);
+    }
+
+    /// Responses route: the capture is tagged `api: responses` and wraps the
+    /// Responses wire type, whose hand-written `Serialize` mirrors the body
+    /// (`service_tier` kept; the stamped transport id, which is not body,
+    /// deliberately not emitted — so the deserialized capture reports `None`
+    /// there while the normalized response beside it carries the header).
+    #[tokio::test]
+    async fn responses_route_raw_round_trips_into_the_route_tagged_type() {
+        let model = model("gpt-5.3-codex", RESPONSES_BODY);
+
+        let (response, typed) = assert_capture_contract(&model, "responses").await;
+
+        let CopilotCompletionResponse::Responses(responses) = typed else {
+            panic!("the responses route must capture the responses variant");
+        };
+        assert!(matches!(
+            responses.additional_parameters.service_tier,
+            Some(responses_api::OpenAIServiceTier::Default)
+        ));
+        assert_eq!(responses.provider_request_id, None);
+        assert_eq!(
+            response.identity().message_id.as_deref(),
+            Some("msg_copilot_raw")
+        );
+        assert_eq!(
+            response.identity().response_id.as_deref(),
+            Some("resp_copilot_raw")
+        );
+    }
+
+    /// Responses route Part A: the wire type carries the id itself, so the
+    /// pair's second element equals the raw type's own id and reattaching it
+    /// is a no-op — the same pair still reproduces `completion()`.
+    #[tokio::test]
+    async fn responses_route_raw_completion_with_request_id_reproduces_completion() {
+        let model = model("gpt-5.3-codex", RESPONSES_BODY);
+
+        assert_parity_contract(&model).await;
+
+        let (raw, id) = model
+            .raw_completion_with_request_id(model.completion_request("hello").build())
+            .await
+            .expect("typed route");
+        let CopilotCompletionResponse::Responses(responses) = &raw else {
+            panic!("codex models route to /responses");
+        };
+        assert_eq!(responses.provider_request_id, id);
+        assert_eq!(id.as_deref(), Some(REQUEST_ID));
+    }
+
+    /// Both variants of the route-tagged unary raw type round-trip through
+    /// serde, hand-built from parsed wire bodies rather than through the
+    /// transport: the internally tagged enum has to merge its `api` tag into
+    /// whatever the inner type serializes as, and the responses variant's
+    /// inner type serializes through a hand-written `Serialize` (with a
+    /// flattened tail) rather than a derive.
+    #[test]
+    fn copilot_completion_response_round_trips_both_variants() {
+        let chat: openai::completion::CompletionResponse =
+            serde_json::from_str(CHAT_BODY).expect("chat body parses");
+        let responses: responses_api::CompletionResponse =
+            serde_json::from_str(RESPONSES_BODY).expect("responses body parses");
+
+        for (variant, tag) in [
+            (CopilotCompletionResponse::Chat(Box::new(chat)), "chat"),
+            (
+                CopilotCompletionResponse::Responses(Box::new(responses)),
+                "responses",
+            ),
+        ] {
+            let value = serde_json::to_value(&variant).expect("serialize");
+            assert_eq!(value["api"], tag);
+            let back: CopilotCompletionResponse =
+                serde_json::from_value(value.clone()).expect("deserialize");
+            assert_eq!(
+                serde_json::to_value(&back).expect("re-serialize"),
+                value,
+                "{tag}: the route-tagged raw type must round-trip"
+            );
+            assert_eq!(
+                back.normalize(PROVIDER_NAME).expect("normalize").provider,
+                PROVIDER_NAME
+            );
+        }
+    }
+
+    /// Both variants of the route-tagged streaming terminal round-trip
+    /// through serde — this is the value `StreamFinal.raw` carries for a
+    /// Copilot stream, so a consumer must be able to read it back as
+    /// [`CopilotStreamingResponse`].
+    #[test]
+    fn copilot_streaming_response_round_trips_both_variants() {
+        let mut chat = openai::completion::streaming::StreamingCompletionResponse::<
+            openai::completion::Usage,
+        >::new(openai::completion::Usage::default());
+        chat.finish_reason = Some(completion::FinishReason::Stop);
+        chat.response_id = Some("chatcmpl-stream".to_string());
+        chat.model = Some("gpt-4o".to_string());
+        chat.provider_request_id = Some("req-chat".to_string());
+        chat.additional_params = Some(
+            serde_json::from_value(json!({"service_tier": "default"})).expect("additional params"),
+        );
+
+        let mut responses = responses_api::streaming::StreamingCompletionResponse::new(
+            serde_json::from_value(
+                json!({"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}),
+            )
+            .expect("usage should parse"),
+        );
+        responses.provider_request_id = Some("req-responses".to_string());
+
+        for (variant, tag) in [
+            (CopilotStreamingResponse::Chat(chat), "chat"),
+            (CopilotStreamingResponse::Responses(responses), "responses"),
+        ] {
+            let value = serde_json::to_value(&variant).expect("serialize");
+            assert_eq!(value["api"], tag);
+            let back: CopilotStreamingResponse =
+                serde_json::from_value(value.clone()).expect("deserialize");
+            assert_eq!(
+                serde_json::to_value(&back).expect("re-serialize"),
+                value,
+                "{tag}: the route-tagged terminal must round-trip"
+            );
+            let original: crate::streaming::StreamFinal = (PROVIDER_NAME, variant).into();
+            let restored: crate::streaming::StreamFinal = (PROVIDER_NAME, back).into();
+            assert_eq!(
+                restored, original,
+                "{tag}: normalization must agree across the round-trip"
+            );
+        }
     }
 }

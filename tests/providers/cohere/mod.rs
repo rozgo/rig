@@ -11,6 +11,11 @@ mod cassette {
     mod context;
     mod embeddings;
     mod errors;
+    mod prompt_caching;
+    mod raw_capture_matrix;
+    mod raw_completion_parity_matrix;
+    mod raw_stream_capture_matrix;
+    mod response_identity;
     mod streaming;
     mod streaming_grammar;
     mod streaming_tools;
