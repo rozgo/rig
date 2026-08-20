@@ -683,6 +683,23 @@ impl ToolSet {
         self.insert(RegisteredTool::Static(tool))
     }
 
+    /// Replace a registration whose prior generation is already known to be
+    /// MCP-managed. Credential rotation deliberately transfers these names to
+    /// a fresh transport, so this path preserves ordering without reporting
+    /// the expected handoff as an accidental registration collision.
+    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    pub(crate) fn replace_managed_erased(&mut self, tool: Arc<dyn ErasedTool>) -> String {
+        let name = tool.name();
+        let mut registration = ToolRegistration::new(RegisteredTool::Static(tool), true);
+        if let Some(current) = self.tools.get_mut(&name) {
+            registration.always_exposed |= current.always_exposed;
+            *current = registration;
+        } else {
+            self.tools.insert(name.clone(), registration);
+        }
+        name
+    }
+
     pub(crate) fn insert(&mut self, tool: RegisteredTool) -> String {
         let name = tool.name();
         self.insert_registration(name.clone(), ToolRegistration::new(tool, true));

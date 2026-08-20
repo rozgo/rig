@@ -323,7 +323,12 @@ impl ToolServerHandle {
                 continue;
             }
 
-            let name = state.toolset.add_erased(tool);
+            let name = tool.name();
+            let name = if state.managed_generations.contains_key(&name) {
+                state.toolset.replace_managed_erased(tool)
+            } else {
+                state.toolset.add_erased(tool)
+            };
             let token = ManagedToolToken::new();
             state
                 .managed_generations
