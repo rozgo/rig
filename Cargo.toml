@@ -175,7 +175,7 @@ redis = "1"
 reqwest = { version = "0.13", default-features = false }
 reqwest-middleware = { version = "0.5", default-features = false }
 reqwest-retry = "0.9"
-rmcp = { version = "=3.1.3", git = "https://github.com/rozgo/rust-sdk", rev = "d37833f3d72882461d96a03aa2b662e448310b35" }
+rmcp = { version = "=3.1.4", git = "https://github.com/rozgo/rust-sdk", rev = "bcbc5afc3ba93d40e5449f7217fa08842ca7dd63" }
 url = "2"
 rusqlite = "0.32"
 scylla = "1"

@@ -10367,8 +10367,8 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.1.3"
-source = "git+https://github.com/rozgo/rust-sdk?rev=d37833f3d72882461d96a03aa2b662e448310b35#d37833f3d72882461d96a03aa2b662e448310b35"
+version = "3.1.4"
+source = "git+https://github.com/rozgo/rust-sdk?rev=bcbc5afc3ba93d40e5449f7217fa08842ca7dd63#bcbc5afc3ba93d40e5449f7217fa08842ca7dd63"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -10399,8 +10399,8 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.1.3"
-source = "git+https://github.com/rozgo/rust-sdk?rev=d37833f3d72882461d96a03aa2b662e448310b35#d37833f3d72882461d96a03aa2b662e448310b35"
+version = "3.1.4"
+source = "git+https://github.com/rozgo/rust-sdk?rev=bcbc5afc3ba93d40e5449f7217fa08842ca7dd63#bcbc5afc3ba93d40e5449f7217fa08842ca7dd63"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",
